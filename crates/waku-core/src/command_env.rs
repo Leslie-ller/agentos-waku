@@ -50,6 +50,18 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
+/// Build a command via [`command`] and apply isolated AgentOS profile
+/// environment variables for `provider` (preventing contamination of personal
+/// `~/.gemini`, `~/.codex`, `~/.claude`, or `~/.dsh` state).
+pub fn command_for_provider(
+    provider: crate::model::ProviderKind,
+    program: impl AsRef<OsStr>,
+) -> anyhow::Result<Command> {
+    let mut cmd = command(program);
+    crate::agent_profiles::apply_to_command(provider, &mut cmd)?;
+    Ok(cmd)
+}
+
 /// The `PATH` a provider CLI runs with: every directory Waku itself searched,
 /// plus the one the binary was found in.
 ///

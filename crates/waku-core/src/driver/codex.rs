@@ -247,7 +247,10 @@ impl CodexDriver {
             .map(|config| config.server_path.clone());
         let title_binary = binary.clone();
         let title_cwd = cwd.clone();
-        let mut command = crate::command_env::command(&binary);
+        let mut command = crate::command_env::command_for_provider(
+            crate::model::ProviderKind::Codex,
+            &binary,
+        )?;
         command.args(["app-server", "--stdio"]);
         configure_computer_use_command(&mut command, computer_use.as_ref());
         let command = command

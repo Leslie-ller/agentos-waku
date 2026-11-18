@@ -58,6 +58,15 @@ pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
         ProviderKind::Cursor => {
             vec![ProviderModel::new("auto", tr!("model_option.auto")).default()]
         }
+        ProviderKind::Antigravity => [
+            ProviderModel::new("gemini-3.8-flash", "Gemini 3.8 Flash").default(),
+            ProviderModel::new("gemini-4-carbon", "Gemini 4 Carbon"),
+            ProviderModel::new("gemini-4-argon", "Gemini 4 Argon"),
+            ProviderModel::new("gemini-4-hydrogen", "Gemini 4 Hydrogen"),
+        ]
+        .into_iter()
+        .map(|model| model.reasoning(reasoning_options(["low", "medium", "high"]), "high"))
+        .collect(),
         ProviderKind::DeepSeek
         | ProviderKind::Fx
         | ProviderKind::Grok

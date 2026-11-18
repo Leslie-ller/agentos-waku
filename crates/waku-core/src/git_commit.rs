@@ -87,6 +87,9 @@ pub fn generate_message(
     invocation: &AgentInvocation,
 ) -> anyhow::Result<String> {
     let prompt = commit_prompt(cwd, include_unstaged)?;
+    if invocation.provider == ProviderKind::Antigravity {
+        return generate_antigravity_acp_message(cwd, &invocation.binary, &prompt);
+    }
     let amp_settings = if invocation.provider == ProviderKind::Amp {
         let path = std::env::temp_dir().join(format!("waku-amp-commit-{}.json", Uuid::new_v4()));
         fs::write(
@@ -207,6 +210,61 @@ fn commit_prompt(cwd: &Path, include_unstaged: bool) -> anyhow::Result<String> {
     ))
 }
 
+fn generate_antigravity_acp_message(
+    cwd: &Path,
+    binary: &Path,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let (wake, _wakes) = smol::channel::bounded(1);
+    let (events, event_rx) = crate::driver::event_channel(wake);
+    let driver = crate::driver::start_local(
+        ProviderKind::Antigravity,
+        crate::driver::DriverStartOptions {
+            binary: binary.to_path_buf(),
+            cwd: cwd.to_path_buf(),
+            mode: crate::model::RuntimeMode::Ask,
+            model: Some("gemini-3.8-flash".into()),
+            reasoning_effort: Some("low".into()),
+            service_tier: None,
+            context_window: None,
+            agent_preset: None,
+            computer_use_enabled: false,
+            provider_cursor: None,
+        },
+        events,
+    )?;
+    let deadline = Instant::now() + AGENT_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("Google Antigravity timed out while opening commit-message session");
+        }
+        match event_rx.recv_timeout(remaining) {
+            Ok(crate::model::DriverEvent::Connected { .. }) => break,
+            Ok(crate::model::DriverEvent::Error(err)) => bail!("{err}"),
+            Ok(_) => {}
+            Err(_) => bail!("Google Antigravity could not open commit-message session"),
+        }
+    }
+    driver.prompt(prompt.to_owned());
+    let mut text = String::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("Google Antigravity timed out while generating a commit message");
+        }
+        match event_rx.recv_timeout(remaining) {
+            Ok(crate::model::DriverEvent::TextDelta(chunk)) => text.push_str(&chunk),
+            Ok(crate::model::DriverEvent::Error(err)) => bail!("{err}"),
+            Ok(crate::model::DriverEvent::TurnFinished { .. }) => break,
+            Ok(_) => {}
+            Err(_) => bail!("Google Antigravity stopped before returning a commit message"),
+        }
+    }
+    normalize_message(&text)
+        .ok_or_else(|| anyhow!("Google Antigravity returned no commit message"))
+}
+
 fn agent_arguments(
     provider: ProviderKind,
     model: Option<&str>,
@@ -235,6 +293,11 @@ fn agent_arguments(
             if let Some(effort) = reasoning_effort {
                 push(&mut args, "--effort");
                 push(&mut args, effort);
+            }
+        }
+        ProviderKind::Antigravity => {
+            if cfg!(target_os = "linux") {
+                push(&mut args, "--uid=");
             }
         }
         ProviderKind::Claude => {
@@ -806,6 +869,12 @@ mod tests {
                     assert!(has_pair(&args, "--prompt", prompt));
                     assert!(has_pair(&args, "--output-format", "text"));
                     assert!(has_pair(&args, "--model", "model"));
+                }
+                ProviderKind::Antigravity => {
+                    assert!(has(&args, prompt));
+                    if cfg!(target_os = "linux") {
+                        assert!(has(&args, "--uid="));
+                    }
                 }
             }
         }

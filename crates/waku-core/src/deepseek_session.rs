@@ -387,7 +387,11 @@ pub(crate) struct DeepSeekServer {
 
 impl DeepSeekServer {
     pub(crate) fn start(binary: &Path) -> anyhow::Result<Self> {
-        Self::start_with_dsh_home(binary, None)
+        let isolated = crate::agent_profiles::resolve_isolated_profile(
+            crate::model::ProviderKind::DeepSeek,
+        )?
+        .map(|profile| profile.directory);
+        Self::start_with_dsh_home(binary, isolated.as_deref())
     }
 
     fn start_with_dsh_home(binary: &Path, dsh_home: Option<&Path>) -> anyhow::Result<Self> {

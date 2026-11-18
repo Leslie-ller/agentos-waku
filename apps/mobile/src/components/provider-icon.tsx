@@ -10,6 +10,7 @@ import { useTheme } from '@/hooks/use-theme';
  * OpenCode, Fx, Pi) tint with the theme text color, and Oh My Pi's SVG
  * carries its own gradient. */
 const PROVIDER_BRAND_COLORS: Partial<Record<ProviderKind, string>> = {
+  antigravity: '#4285f4',
   claude: '#d97757',
   deepSeek: '#4d6bfe',
   amp: '#f34e3f',

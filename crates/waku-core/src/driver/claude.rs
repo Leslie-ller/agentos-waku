@@ -199,7 +199,10 @@ impl ClaudeDriver {
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        let mut command = crate::command_env::command(&binary);
+        let mut command = crate::command_env::command_for_provider(
+            crate::model::ProviderKind::Claude,
+            &binary,
+        )?;
         command.current_dir(&cwd);
         configure_stream_command(&mut command, mode);
         let launch_model = wire_model(model.as_deref(), context_window.as_deref());
