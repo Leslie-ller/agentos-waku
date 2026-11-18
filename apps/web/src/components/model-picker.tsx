@@ -12,6 +12,17 @@ import { cn } from '@/lib/utils'
 
 type PickerTab = 'favorites' | ProviderKind
 
+const HANDOFF_PROVIDERS = new Set<ProviderKind>([
+  'antigravity',
+  'claude',
+  'codex',
+  'cursor',
+  'deepSeek',
+  'grok',
+  'kimi',
+  'openCode',
+])
+
 export function ModelPicker({
   session,
   currentProbe,
@@ -67,7 +78,13 @@ export function ModelPicker({
   }) as Partial<Record<ProviderKind, ProviderProbe>>
 
   const usable = PROVIDERS.filter(({ id }) => {
-    if (lockedProvider && id !== lockedProvider) return false
+    if (
+      lockedProvider &&
+      id !== lockedProvider &&
+      !(HANDOFF_PROVIDERS.has(lockedProvider) && HANDOFF_PROVIDERS.has(id))
+    ) {
+      return false
+    }
     if (id === session.provider) return true
     return !settings.data?.disabled_providers.includes(id) && probeMap[id]?.installed
   })

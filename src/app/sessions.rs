@@ -954,11 +954,12 @@ impl Waku {
         let (reasoning_effort, service_tier, context_window) =
             self.state.model_traits_for(provider, &model);
         if let Some(session) = self.selected_session_mut() {
-            session.provider = provider;
-            session.model = Some(model.clone());
             if provider_changed {
-                session.agent_preset = None;
+                session.switch_provider(provider);
+            } else {
+                session.provider = provider;
             }
+            session.model = Some(model.clone());
             session.reasoning_effort.clone_from(&reasoning_effort);
             session.service_tier.clone_from(&service_tier);
             session.context_window.clone_from(&context_window);

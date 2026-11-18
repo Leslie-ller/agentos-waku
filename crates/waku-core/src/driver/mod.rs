@@ -208,7 +208,16 @@ pub struct SessionOptions {
 
 pub(crate) fn start_local(
     provider: ProviderKind,
+    options: DriverStartOptions,
+    events: DriverEventSender,
+) -> anyhow::Result<DriverHandle> {
+    start_local_with_mcp(provider, options, None, events)
+}
+
+pub(crate) fn start_local_with_mcp(
+    provider: ProviderKind,
     mut options: DriverStartOptions,
+    mcp_companion: Option<crate::mcp_companion::McpCompanionLaunch>,
     events: DriverEventSender,
 ) -> anyhow::Result<DriverHandle> {
     // Computer Use is experimental, so release builds never start its helper
@@ -218,7 +227,9 @@ pub(crate) fn start_local(
     options.computer_use_enabled =
         crate::computer_use::resolve_enabled(options.computer_use_enabled);
     let inner: Arc<dyn DriverControl> = match provider {
-        ProviderKind::Codex => Arc::new(codex::CodexDriver::start(options, events)?),
+        ProviderKind::Codex => {
+            Arc::new(codex::CodexDriver::start_with_mcp(options, mcp_companion, events)?)
+        }
         ProviderKind::Pi => Arc::new(pi::PiDriver::start(pi::PiFlavor::Pi, options, events)?),
         ProviderKind::OhMyPi => {
             Arc::new(pi::PiDriver::start(pi::PiFlavor::OhMyPi, options, events)?)
@@ -231,7 +242,7 @@ pub(crate) fn start_local(
         | ProviderKind::Fx
         | ProviderKind::Grok
         | ProviderKind::Kimi => {
-            Arc::new(acp::AcpDriver::start(provider, options, events)?)
+            Arc::new(acp::AcpDriver::start_with_mcp(provider, options, mcp_companion, events)?)
         }
         ProviderKind::DeepSeek => Arc::new(deepseek::DeepSeekDriver::start(options, events)?),
         // OpenCode is not a per-workspace server: one adopted background
@@ -241,7 +252,9 @@ pub(crate) fn start_local(
         // Claude serves a realtime stream of user messages on stdin — the same
         // transport the Agent SDK drives — which is what lets its Supervised
         // mode ask rather than decide alone.
-        ProviderKind::Claude => Arc::new(claude::ClaudeDriver::start(options, events)?),
+        ProviderKind::Claude => {
+            Arc::new(claude::ClaudeDriver::start_with_mcp(options, mcp_companion, events)?)
+        }
         // Amp reads newline-delimited user messages on stdin and stays alive
         // until stdin closes, so it too serves the whole conversation.
         ProviderKind::Amp => Arc::new(amp::AmpDriver::start(options, events)?),
