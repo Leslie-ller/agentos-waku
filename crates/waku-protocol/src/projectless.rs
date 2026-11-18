@@ -5,9 +5,7 @@ use std::sync::{OnceLock, RwLock};
 
 fn workspace_root_slot() -> &'static RwLock<Option<PathBuf>> {
     static ROOT: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
-    ROOT.get_or_init(|| {
-        RwLock::new(dirs::home_dir().map(|home| home.join(".waku").join("projects")))
-    })
+    ROOT.get_or_init(|| RwLock::new(Some(crate::identity::default_config_dir().join("projects"))))
 }
 
 pub fn set_workspace_root(root: Option<PathBuf>) {
@@ -26,12 +24,21 @@ pub fn home_directory() -> Option<PathBuf> {
 }
 
 pub fn is_projectless_path(path: &Path) -> bool {
-    workspace_root().is_some_and(|root| {
+    let matches_current = workspace_root().is_some_and(|root| {
         path.starts_with(&root)
             || root
                 .parent()
                 .is_some_and(|legacy_root| is_legacy_workspace_path(path, legacy_root))
-    })
+    });
+    if matches_current {
+        return true;
+    }
+    dirs::home_dir()
+        .map(|home| home.join(crate::identity::LEGACY_CONFIG_DIRECTORY_NAME))
+        .is_some_and(|legacy_waku| {
+            path.starts_with(legacy_waku.join("projects"))
+                || is_legacy_workspace_path(path, &legacy_waku)
+        })
 }
 
 pub fn needs_migration(path: &Path) -> bool {

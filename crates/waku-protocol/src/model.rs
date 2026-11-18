@@ -1021,6 +1021,20 @@ fn detail_loaded_default() -> bool {
     true
 }
 
+fn truncate_utf8_with_notice(text: &mut String, max_bytes: usize) -> bool {
+    if text.len() <= max_bytes {
+        return false;
+    }
+    let omitted = text.len().saturating_sub(max_bytes);
+    let mut boundary = max_bytes.min(text.len());
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text.truncate(boundary);
+    text.push_str(&format!("… [truncated {omitted}B for wire hydration]"));
+    true
+}
+
 impl AgentSession {
     pub const DEFAULT_TITLE: &'static str = "New task";
 
@@ -1135,6 +1149,86 @@ impl AgentSession {
         self.turns = Vec::new();
         self.queued_messages = Vec::new();
         self.detail_loaded = false;
+    }
+
+    /// Upper-bound estimate of this session's JSON wire size in bytes.
+    pub fn estimated_wire_bytes(&self) -> usize {
+        let mut total: usize = 1024;
+        for msg in &self.messages {
+            total = total
+                .saturating_add(160)
+                .saturating_add(msg.content.len())
+                .saturating_add(msg.display_content.as_ref().map_or(0, String::len));
+        }
+        for block in &self.transcript_blocks {
+            total = total.saturating_add(96);
+            for act in &block.activities {
+                total = total
+                    .saturating_add(240)
+                    .saturating_add(act.title.len())
+                    .saturating_add(act.detail.as_ref().map_or(0, String::len))
+                    .saturating_add(act.arguments.as_ref().map_or(0, String::len))
+                    .saturating_add(act.output.as_ref().map_or(0, String::len))
+                    .saturating_add(
+                        act.reasoning
+                            .as_ref()
+                            .map_or(0, |reasoning| reasoning.content.len()),
+                    );
+                for fc in &act.file_changes {
+                    total = total
+                        .saturating_add(96)
+                        .saturating_add(fc.path.len())
+                        .saturating_add(fc.diff.as_ref().map_or(0, String::len));
+                }
+            }
+        }
+        total = total.saturating_add(self.turns.len().saturating_mul(160));
+        total
+    }
+
+    /// Compacts oversized historical tool payloads on an in-memory projection
+    /// when the session would otherwise exceed `max_bytes` on the wire.
+    ///
+    /// Preserves all messages and every activity card; callers run this on a
+    /// cloned outbound response so SQLite rows remain completely lossless.
+    pub fn compact_for_wire_budget(&mut self, max_bytes: usize) -> bool {
+        if self.estimated_wire_bytes() <= max_bytes {
+            return false;
+        }
+        let tiers: [(usize, usize, usize, usize); 4] = [
+            (1024, 1536, 2048, 2048),
+            (320, 480, 768, 1024),
+            (120, 160, 256, 512),
+            (48, 64, 96, 192),
+        ];
+        let mut changed = false;
+        for (arg_cap, out_cap, diff_cap, reason_cap) in tiers {
+            for block in &mut self.transcript_blocks {
+                for act in &mut block.activities {
+                    if let Some(detail) = &mut act.detail {
+                        changed |= truncate_utf8_with_notice(detail, arg_cap);
+                    }
+                    if let Some(args) = &mut act.arguments {
+                        changed |= truncate_utf8_with_notice(args, arg_cap);
+                    }
+                    if let Some(out) = &mut act.output {
+                        changed |= truncate_utf8_with_notice(out, out_cap);
+                    }
+                    if let Some(reasoning) = &mut act.reasoning {
+                        changed |= truncate_utf8_with_notice(&mut reasoning.content, reason_cap);
+                    }
+                    for fc in &mut act.file_changes {
+                        if let Some(diff) = &mut fc.diff {
+                            changed |= truncate_utf8_with_notice(diff, diff_cap);
+                        }
+                    }
+                }
+            }
+            if self.estimated_wire_bytes() <= max_bytes {
+                return changed;
+            }
+        }
+        changed
     }
 
     /// Identifier owned by the underlying agent CLI, once its native session

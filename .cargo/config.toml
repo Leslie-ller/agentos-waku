@@ -1,4 +1,5 @@
 [env]
+CARGO_INCREMENTAL = "0"
 # Xcode ships the Metal compiler as an optional toolchain. GPUI's build script
 # invokes `xcrun metal`, so select that toolchain for precompiled shaders.
 TOOLCHAINS = "Metal"
@@ -30,6 +31,7 @@ rustflags = ["-C", "link-arg=-arm64hazardfree"]
 
 [build]
 jobs = 4
+incremental = false
 
 [profile.dev]
 debug = "line-tables-only"

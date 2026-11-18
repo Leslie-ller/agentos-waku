@@ -45,7 +45,7 @@ const MAX_CACHED_RESPONSES: usize = 2048;
 /// fetch it after reconnecting. Caching is bounded by bytes as well as count:
 /// outcomes such as a hydrated session can be megabytes, and a count-only cap
 /// would let a handful of them pin hundreds of megabytes in the daemon.
-const MAX_CACHED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CACHED_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 const NATIVE_CLIENT_HEADER: &str = "x-waku-client";
 const NATIVE_CLIENT_HEADER_VALUE: &str = "native";
 
@@ -83,6 +83,15 @@ pub struct EventSink {
 }
 
 impl EventSink {
+    #[cfg(test)]
+    pub(crate) fn test_sink() -> Self {
+        Self {
+            session_id: Uuid::nil(),
+            runtime_id: Uuid::nil(),
+            hub: Arc::new(Hub::default()),
+        }
+    }
+
     pub fn send(&self, event: WireDriverEvent) -> anyhow::Result<()> {
         self.hub.emit(self.session_id, self.runtime_id, event, true);
         Ok(())
