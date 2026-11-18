@@ -1,0 +1,10 @@
+{
+  "name": "AgentOS Waku",
+  "short_name": "AgentOS",
+  "description": "AgentOS Waku mobile & web remote control plane",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#191a1a",
+  "theme_color": "#191a1a"
+}

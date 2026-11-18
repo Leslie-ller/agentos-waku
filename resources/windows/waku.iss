@@ -33,21 +33,21 @@
 [Setup]
 ; Never change AppId: it is how Windows and every later installer recognize
 ; an existing install, and how the updater replaces rather than duplicates it.
-AppId={{8B6C6E4A-3E0F-4F0B-9C5F-2E0E9C4B7A11}
-AppName=Waku
+AppId={{A7E40518-9C2D-4B6A-8E11-5F3C2D1A90B4}
+AppName=AgentOS Waku
 AppVersion={#AppVersion}
 VersionInfoVersion={#AppVersion}
-AppPublisher=Waku
-AppPublisherURL=https://waku.sh
+AppPublisher=AgentOS
+AppPublisherURL=https://github.com/egoist/waku
 AppSupportURL=https://github.com/egoist/waku/issues
 AppUpdatesURL=https://github.com/egoist/waku/releases
-DefaultDirName={autopf}\Waku
-DefaultGroupName=Waku
-UninstallDisplayName=Waku
+DefaultDirName={autopf}\AgentOS Waku
+DefaultGroupName=AgentOS Waku
+UninstallDisplayName=AgentOS Waku
 UninstallDisplayIcon={app}\waku.exe
 LicenseFile={#StageDir}\LICENSE
 OutputDir={#OutputDir}
-OutputBaseFilename=Waku-{#AppVersion}-{#Arch}-Setup
+OutputBaseFilename=AgentOS-Waku-{#AppVersion}-{#Arch}-Setup
 SetupIconFile=AppIcon.ico
 Compression=lzma2/max
 SolidCompression=yes
@@ -59,7 +59,7 @@ ArchitecturesInstallIn64BitMode={#Architectures}
 MinVersion=10.0.17763
 ; Two installers must not race — the updater can be triggered again while an
 ; update is already applying.
-SetupMutex=WakuSetup
+SetupMutex=AgentOSWakuSetup
 ; No elevation, so an update never has to ask for it either.
 PrivilegesRequired=lowest
 DisableProgramGroupPage=yes
@@ -86,12 +86,12 @@ Source: "{#StageDir}\resources\*"; DestDir: "{app}\resources"; Flags: ignorevers
 Source: "{#StageDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Waku"; Filename: "{app}\waku.exe"
-Name: "{userdesktop}\Waku"; Filename: "{app}\waku.exe"; Tasks: desktopicon
+Name: "{group}\AgentOS Waku"; Filename: "{app}\waku.exe"
+Name: "{userdesktop}\AgentOS Waku"; Filename: "{app}\waku.exe"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: unchecked
 
 [Run]
 ; No skipifsilent: this is also how the updater's silent run brings Waku back.
-Filename: "{app}\waku.exe"; Description: "{cm:LaunchProgram,Waku}"; Flags: nowait postinstall
+Filename: "{app}\waku.exe"; Description: "{cm:LaunchProgram,AgentOS Waku}"; Flags: nowait postinstall

@@ -14,7 +14,7 @@
 import { $ } from "bun";
 import { bundleComputerUse } from "./cua-driver";
 import { existsSync, readdirSync, statSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { cp, copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -25,6 +25,7 @@ const projectRoot = resolve(import.meta.dir, "..");
  *  that rather than the full triple. */
 const architectureForTarget: Record<string, string> = {
   "x86_64-pc-windows-msvc": "x86_64",
+  "x86_64-pc-windows-gnu": "x86_64",
   "aarch64-pc-windows-msvc": "aarch64",
 };
 
@@ -97,7 +98,7 @@ if (process.platform !== "win32") {
 }
 
 const targetDirectory = resolve(process.env.CARGO_TARGET_DIR || "target");
-const releaseDirectory = join(targetDirectory, "release");
+const explicitTarget = process.env.CARGO_BUILD_TARGET?.trim();
 
 const metadata = JSON.parse(
   await $`cargo metadata --no-deps --format-version 1`.quiet().text(),
@@ -112,22 +113,32 @@ if (!version) {
 const hostLine = (await $`rustc -vV`.quiet().text())
   .split("\n")
   .find((line) => line.startsWith("host: "));
-const targetTriple = hostLine?.slice("host: ".length).trim();
+const targetTriple = explicitTarget || hostLine?.slice("host: ".length).trim();
 const architecture = targetTriple
   ? architectureForTarget[targetTriple]
   : undefined;
 if (!targetTriple || !architecture) {
   throw new Error(`Unsupported Windows target ${targetTriple ?? "(unknown)"}`);
 }
+const releaseDirectory = explicitTarget
+  ? join(targetDirectory, explicitTarget, "release")
+  : join(targetDirectory, "release");
 
-const packageDirectoryName = `waku-${version}-${targetTriple}`;
+const packageDirectoryName = `agentos-waku-${version}-${targetTriple}`;
 const archive = join(releaseDirectory, `${packageDirectoryName}.zip`);
 const installer = join(
   releaseDirectory,
-  `Waku-${version}-${architecture}-Setup.exe`,
+  `AgentOS-Waku-${version}-${architecture}-Setup.exe`,
 );
 
-await $`cargo build --locked --release --package waku --bin waku --bin waku_js_repl --package waku-daemon --bin waku-daemon --package waku-computer-use --bin waku_computer_use`;
+if (process.env.WAKU_SKIP_CARGO_BUILD !== "1") {
+  await $`cargo build --locked --release --package waku --bin waku --bin waku_js_repl --package waku-daemon --bin waku-daemon --package waku-computer-use --bin waku_computer_use`;
+}
+
+const webDistDir = resolve(
+  projectRoot,
+  process.env.WAKU_WEB_DIST || "apps/web/dist-spa",
+);
 
 const staging = await mkdtemp(join(tmpdir(), "waku-bundle-"));
 try {
@@ -147,6 +158,11 @@ try {
     join(projectRoot, "LICENSE"),
     join(packageDirectory, "LICENSE"),
   );
+  if (existsSync(join(webDistDir, "index.html"))) {
+    await cp(webDistDir, join(packageDirectory, "resources", "web-dist"), {
+      recursive: true,
+    });
+  }
 
   // Authenticode has to be applied before anything is packaged, so the
   // executables inside the zip and the installer are all signed. Unsigned

@@ -83,6 +83,7 @@ fn main() -> anyhow::Result<()> {
     )
     .context("could not load daemon settings")?;
     let task_store = waku_core::persistence::StateStore::daemon(task_path);
+    let web_dist_dir = resolve_web_dist_dir(arguments.web_dist.as_deref())?;
     waku_core::serve(
         listener,
         token,
@@ -91,8 +92,53 @@ fn main() -> anyhow::Result<()> {
         waku_core::ServerOptions {
             allowed_origins: arguments.allowed_origins.into_iter().collect(),
             allow_shutdown: arguments.parent_pid.is_some(),
+            web_dist_dir,
         },
     )
+}
+
+const WEB_DIST_ENV: &str = "AGENTOS_WAKU_WEB_DIST";
+
+fn resolve_web_dist_dir(explicit: Option<&str>) -> anyhow::Result<Option<std::path::PathBuf>> {
+    if let Some(explicit) = explicit.map(str::trim).filter(|val| !val.is_empty()) {
+        let dir = std::path::PathBuf::from(explicit);
+        if !dir.join("index.html").is_file() {
+            bail!(
+                "--web-dist directory {} does not contain index.html",
+                dir.display()
+            );
+        }
+        return Ok(Some(dir));
+    }
+
+    if let Some(env_dir) = std::env::var_os(WEB_DIST_ENV)
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.join("index.html").is_file())
+    {
+        return Ok(Some(env_dir));
+    }
+
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+    {
+        for candidate in [
+            exe_dir.join("resources").join("web-dist"),
+            exe_dir.join("..").join("Resources").join("web-dist"),
+            exe_dir.join("web-dist"),
+        ] {
+            if candidate.join("index.html").is_file() {
+                return Ok(Some(candidate));
+            }
+        }
+    }
+
+    let dev_spa = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../apps/web/dist-spa");
+    if dev_spa.join("index.html").is_file() {
+        return Ok(Some(dev_spa));
+    }
+
+    Ok(None)
 }
 
 fn ensure_bind_allowed(address: SocketAddr, allow_non_loopback: bool) -> anyhow::Result<()> {
@@ -109,6 +155,7 @@ struct Arguments {
     parent_pid: Option<u32>,
     allowed_origins: Vec<String>,
     allow_non_loopback: bool,
+    web_dist: Option<String>,
     mcp_stdio: bool,
     mcp_session_id: Option<String>,
     mcp_db: Option<String>,
@@ -121,6 +168,7 @@ impl Arguments {
         let mut parent_pid = None;
         let mut allowed_origins = Vec::new();
         let mut allow_non_loopback = false;
+        let mut web_dist = None;
         let mut mcp_stdio = false;
         let mut mcp_session_id = None;
         let mut mcp_db = None;
@@ -176,9 +224,17 @@ impl Arguments {
                 "--allow-non-loopback" => {
                     allow_non_loopback = true;
                 }
+                "--web-dist" => {
+                    web_dist = Some(
+                        arguments
+                            .next()
+                            .filter(|dir| !dir.trim().is_empty())
+                            .ok_or_else(|| anyhow!("--web-dist requires a directory"))?,
+                    );
+                }
                 "--help" | "-h" => {
                     println!(
-                        "usage: {} [--bind ADDRESS] [--allow-non-loopback] [--parent-pid PID] [--allow-origin ORIGIN]...",
+                        "usage: {} [--bind ADDRESS] [--allow-non-loopback] [--web-dist DIR] [--parent-pid PID] [--allow-origin ORIGIN]...",
                         env!("CARGO_BIN_NAME")
                     );
                     std::process::exit(0);
@@ -191,6 +247,7 @@ impl Arguments {
             parent_pid,
             allowed_origins,
             allow_non_loopback,
+            web_dist,
             mcp_stdio,
             mcp_session_id,
             mcp_db,
@@ -267,7 +324,13 @@ mod tests {
 
     #[test]
     fn parses_explicit_non_loopback_opt_in() {
-        let arguments = Arguments::parse(["--allow-non-loopback".into()]).unwrap();
+        let arguments = Arguments::parse([
+            "--allow-non-loopback".into(),
+            "--web-dist".into(),
+            "/tmp/waku-web".into(),
+        ])
+        .unwrap();
         assert!(arguments.allow_non_loopback);
+        assert_eq!(arguments.web_dist.as_deref(), Some("/tmp/waku-web"));
     }
 }

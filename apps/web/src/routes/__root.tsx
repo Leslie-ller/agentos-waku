@@ -12,9 +12,9 @@ import { DaemonProvider } from '@/lib/daemon-context'
 import { RuntimeProvider } from '@/lib/runtime-context'
 import appCss from '@/styles.css?url'
 
-const TITLE = 'Waku Web'
+const TITLE = 'AgentOS Waku'
 const DESCRIPTION =
-  'Connect securely to a Waku daemon and continue your coding-agent tasks from the browser.'
+  'Connect securely to an AgentOS Waku daemon and continue your multi-agent coding tasks from mobile or desktop browsers.'
 
 export const Route = createRootRouteWithContext<{
   queryClient: QueryClient
@@ -51,6 +51,21 @@ export const Route = createRootRouteWithContext<{
 })
 
 function RootComponent() {
+  if (
+    typeof document !== 'undefined' &&
+    document.getElementById('waku-spa-root')
+  ) {
+    return (
+      <>
+        <DaemonProvider>
+          <RuntimeProvider>
+            <Outlet />
+          </RuntimeProvider>
+        </DaemonProvider>
+        <Toaster position="top-center" richColors closeButton />
+      </>
+    )
+  }
   return (
     <RootDocument>
       <Outlet />
