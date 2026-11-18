@@ -35,7 +35,8 @@ fn app_server_request(binary: &Path, request: Value) -> anyhow::Result<Value> {
 }
 
 fn app_server_request_in(binary: &Path, cwd: &Path, request: Value) -> anyhow::Result<Value> {
-    let mut command = crate::command_env::command(binary);
+    let mut command =
+        crate::command_env::command_for_provider(crate::model::ProviderKind::Codex, binary)?;
     let command = command
         .args(["app-server", "--stdio"])
         .current_dir(cwd)

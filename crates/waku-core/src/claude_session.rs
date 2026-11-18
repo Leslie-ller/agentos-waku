@@ -66,11 +66,20 @@ pub fn provider_session_history(
 }
 
 fn projects_directory() -> anyhow::Result<PathBuf> {
-    let config_directory = std::env::var_os("CLAUDE_CONFIG_DIR")
+    let config_directory = if let Some(explicit) = std::env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
-        .ok_or_else(|| anyhow!("Claude's configuration directory could not be located"))?;
+    {
+        explicit
+    } else if let Some(profile) =
+        crate::agent_profiles::resolve_isolated_profile(crate::model::ProviderKind::Claude)?
+    {
+        profile.directory
+    } else {
+        dirs::home_dir()
+            .map(|home| home.join(".claude"))
+            .ok_or_else(|| anyhow!("Claude's configuration directory could not be located"))?
+    };
     Ok(config_directory.join("projects"))
 }
 

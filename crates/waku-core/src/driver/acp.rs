@@ -73,6 +73,17 @@ struct AcpLaunch {
 
 fn launch_for(provider: ProviderKind, reasoning_effort: Option<&str>) -> anyhow::Result<AcpLaunch> {
     match provider {
+        ProviderKind::Antigravity => {
+            let args = if cfg!(target_os = "linux") {
+                vec!["--uid=".into()]
+            } else {
+                Vec::new()
+            };
+            Ok(AcpLaunch {
+                args,
+                env: Vec::new(),
+            })
+        }
         ProviderKind::Cursor => Ok(AcpLaunch {
             args: vec!["acp".into()],
             env: Vec::new(),
@@ -151,6 +162,7 @@ impl AcpDriver {
             .map(ToOwned::to_owned);
         let stderr_lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let agent = sdk_agent(
+            provider,
             &binary,
             &cwd,
             launch,
@@ -206,6 +218,7 @@ impl AcpDriver {
 }
 
 fn sdk_agent(
+    provider: ProviderKind,
     binary: &Path,
     cwd: &Path,
     mut launch: AcpLaunch,
@@ -230,17 +243,26 @@ fn sdk_agent(
             )
         })
         .collect::<Vec<_>>();
+    crate::agent_profiles::apply_to_env_vec(provider, &mut environment)?;
     environment.append(&mut launch.env);
     environment.extend(computer_env);
 
-    // `AcpAgentConfig` deliberately contains only argv and environment. macOS
-    // `env -C` supplies the session cwd without a shell, preserving exact
-    // argument boundaries and the SDK's process-group lifecycle management.
-    let mut args = vec!["-C".to_owned(), cwd.to_owned(), binary.to_owned()];
-    args.extend(launch.args);
-    let config = AcpAgentConfig::new("/usr/bin/env")
-        .args(args)
+    #[cfg(unix)]
+    let config = {
+        // `AcpAgentConfig` deliberately contains only argv and environment.
+        // Unix `env -C` supplies the session cwd without a shell, preserving
+        // exact argument boundaries and the SDK's process-group management.
+        let mut args = vec!["-C".to_owned(), cwd.to_owned(), binary.to_owned()];
+        args.extend(launch.args);
+        AcpAgentConfig::new("/usr/bin/env")
+            .args(args)
+            .envs(environment)
+    };
+    #[cfg(windows)]
+    let config = AcpAgentConfig::new(binary)
+        .args(launch.args)
         .envs(environment);
+
     Ok(AcpAgent::new(config).with_debug(move |line, direction| {
         if direction != LineDirection::Stderr || line.trim().is_empty() {
             return;
@@ -265,7 +287,14 @@ pub(crate) fn catalog_agent(
     cwd: &Path,
 ) -> anyhow::Result<AcpAgent> {
     let launch = launch_for(provider, None)?;
-    sdk_agent(binary, cwd, launch, None, Arc::new(Mutex::new(Vec::new())))
+    sdk_agent(
+        provider,
+        binary,
+        cwd,
+        launch,
+        None,
+        Arc::new(Mutex::new(Vec::new())),
+    )
 }
 
 type PermissionResponder = Responder<RequestPermissionResponse>;
@@ -731,7 +760,22 @@ fn desired_access_mode(
     mode: RuntimeMode,
 ) -> Option<SessionModeId> {
     let modes = modes?;
-    let desired = if provider == ProviderKind::Fx {
+    let desired = if provider == ProviderKind::Antigravity {
+        let candidates: &[&str] = match mode {
+            RuntimeMode::Ask => &["default"],
+            RuntimeMode::AutoAcceptEdits => &["auto_edit", "default"],
+            RuntimeMode::Auto | RuntimeMode::FullAccess => &["yolo", "auto_edit", "default"],
+        };
+        candidates
+            .iter()
+            .find_map(|candidate| {
+                modes
+                    .available_modes
+                    .iter()
+                    .find(|item| item.id.to_string().eq_ignore_ascii_case(candidate))
+                    .map(|item| item.id.clone())
+            })?
+    } else if provider == ProviderKind::Fx {
         let desired = if mode == RuntimeMode::Ask {
             "ask"
         } else {
@@ -769,11 +813,13 @@ fn desired_access_mode(
 }
 
 /// Which session config option carries reasoning effort. ACP leaves the id to
-/// the agent: Kimi Code exposes it as its `thinking` level, while the other
-/// agents Waku drives keep it on `mode`. Grok does not use this path: its
-/// effort rides on `session/set_model` as `_meta.reasoningEffort`.
+/// the agent: Antigravity exposes `thinking_level`, Kimi Code exposes it as its
+/// `thinking` level, while the other agents Waku drives keep it on `mode`. Grok
+/// does not use this path: its effort rides on `session/set_model` as
+/// `_meta.reasoningEffort`.
 fn reasoning_effort_config_id(provider: ProviderKind) -> &'static str {
     match provider {
+        ProviderKind::Antigravity => "thinking_level",
         ProviderKind::Kimi => "thinking",
         _ => "mode",
     }
@@ -1139,8 +1185,52 @@ async fn apply_model(
     events: &DriverEventSender,
 ) {
     let Some(model) = model else {
+        if provider == ProviderKind::Antigravity
+            && let Some(effort) = reasoning_effort.filter(|effort| !effort.is_empty())
+        {
+            let _ = connection
+                .send_request(SetSessionConfigOptionRequest::new(
+                    session_id.clone(),
+                    reasoning_effort_config_id(provider),
+                    effort,
+                ))
+                .block_task()
+                .await;
+        }
         return;
     };
+    if provider == ProviderKind::Antigravity {
+        if let Some(option) = config_options
+            .and_then(|options| find_config_option(options, SessionConfigOptionCategory::Model))
+        {
+            if let Err(error) = connection
+                .send_request(SetSessionConfigOptionRequest::new(
+                    session_id.clone(),
+                    option.id.clone(),
+                    model,
+                ))
+                .block_task()
+                .await
+            {
+                let _ = events.send(DriverEvent::Error(tr!(
+                    "errors.select_model",
+                    error = error
+                )));
+                return;
+            }
+            if let Some(effort) = reasoning_effort.filter(|effort| !effort.is_empty()) {
+                let _ = connection
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session_id.clone(),
+                        reasoning_effort_config_id(provider),
+                        effort,
+                    ))
+                    .block_task()
+                    .await;
+            }
+            return;
+        }
+    }
     let cursor_model_option = (provider == ProviderKind::Cursor)
         .then_some(config_options)
         .flatten()
@@ -2793,5 +2883,376 @@ mod tests {
                 "the turn failed without naming a reason"
             ),
         }
+    }
+
+    #[test]
+    fn antigravity_launch_and_access_modes_follow_acp_contract() {
+        let launch = launch_for(ProviderKind::Antigravity, Some("low")).unwrap();
+        if cfg!(target_os = "linux") {
+            assert_eq!(launch.args, ["--uid="]);
+        } else {
+            assert!(launch.args.is_empty());
+        }
+        assert_eq!(
+            reasoning_effort_config_id(ProviderKind::Antigravity),
+            "thinking_level"
+        );
+
+        let modes: SessionModeState = serde_json::from_value(json!({
+            "currentModeId": "default",
+            "availableModes": [
+                {"id": "default", "name": "Default"},
+                {"id": "auto_edit", "name": "Auto Edit"},
+                {"id": "yolo", "name": "YOLO"}
+            ]
+        }))
+        .unwrap();
+        assert!(
+            desired_access_mode(ProviderKind::Antigravity, Some(&modes), RuntimeMode::Ask)
+                .is_none()
+        );
+        assert_eq!(
+            desired_access_mode(
+                ProviderKind::Antigravity,
+                Some(&modes),
+                RuntimeMode::AutoAcceptEdits
+            )
+            .map(|id| id.to_string()),
+            Some("auto_edit".into())
+        );
+        assert_eq!(
+            desired_access_mode(
+                ProviderKind::Antigravity,
+                Some(&modes),
+                RuntimeMode::FullAccess
+            )
+            .map(|id| id.to_string()),
+            Some("yolo".into())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_acp_driver_streams_turn_isolates_profile_and_resumes_cursor() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let sandbox = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(format!("waku-agy-acp-e2e-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let state_file = sandbox.join("rpc_log.json");
+        let fake_server = sandbox.join("fake_agy_acp.py");
+
+        let script = r#"#!/usr/bin/env python3
+import json, os, sys
+
+log_path = os.environ["FAKE_AGY_LOG"]
+def record(entry):
+    items = []
+    if os.path.exists(log_path):
+        with open(log_path, "r", encoding="utf-8") as f:
+            items = json.load(f)
+    items.append(entry)
+    with open(log_path, "w", encoding="utf-8") as f:
+        json.dump(items, f)
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+record({
+    "event": "spawn",
+    "gemini_home": os.environ.get("GEMINI_HOME"),
+    "force_file_storage": os.environ.get("AGY_ACP_FORCE_FILE_STORAGE"),
+    "cwd": os.getcwd(),
+})
+
+config_options = [
+    {
+        "id": "model",
+        "name": "Model",
+        "category": "model",
+        "type": "select",
+        "currentValue": "gemini-3.8-flash",
+        "options": [
+            {"value": "gemini-3.8-flash", "name": "Gemini 3.8 Flash"},
+            {"value": "gemini-4-carbon", "name": "Gemini 4 Carbon"},
+        ],
+    },
+    {
+        "id": "thinking_level",
+        "name": "Thinking Level",
+        "category": "thought_level",
+        "type": "select",
+        "currentValue": "high",
+        "options": [
+            {"value": "low", "name": "Low"},
+            {"value": "medium", "name": "Medium"},
+            {"value": "high", "name": "High"},
+        ],
+    },
+]
+modes = {
+    "currentModeId": "default",
+    "availableModes": [
+        {"id": "default", "name": "Default"},
+        {"id": "auto_edit", "name": "Auto Edit"},
+        {"id": "yolo", "name": "YOLO"},
+    ],
+}
+
+session_id = "agy-session-test-001"
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    msg = json.loads(raw)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    params = msg.get("params") or {}
+    record({"method": method, "params": params})
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "loadSession": True,
+                    "sessionCapabilities": {"list": {}, "resume": {}},
+                },
+                "agentInfo": {
+                    "name": "antigravity-acp",
+                    "title": "Google Antigravity",
+                    "version": "1.4.5",
+                },
+            },
+        })
+    elif method == "session/new":
+        send({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "sessionId": session_id,
+                "modes": modes,
+                "configOptions": config_options,
+            },
+        })
+    elif method == "session/resume":
+        session_id = params["sessionId"]
+        send({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "modes": modes,
+                "configOptions": config_options,
+            },
+        })
+    elif method == "session/set_mode":
+        send({"jsonrpc": "2.0", "id": req_id, "result": {}})
+    elif method == "session/set_config_option":
+        send({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"configOptions": config_options},
+        })
+    elif method == "session/prompt":
+        sid = params["sessionId"]
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": "checking isolated profile"},
+                },
+            },
+        })
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call-agy-1",
+                    "title": "read_file",
+                    "kind": "read",
+                    "status": "pending",
+                    "rawInput": {"Path": "README.md"},
+                },
+            },
+        })
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-agy-1",
+                    "status": "completed",
+                    "title": "README.md",
+                    "content": [{"type": "content", "content": {"type": "text", "text": "hello waku"}}],
+                },
+            },
+        })
+        send({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "Antigravity ACP ready."},
+                },
+            },
+        })
+        send({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"stopReason": "end_turn"},
+        })
+"#;
+        std::fs::write(&fake_server, script).unwrap();
+        std::fs::set_permissions(&fake_server, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let wrapper = sandbox.join("run_fake_agy.sh");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nexport FAKE_AGY_LOG='{}'\nexec python3 '{}' \"$@\"\n",
+                state_file.display(),
+                fake_server.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cwd = sandbox.join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        // Turn 1: fresh session/new + configOptions + streaming tool & text
+        let (events, event_rx) = crate::driver::test_event_channel();
+        let driver = AcpDriver::start(
+            ProviderKind::Antigravity,
+            DriverStartOptions {
+                binary: wrapper.clone(),
+                cwd: cwd.clone(),
+                mode: RuntimeMode::FullAccess,
+                model: Some("gemini-3.8-flash".into()),
+                reasoning_effort: Some("low".into()),
+                service_tier: None,
+                context_window: None,
+                agent_preset: None,
+                computer_use_enabled: false,
+                provider_cursor: None,
+            },
+            events,
+        )
+        .unwrap();
+
+        let cursor = loop {
+            match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                DriverEvent::Connected {
+                    provider_cursor: Some(cursor @ ProviderResumeCursor::Antigravity { .. }),
+                } => break cursor,
+                DriverEvent::Error(err) => panic!("unexpected driver error: {err}"),
+                _ => {}
+            }
+        };
+        assert_eq!(cursor.native_id(), "agy-session-test-001");
+
+        driver.prompt("First Antigravity turn".into());
+        let mut text = String::new();
+        let mut saw_tool_complete = false;
+        loop {
+            match event_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                DriverEvent::TextDelta(chunk) => text.push_str(&chunk),
+                DriverEvent::RichActivity(item) if item.complete => saw_tool_complete = true,
+                DriverEvent::TurnFinished { success, .. } => {
+                    assert!(success);
+                    break;
+                }
+                DriverEvent::Error(err) => panic!("turn 1 error: {err}"),
+                _ => {}
+            }
+        }
+        assert_eq!(text, "Antigravity ACP ready.");
+        assert!(saw_tool_complete);
+        drop(driver);
+
+        // Turn 2: resume from persisted ProviderResumeCursor::Antigravity
+        let (events2, event_rx2) = crate::driver::test_event_channel();
+        let driver2 = AcpDriver::start(
+            ProviderKind::Antigravity,
+            DriverStartOptions {
+                binary: wrapper,
+                cwd,
+                mode: RuntimeMode::FullAccess,
+                model: Some("gemini-3.8-flash".into()),
+                reasoning_effort: Some("low".into()),
+                service_tier: None,
+                context_window: None,
+                agent_preset: None,
+                computer_use_enabled: false,
+                provider_cursor: Some(cursor),
+            },
+            events2,
+        )
+        .unwrap();
+
+        loop {
+            match event_rx2.recv_timeout(Duration::from_secs(10)).unwrap() {
+                DriverEvent::Connected {
+                    provider_cursor: Some(ProviderResumeCursor::Antigravity { session_id }),
+                } => {
+                    assert_eq!(session_id, "agy-session-test-001");
+                    break;
+                }
+                DriverEvent::Error(err) => panic!("resume error: {err}"),
+                _ => {}
+            }
+        }
+        driver2.prompt("Resumed Antigravity turn".into());
+        loop {
+            match event_rx2.recv_timeout(Duration::from_secs(10)).unwrap() {
+                DriverEvent::TurnFinished { success, .. } => {
+                    assert!(success);
+                    break;
+                }
+                DriverEvent::Error(err) => panic!("turn 2 error: {err}"),
+                _ => {}
+            }
+        }
+        drop(driver2);
+
+        let recorded: Vec<Value> =
+            serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+        let spawn = recorded
+            .iter()
+            .find(|item| item.get("event").and_then(Value::as_str) == Some("spawn"))
+            .unwrap();
+        let gemini_home = spawn["gemini_home"].as_str().unwrap();
+        assert!(gemini_home.ends_with("antigravity"));
+        if let Some(personal) = dirs::home_dir().map(|h| h.join(".gemini")) {
+            assert_ne!(Path::new(gemini_home), personal);
+        }
+        assert_eq!(spawn["force_file_storage"].as_str(), Some("1"));
+        assert!(
+            recorded
+                .iter()
+                .any(|item| item.get("method").and_then(Value::as_str) == Some("session/resume"))
+        );
+        assert!(recorded.iter().any(|item| {
+            item.get("method").and_then(Value::as_str) == Some("session/set_config_option")
+                && item.pointer("/params/configId").and_then(Value::as_str)
+                    == Some("thinking_level")
+                && item.pointer("/params/value").and_then(Value::as_str) == Some("low")
+        }));
+
+        let _ = std::fs::remove_dir_all(sandbox);
     }
 }

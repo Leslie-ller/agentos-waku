@@ -321,6 +321,22 @@ fn assemble_slash_commands(
         // Harness commands are session-scoped and reported live by the Host,
         // and Kimi Code likewise publishes its whole command set over ACP
         // rather than from files Waku could scan.
+        ProviderKind::Antigravity => {
+            if let Ok(Some(profile)) =
+                crate::agent_profiles::resolve_isolated_profile(ProviderKind::Antigravity)
+            {
+                scan_skill_files(
+                    provider,
+                    &profile.directory.join("config/skills"),
+                    &mut commands,
+                );
+                scan_skill_files(
+                    provider,
+                    &profile.directory.join("antigravity-cli/skills"),
+                    &mut commands,
+                );
+            }
+        }
         ProviderKind::DeepSeek | ProviderKind::Grok | ProviderKind::Kimi => {}
     }
     // The cross-tool skill standard, read by Amp and OpenCode among others;

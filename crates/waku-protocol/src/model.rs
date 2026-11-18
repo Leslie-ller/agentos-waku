@@ -11,6 +11,7 @@ use uuid::Uuid;
 #[serde(rename_all = "camelCase")]
 pub enum ProviderKind {
     Amp,
+    Antigravity,
     Claude,
     #[default]
     Codex,
@@ -29,8 +30,9 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Amp,
+        Self::Antigravity,
         Self::Claude,
         Self::Codex,
         Self::Cursor,
@@ -46,6 +48,7 @@ impl ProviderKind {
     pub fn id(self) -> &'static str {
         match self {
             Self::Amp => "amp",
+            Self::Antigravity => "antigravity",
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Cursor => "cursor",
@@ -62,6 +65,7 @@ impl ProviderKind {
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Amp => "Amp",
+            Self::Antigravity => "Google Antigravity",
             Self::Claude => "Claude Code",
             Self::Codex => "Codex CLI",
             Self::Cursor => "Cursor CLI",
@@ -78,6 +82,7 @@ impl ProviderKind {
     pub fn short_name(self) -> &'static str {
         match self {
             Self::Amp => "Amp",
+            Self::Antigravity => "Antigravity",
             Self::Claude => "Claude",
             Self::Codex => "Codex",
             Self::Cursor => "Cursor",
@@ -94,6 +99,13 @@ impl ProviderKind {
     pub fn command(self) -> &'static str {
         match self {
             Self::Amp => "amp",
+            Self::Antigravity => {
+                if cfg!(windows) {
+                    "agy_acp_server.exe"
+                } else {
+                    "agy_acp_server.par"
+                }
+            }
             Self::Claude => "claude",
             Self::Codex => "codex",
             // Cursor documents `agent` as its primary command, but that name is
@@ -147,7 +159,8 @@ impl ProviderKind {
     pub fn supports_model_discovery(self) -> bool {
         matches!(
             self,
-            Self::Claude
+            Self::Antigravity
+                | Self::Claude
                 | Self::Codex
                 | Self::Cursor
                 | Self::DeepSeek
@@ -172,6 +185,9 @@ pub enum ProviderResumeCursor {
         thread_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fork_context: Option<String>,
+    },
+    Antigravity {
+        session_id: String,
     },
     Claude {
         session_id: String,
@@ -226,6 +242,7 @@ impl ProviderResumeCursor {
                 thread_id: id,
                 fork_context: None,
             },
+            ProviderKind::Antigravity => Self::Antigravity { session_id: id },
             ProviderKind::Claude => Self::Claude {
                 session_id: id,
                 resume_at: None,
@@ -257,6 +274,7 @@ impl ProviderResumeCursor {
     pub fn provider(&self) -> ProviderKind {
         match self {
             Self::Amp { .. } => ProviderKind::Amp,
+            Self::Antigravity { .. } => ProviderKind::Antigravity,
             Self::Claude { .. } => ProviderKind::Claude,
             Self::Codex { .. } => ProviderKind::Codex,
             Self::Cursor { .. } => ProviderKind::Cursor,
@@ -273,7 +291,8 @@ impl ProviderResumeCursor {
     pub fn native_id(&self) -> &str {
         match self {
             Self::Amp { thread_id, .. } => thread_id,
-            Self::Claude { session_id, .. }
+            Self::Antigravity { session_id }
+            | Self::Claude { session_id, .. }
             | Self::Cursor { session_id, .. }
             | Self::DeepSeek { session_id }
             | Self::Fx { session_id }
@@ -4258,7 +4277,7 @@ mod tests {
             assert!(provider.supports_conversation_fork());
             assert!(provider.supports_conversation_rollback());
         }
-        for provider in [ProviderKind::Fx, ProviderKind::Kimi] {
+        for provider in [ProviderKind::Antigravity, ProviderKind::Fx, ProviderKind::Kimi] {
             assert!(!provider.supports_conversation_fork());
             assert!(!provider.supports_conversation_rollback());
         }
@@ -4267,6 +4286,7 @@ mod tests {
     #[test]
     fn only_dynamic_provider_catalogs_are_discovered() {
         assert!(!ProviderKind::Amp.supports_model_discovery());
+        assert!(ProviderKind::Antigravity.supports_model_discovery());
         assert!(ProviderKind::Claude.supports_model_discovery());
         assert!(ProviderKind::Codex.supports_model_discovery());
         assert!(ProviderKind::Cursor.supports_model_discovery());
@@ -4342,7 +4362,7 @@ mod tests {
 
     #[test]
     fn all_contains_every_provider_kind() {
-        assert_eq!(ProviderKind::ALL.len(), 11);
+        assert_eq!(ProviderKind::ALL.len(), 12);
         let ids: std::collections::HashSet<_> =
             ProviderKind::ALL.iter().map(|kind| kind.id()).collect();
         assert_eq!(

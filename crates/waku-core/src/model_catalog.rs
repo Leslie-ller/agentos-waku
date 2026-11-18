@@ -38,6 +38,15 @@ pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
             )
         })
         .collect(),
+        ProviderKind::Antigravity => [
+            ProviderModel::new("gemini-3.8-flash", "Gemini 3.8 Flash").default(),
+            ProviderModel::new("gemini-4-carbon", "Gemini 4 Carbon"),
+            ProviderModel::new("gemini-4-argon", "Gemini 4 Argon"),
+            ProviderModel::new("gemini-4-hydrogen", "Gemini 4 Hydrogen"),
+        ]
+        .into_iter()
+        .map(|model| model.reasoning(reasoning_options(["low", "medium", "high"]), "high"))
+        .collect(),
         ProviderKind::Codex => [
             ProviderModel::new("gpt-5.6-sol", "GPT-5.6-Sol").default(),
             ProviderModel::new("gpt-5.6-terra", "GPT-5.6-Terra"),
@@ -129,6 +138,7 @@ pub fn discover_catalog(
         // Amp exposes stable agent modes rather than a model inventory. Keep
         // the picker aligned with the modes advertised by the current CLI.
         ProviderKind::Amp => (Vec::new(), None),
+        ProviderKind::Antigravity => (discover_antigravity_models(binary), None),
         ProviderKind::Codex => (discover_codex_models(binary), None),
         ProviderKind::Claude => (discover_claude_models(binary), None),
         ProviderKind::Cursor => (discover_cursor_models(binary), None),
@@ -801,6 +811,101 @@ fn parse_deepseek_model_catalog(catalog: &Value) -> Vec<ProviderModel> {
                         Some(model)
                     })
                 })
+        })
+        .collect()
+}
+
+fn discover_antigravity_models(binary: &Path) -> Vec<ProviderModel> {
+    let Ok(cwd) = crate::acp_session::catalog_working_directory() else {
+        return Vec::new();
+    };
+    let Ok(agent) = crate::driver::catalog_agent(ProviderKind::Antigravity, binary, &cwd) else {
+        return Vec::new();
+    };
+    let cwd_for_rpc = cwd.clone();
+    let request = Client.builder().name("waku-agy-catalog").connect_with(
+        agent,
+        async move |connection: ConnectionTo<Agent>| {
+            connection
+                .send_request(
+                    InitializeRequest::new(ProtocolVersion::V1)
+                        .client_capabilities(ClientCapabilities::new().terminal(false))
+                        .client_info(Implementation::new("waku", env!("CARGO_PKG_VERSION"))),
+                )
+                .block_task()
+                .await?;
+            let response = connection
+                .send_request(UntypedMessage::new(
+                    "session/new",
+                    json!({ "cwd": cwd_for_rpc, "mcpServers": [] }),
+                )?)
+                .block_task()
+                .await?;
+            Ok::<Value, agent_client_protocol::Error>(response)
+        },
+    );
+    let Ok(response) = smol::block_on(smol::future::race(
+        async move { request.await.map_err(anyhow::Error::new) },
+        async move {
+            smol::Timer::after(CURSOR_ACP_DISCOVERY_TIMEOUT).await;
+            Err(anyhow::anyhow!("Antigravity model discovery timed out"))
+        },
+    )) else {
+        let _ = std::fs::remove_dir_all(&cwd);
+        return Vec::new();
+    };
+    let _ = std::fs::remove_dir_all(&cwd);
+
+    // Clean up the 0-byte session stub created by `session/new` in the isolated profile.
+    if let Some(sid) = response.get("sessionId").and_then(Value::as_str)
+        && let Ok(Some(profile)) =
+            crate::agent_profiles::resolve_isolated_profile(ProviderKind::Antigravity)
+    {
+        let conv_dir = profile
+            .directory
+            .join("antigravity-acp")
+            .join("conversations");
+        let _ = std::fs::remove_file(conv_dir.join(format!("{sid}.db")));
+        let _ = std::fs::remove_file(conv_dir.join(format!("{sid}.meta")));
+    }
+
+    parse_antigravity_models(&response)
+}
+
+fn parse_antigravity_models(response: &Value) -> Vec<ProviderModel> {
+    let Some(options) = response.get("configOptions").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let Some(model_opt) = options.iter().find(|opt| {
+        json_option_category(opt).eq_ignore_ascii_case("model")
+            || json_option_id(opt).eq_ignore_ascii_case("model")
+    }) else {
+        return Vec::new();
+    };
+    let default_model = json_current_string(model_opt);
+    let thinking_opt = options.iter().find(|opt| {
+        json_option_category(opt).eq_ignore_ascii_case("thought_level")
+            || json_option_id(opt).eq_ignore_ascii_case("thinking_level")
+    });
+    let thinking_choices = thinking_opt.map(json_select_choices).unwrap_or_default();
+    let default_thinking = thinking_opt
+        .and_then(json_current_string)
+        .unwrap_or_else(|| "high".into());
+
+    json_select_choices(model_opt)
+        .into_iter()
+        .map(|(id, name)| {
+            let mut model = ProviderModel::new(id.clone(), name);
+            if default_model.as_deref() == Some(id.as_str()) {
+                model = model.default();
+            }
+            if !thinking_choices.is_empty() {
+                let efforts = thinking_choices
+                    .iter()
+                    .map(|(val, label)| ProviderModelOption::new(val.clone(), label.clone()));
+                model = model.reasoning(efforts, default_thinking.clone());
+            }
+            model
         })
         .collect()
 }

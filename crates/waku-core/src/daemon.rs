@@ -265,7 +265,7 @@ impl Backend for WakuBackend {
                         probe
                             .path
                             .as_deref()
-                            .and_then(crate::model::probe_provider_version)
+                            .and_then(|path| crate::model::probe_provider_version_for(provider, path))
                     })
                     .flatten();
                 if discover_models {
@@ -532,7 +532,7 @@ impl Backend for WakuBackend {
                     ProviderKind::Codex => {
                         crate::codex_session::list_provider_sessions(&binary, limit)?
                     }
-                    ProviderKind::Cursor | ProviderKind::Fx => {
+                    ProviderKind::Antigravity | ProviderKind::Cursor | ProviderKind::Fx => {
                         crate::acp_session::list_provider_sessions(provider, &binary, &[], limit)?
                     }
                     ProviderKind::OpenCode => {
@@ -606,7 +606,8 @@ impl Backend for WakuBackend {
                             VISIBLE_TURN_LIMIT,
                         )?
                     }
-                    ProviderResumeCursor::Cursor { session_id, .. }
+                    ProviderResumeCursor::Antigravity { session_id }
+                    | ProviderResumeCursor::Cursor { session_id, .. }
                     | ProviderResumeCursor::Fx { session_id }
                     | ProviderResumeCursor::Grok { session_id }
                     | ProviderResumeCursor::Kimi { session_id } => {
@@ -1291,7 +1292,7 @@ impl WakuBackend {
             }
             // Unreachable through the UI, which hides branching for providers
             // that answer `supports_conversation_fork` with false.
-            ProviderKind::Fx | ProviderKind::Kimi => {
+            ProviderKind::Antigravity | ProviderKind::Fx | ProviderKind::Kimi => {
                 bail!(
                     "{} cannot branch a conversation at a turn",
                     source.provider.display_name()
@@ -1492,7 +1493,7 @@ impl WakuBackend {
             )),
             // Unreachable through the UI, which hides rewinding for providers
             // that answer `supports_conversation_rollback` with false.
-            ProviderKind::Fx | ProviderKind::Kimi => {
+            ProviderKind::Antigravity | ProviderKind::Fx | ProviderKind::Kimi => {
                 bail!(
                     "{} cannot rewind a conversation to a turn",
                     source.provider.display_name()
