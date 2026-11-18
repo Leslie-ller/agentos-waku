@@ -38,15 +38,15 @@ else
 fi
 case "$profile" in
   debug)
-    app_name="Waku Debug"
-    helper_name="Waku Debug Computer Use"
-    bundle_identifier="sh.waku.dev"
+    app_name="AgentOS Waku Debug"
+    helper_name="AgentOS Waku Debug Computer Use"
+    bundle_identifier="app.agentos.waku.dev"
     icon_file="AppIconDev.icns"
     ;;
   release)
-    app_name="Waku"
-    helper_name="Waku Computer Use"
-    bundle_identifier="sh.waku"
+    app_name="AgentOS Waku"
+    helper_name="AgentOS Waku Computer Use"
+    bundle_identifier="app.agentos.waku"
     icon_file="AppIcon.icns"
     ;;
   *)
@@ -67,11 +67,13 @@ if [ "${WAKU_SKIP_CARGO_BUILD:-0}" != "1" ]; then
   fi
 fi
 
+bin_dir="$cargo_target_dir/${CARGO_BUILD_TARGET:+$CARGO_BUILD_TARGET/}$profile"
 bundle="$cargo_target_dir/$profile/$app_name.app"
 contents="$bundle/Contents"
 helper_bundle="$contents/Helpers/$helper_name.app"
 repl_executable="$contents/Resources/waku_js_repl"
 daemon_executable="$contents/MacOS/waku-daemon"
+web_dist_source="${WAKU_WEB_DIST:-apps/web/dist-spa}"
 swift_module_cache="$cargo_target_dir/$profile/swift-module-cache"
 helper_source="resources/computer-use/WakuComputerUse.swift"
 helper_sdk_source="resources/computer-use/CuaDriver.swift"
@@ -163,12 +165,15 @@ fi
 
 rm -rf "$bundle"
 mkdir -p "$contents/MacOS" "$contents/Resources/computer-use" "$contents/Resources/skills/waku-computer-use" "$contents/Helpers"
-cp "$cargo_target_dir/$profile/waku" "$contents/MacOS/$app_name"
-cp "$cargo_target_dir/$profile/waku_js_repl" "$repl_executable"
+cp "$bin_dir/waku" "$contents/MacOS/$app_name"
+cp "$bin_dir/waku_js_repl" "$repl_executable"
 chmod 755 "$repl_executable"
 if [ "$profile" = "release" ]; then
-  cp "$cargo_target_dir/$profile/waku-daemon" "$daemon_executable"
+  cp "$bin_dir/waku-daemon" "$daemon_executable"
   chmod 755 "$daemon_executable"
+fi
+if [ -f "$web_dist_source/index.html" ]; then
+  cp -R "$web_dist_source" "$contents/Resources/web-dist"
 fi
 cp resources/Info.plist "$contents/Info.plist"
 cp "resources/$icon_file" "$contents/Resources/AppIcon.icns"

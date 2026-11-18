@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <title>AgentOS Waku</title>
+    <meta
+      name="description"
+      content="Connect securely to an AgentOS Waku daemon and continue your multi-agent coding tasks from mobile or desktop browsers."
+    />
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta
+      name="apple-mobile-web-app-status-bar-style"
+      content="black-translucent"
+    />
+    <meta name="apple-mobile-web-app-title" content="AgentOS Waku" />
+    <meta
+      name="theme-color"
+      media="(prefers-color-scheme: light)"
+      content="#f7f7f6"
+    />
+    <meta
+      name="theme-color"
+      media="(prefers-color-scheme: dark)"
+      content="#191a1a"
+    />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <script>
+      try {
+        var d = document.documentElement,
+          p = localStorage.getItem('waku.theme'),
+          s = matchMedia('(prefers-color-scheme: dark)').matches,
+          x = p === 'dark' || (p !== 'light' && s),
+          l = localStorage.getItem('waku.language'),
+          n = (
+            (navigator.languages && navigator.languages[0]) ||
+            navigator.language ||
+            'en'
+          )
+            .replaceAll('_', '-')
+            .toLowerCase(),
+          r =
+            l === 'zh-CN' || l === 'ja' || l === 'en'
+              ? l
+              : n === 'zh-cn' || n === 'zh-sg' || n.startsWith('zh-hans')
+                ? 'zh-CN'
+                : n === 'ja' || n.startsWith('ja-')
+                  ? 'ja'
+                  : 'en'
+        d.classList.toggle('dark', x)
+        d.classList.toggle('light', !x)
+        d.lang = r
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <div id="waku-spa-root"></div>
+    <script type="module" src="/src/spa-entry.tsx"></script>
+  </body>
+</html>

@@ -4,6 +4,7 @@ import { Input } from '@/components/ui/input'
 import { StartupScreen } from '@/components/startup-screen'
 import { WakuIcon } from '@/components/waku-icon'
 import { useDocumentTitle } from '@/hooks/use-document-title'
+import { defaultDaemonAddress } from '@/lib/connection'
 import { useDaemon } from '@/lib/daemon-context'
 import { useI18n } from '@/lib/i18n'
 import wakuAppIconUrl from '../../../../website/public/app-icon.png'
@@ -12,7 +13,9 @@ export function ConnectionPanel({ title }: { title?: string } = {}) {
   const { t } = useI18n()
   const { config, phase, error, connect } = useDaemon()
   useDocumentTitle(title)
-  const [address, setAddress] = useState(config?.address ?? '')
+  const [address, setAddress] = useState(
+    () => config?.address ?? defaultDaemonAddress(),
+  )
   const [token, setToken] = useState(config?.token ?? '')
   const [tokenRevealed, setTokenRevealed] = useState(false)
   const [remember, setRemember] = useState(config?.remember ?? false)

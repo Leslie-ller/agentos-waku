@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io;
+use std::io::{self, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
@@ -12,7 +13,10 @@ use subtle::ConstantTimeEq as _;
 use tungstenite::handshake::server::{
     ErrorResponse, Request as HandshakeRequest, Response as HandshakeResponse,
 };
-use tungstenite::http::{StatusCode, header::ORIGIN};
+use tungstenite::http::{
+    HeaderValue, StatusCode,
+    header::{HOST, ORIGIN},
+};
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket, accept_hdr_with_config};
 use uuid::Uuid;
@@ -59,6 +63,11 @@ pub struct ServerOptions {
     /// shutdown control message. Service-managed daemons keep running when an
     /// authenticated client disconnects.
     pub allow_shutdown: bool,
+    /// Optional directory of prebuilt `@waku/web` SPA static assets. When set,
+    /// plain HTTP `GET`/`HEAD` requests serve the mobile/web UI directly from
+    /// this directory and same-origin WebSocket upgrades (`Origin` matching the
+    /// HTTP `Host` header) are permitted alongside `allowed_origins`.
+    pub web_dist_dir: Option<PathBuf>,
 }
 
 struct ConnectionPermit(Arc<AtomicUsize>);
@@ -612,7 +621,7 @@ pub fn serve(
 }
 
 fn handle_connection(
-    stream: TcpStream,
+    mut stream: TcpStream,
     expected_token: &str,
     dispatcher: Arc<RequestDispatcher>,
     hub: Arc<Hub>,
@@ -624,14 +633,18 @@ fn handle_connection(
     // get their bounded polling behavior from SO_RCVTIMEO below.
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    if try_handle_plain_http(&mut stream, options)? {
+        return Ok(());
+    }
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_HANDSHAKE_MESSAGE_BYTES))
         .max_frame_size(Some(MAX_HANDSHAKE_MESSAGE_BYTES));
     let allowed_origins = options.allowed_origins.clone();
+    let allow_same_origin_web = options.web_dist_dir.is_some();
     let mut socket = accept_hdr_with_config(
         stream,
         move |request: &HandshakeRequest, response: HandshakeResponse| {
-            validate_handshake(request, response, &allowed_origins)
+            validate_handshake(request, response, &allowed_origins, allow_same_origin_web)
         },
         Some(config),
     )
@@ -744,6 +757,7 @@ fn validate_handshake(
     request: &HandshakeRequest,
     response: HandshakeResponse,
     allowed_origins: &HashSet<String>,
+    allow_same_origin_web: bool,
 ) -> Result<HandshakeResponse, ErrorResponse> {
     if request.uri().path() != "/v1" {
         return Err(handshake_error(
@@ -757,10 +771,10 @@ fn validate_handshake(
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value == NATIVE_CLIENT_HEADER_VALUE);
     if let Some(origin) = request.headers().get(ORIGIN) {
-        let allowed = origin
-            .to_str()
-            .ok()
-            .is_some_and(|origin| allowed_origins.contains(origin));
+        let allowed = origin.to_str().ok().is_some_and(|origin| {
+            allowed_origins.contains(origin)
+                || (allow_same_origin_web && origin_matches_host(origin, request.headers().get(HOST)))
+        });
         if !allowed && !is_native_client {
             return Err(handshake_error(
                 StatusCode::FORBIDDEN,
@@ -769,6 +783,341 @@ fn validate_handshake(
         }
     }
     Ok(response)
+}
+
+fn origin_matches_host(origin: &str, host_header: Option<&HeaderValue>) -> bool {
+    let Some(host_header) = host_header.and_then(|val| val.to_str().ok()) else {
+        return false;
+    };
+    let host_header = host_header.trim();
+    if host_header.is_empty() {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(origin) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return false;
+    }
+    let Some(origin_host) = url.host_str() else {
+        return false;
+    };
+    let origin_authority = match url.port() {
+        Some(port) => format!("{origin_host}:{port}"),
+        None => origin_host.to_owned(),
+    };
+    origin_authority.eq_ignore_ascii_case(host_header)
+}
+
+const MAX_PLAIN_HTTP_HEADER_BYTES: usize = 16 * 1024;
+
+fn try_handle_plain_http(stream: &mut TcpStream, options: &ServerOptions) -> anyhow::Result<bool> {
+    let mut buf = [0u8; MAX_PLAIN_HTTP_HEADER_BYTES];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let header_end = loop {
+        let peeked = match stream.peek(&mut buf) {
+            Ok(0) => return Ok(false),
+            Ok(bytes) => bytes,
+            Err(error) if retryable_io(&error) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(_) => return Ok(false),
+        };
+        if let Some(pos) = find_header_end(&buf[..peeked]) {
+            break pos;
+        }
+        if peeked >= MAX_PLAIN_HTTP_HEADER_BYTES || Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    let Ok(header_text) = std::str::from_utf8(&buf[..header_end]) else {
+        return Ok(false);
+    };
+    let mut lines = header_text.split("\r\n");
+    let Some(request_line) = lines.next() else {
+        return Ok(false);
+    };
+    let mut parts = request_line.split_whitespace();
+    let (Some(method), Some(raw_target), Some(version)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return Ok(false);
+    };
+    if !version.starts_with("HTTP/1.") {
+        return Ok(false);
+    }
+
+    let mut is_websocket = false;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim();
+            let value = value.trim();
+            if (name.eq_ignore_ascii_case("upgrade")
+                && value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("websocket")))
+                || name.eq_ignore_ascii_case("sec-websocket-key")
+            {
+                is_websocket = true;
+                break;
+            }
+        }
+    }
+    if is_websocket {
+        return Ok(false);
+    }
+
+    // Consume the plain HTTP request header block before writing a response.
+    let mut consumed = vec![0u8; header_end];
+    stream.read_exact(&mut consumed)?;
+    stream.set_write_timeout(Some(SOCKET_WRITE_STALL_TIMEOUT))?;
+
+    if method != "GET" && method != "HEAD" {
+        write_http_response(
+            stream,
+            "405 Method Not Allowed",
+            "text/plain; charset=utf-8",
+            "no-store",
+            b"method not allowed\n",
+            method == "HEAD",
+        )?;
+        return Ok(true);
+    }
+
+    let raw_path = raw_target.split('?').next().unwrap_or("/");
+    if raw_path == "/healthz" {
+        let body = serde_json::json!({
+            "status": "ok",
+            "protocolVersion": PROTOCOL_VERSION,
+            "daemonVersion": env!("CARGO_PKG_VERSION"),
+            "webUi": options.web_dist_dir.is_some(),
+        })
+        .to_string();
+        write_http_response(
+            stream,
+            "200 OK",
+            "application/json; charset=utf-8",
+            "no-store",
+            body.as_bytes(),
+            method == "HEAD",
+        )?;
+        return Ok(true);
+    }
+
+    let Some(web_dist_dir) = options.web_dist_dir.as_deref() else {
+        write_http_response(
+            stream,
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "no-store",
+            b"not found\n",
+            method == "HEAD",
+        )?;
+        return Ok(true);
+    };
+
+    serve_static_web_asset(stream, web_dist_dir, raw_path, method == "HEAD")?;
+    Ok(true)
+}
+
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|pos| pos + 4)
+}
+
+fn percent_decode_path(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' {
+            if idx + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = (bytes[idx + 1] as char).to_digit(16)?;
+            let lo = (bytes[idx + 2] as char).to_digit(16)?;
+            let decoded = ((hi << 4) | lo) as u8;
+            if decoded == 0 {
+                return None;
+            }
+            out.push(decoded);
+            idx += 3;
+        } else {
+            if bytes[idx] == 0 {
+                return None;
+            }
+            out.push(bytes[idx]);
+            idx += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn serve_static_web_asset(
+    stream: &mut TcpStream,
+    web_dist_dir: &Path,
+    raw_path: &str,
+    head_only: bool,
+) -> anyhow::Result<()> {
+    let Ok(canonical_root) = std::fs::canonicalize(web_dist_dir) else {
+        write_http_response(
+            stream,
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "no-store",
+            b"web bundle directory is unavailable\n",
+            head_only,
+        )?;
+        return Ok(());
+    };
+
+    let Some(decoded_path) = percent_decode_path(raw_path) else {
+        write_http_response(
+            stream,
+            "400 Bad Request",
+            "text/plain; charset=utf-8",
+            "no-store",
+            b"invalid request path\n",
+            head_only,
+        )?;
+        return Ok(());
+    };
+
+    if !decoded_path.starts_with('/') || decoded_path.contains('\\') {
+        write_http_response(
+            stream,
+            "400 Bad Request",
+            "text/plain; charset=utf-8",
+            "no-store",
+            b"invalid request path\n",
+            head_only,
+        )?;
+        return Ok(());
+    }
+
+    let mut rel = PathBuf::new();
+    let mut last_segment = "";
+    for segment in decoded_path.split('/').filter(|seg| !seg.is_empty()) {
+        if segment == "." || segment == ".." {
+            write_http_response(
+                stream,
+                "403 Forbidden",
+                "text/plain; charset=utf-8",
+                "no-store",
+                b"forbidden\n",
+                head_only,
+            )?;
+            return Ok(());
+        }
+        last_segment = segment;
+        rel.push(segment);
+    }
+
+    let requested = if rel.as_os_str().is_empty() {
+        canonical_root.join("index.html")
+    } else {
+        canonical_root.join(&rel)
+    };
+
+    let resolved = if let Ok(found) = std::fs::canonicalize(&requested)
+        && found.starts_with(&canonical_root)
+        && found.is_file()
+    {
+        Some(found)
+    } else if !last_segment.contains('.') {
+        std::fs::canonicalize(canonical_root.join("index.html"))
+            .ok()
+            .filter(|found| found.starts_with(&canonical_root) && found.is_file())
+    } else {
+        None
+    };
+
+    let Some(file_path) = resolved else {
+        write_http_response(
+            stream,
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "no-store",
+            b"not found\n",
+            head_only,
+        )?;
+        return Ok(());
+    };
+
+    let body = std::fs::read(&file_path)?;
+    let content_type = mime_for_path(&file_path);
+    let cache_control = if rel.starts_with("assets") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    write_http_response(
+        stream,
+        "200 OK",
+        content_type,
+        cache_control,
+        &body,
+        head_only,
+    )?;
+    Ok(())
+}
+
+fn mime_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "webmanifest" => "application/manifest+json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "ico" => "image/x-icon",
+        "wasm" => "application/wasm",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    cache_control: &str,
+    body: &[u8],
+    head_only: bool,
+) -> io::Result<()> {
+    let headers = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: {cache_control}\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(headers.as_bytes())?;
+    if !head_only {
+        stream.write_all(body)?;
+    }
+    stream.flush()
 }
 
 fn handshake_error(status: StatusCode, message: &str) -> ErrorResponse {
@@ -1852,16 +2201,21 @@ mod tests {
             .unwrap();
         let response = HandshakeResponse::new(());
         assert_eq!(
-            validate_handshake(&request, response, &HashSet::new())
+            validate_handshake(&request, response, &HashSet::new(), false)
                 .unwrap_err()
                 .status(),
             StatusCode::FORBIDDEN
         );
 
         let allowed = HashSet::from(["https://app.waku.test".to_owned()]);
-        assert!(validate_handshake(&request, HandshakeResponse::new(()), &allowed).is_ok());
+        assert!(
+            validate_handshake(&request, HandshakeResponse::new(()), &allowed, false).is_ok()
+        );
         let native = HandshakeRequest::builder().uri("/v1").body(()).unwrap();
-        assert!(validate_handshake(&native, HandshakeResponse::new(()), &HashSet::new()).is_ok());
+        assert!(
+            validate_handshake(&native, HandshakeResponse::new(()), &HashSet::new(), false)
+                .is_ok()
+        );
 
         let react_native = HandshakeRequest::builder()
             .uri("/v1")
@@ -1870,7 +2224,58 @@ mod tests {
             .body(())
             .unwrap();
         assert!(
-            validate_handshake(&react_native, HandshakeResponse::new(()), &HashSet::new()).is_ok()
+            validate_handshake(
+                &react_native,
+                HandshakeResponse::new(()),
+                &HashSet::new(),
+                false,
+            )
+            .is_ok()
+        );
+
+        let same_origin_mobile = HandshakeRequest::builder()
+            .uri("/v1")
+            .header(HOST, "100.88.12.34:34123")
+            .header(ORIGIN, "http://100.88.12.34:34123")
+            .body(())
+            .unwrap();
+        assert!(
+            validate_handshake(
+                &same_origin_mobile,
+                HandshakeResponse::new(()),
+                &HashSet::new(),
+                true,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            validate_handshake(
+                &same_origin_mobile,
+                HandshakeResponse::new(()),
+                &HashSet::new(),
+                false,
+            )
+            .unwrap_err()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let cross_origin_evil = HandshakeRequest::builder()
+            .uri("/v1")
+            .header(HOST, "100.88.12.34:34123")
+            .header(ORIGIN, "https://attacker.example")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            validate_handshake(
+                &cross_origin_evil,
+                HandshakeResponse::new(()),
+                &HashSet::new(),
+                true,
+            )
+            .unwrap_err()
+            .status(),
+            StatusCode::FORBIDDEN
         );
 
         let forged_native = HandshakeRequest::builder()
@@ -1880,9 +2285,14 @@ mod tests {
             .body(())
             .unwrap();
         assert_eq!(
-            validate_handshake(&forged_native, HandshakeResponse::new(()), &HashSet::new())
-                .unwrap_err()
-                .status(),
+            validate_handshake(
+                &forged_native,
+                HandshakeResponse::new(()),
+                &HashSet::new(),
+                false,
+            )
+            .unwrap_err()
+            .status(),
             StatusCode::FORBIDDEN
         );
     }
@@ -2265,5 +2675,118 @@ mod tests {
             computer_use_enabled: false,
             provider_cursor: None,
         }
+    }
+
+    #[test]
+    fn http_serves_embedded_web_ui_and_allows_same_origin_authenticated_websocket() {
+        use tungstenite::client::IntoClientRequest as _;
+
+        let root = std::env::temp_dir().join(format!("waku-web-dist-{}", Uuid::new_v4()));
+        let assets = root.join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(
+            root.join("index.html"),
+            "<!doctype html><html><body>AgentOS Waku Mobile SPA</body></html>",
+        )
+        .unwrap();
+        std::fs::write(assets.join("app.js"), "console.log('waku-spa-ok');\n").unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let web_root = root.clone();
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                "secret-mobile-token".into(),
+                Arc::new(TestBackend::default()),
+                server_shutdown,
+                ServerOptions {
+                    allow_shutdown: true,
+                    web_dist_dir: Some(web_root),
+                    ..ServerOptions::default()
+                },
+            )
+            .unwrap()
+        });
+
+        let send_http = |raw_req: &str| -> String {
+            let mut tcp = TcpStream::connect(address).unwrap();
+            tcp.write_all(raw_req.as_bytes()).unwrap();
+            tcp.flush().unwrap();
+            let mut out = String::new();
+            tcp.read_to_string(&mut out).unwrap();
+            out
+        };
+
+        let root_resp = send_http(&format!(
+            "GET / HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+        ));
+        assert!(root_resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(root_resp.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(root_resp.contains("Referrer-Policy: no-referrer\r\n"));
+        assert!(root_resp.contains("AgentOS Waku Mobile SPA"));
+
+        let spa_route_resp = send_http(&format!(
+            "GET /settings/general?session=abc HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+        ));
+        assert!(spa_route_resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(spa_route_resp.contains("AgentOS Waku Mobile SPA"));
+
+        let js_resp = send_http(&format!(
+            "GET /assets/app.js HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+        ));
+        assert!(js_resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(js_resp.contains("Content-Type: text/javascript; charset=utf-8\r\n"));
+        assert!(js_resp.contains("Cache-Control: public, max-age=31536000, immutable\r\n"));
+        assert!(js_resp.contains("console.log('waku-spa-ok');"));
+
+        let health_resp = send_http(&format!(
+            "GET /healthz HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+        ));
+        assert!(health_resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(health_resp.contains("\"webUi\":true"));
+
+        let traversal_resp = send_http(&format!(
+            "GET /..%2f..%2fetc/passwd HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+        ));
+        assert!(traversal_resp.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+
+        // Same-origin browser WebSocket upgrade succeeds and requires valid Hello token.
+        let ws_url = format!("ws://{address}/v1");
+        let mut ws_req = ws_url.as_str().into_client_request().unwrap();
+        ws_req
+            .headers_mut()
+            .insert(ORIGIN, format!("http://{address}").parse().unwrap());
+        let tcp = TcpStream::connect(address).unwrap();
+        let (mut ws, _) = tungstenite::client(ws_req, tcp).unwrap();
+        write_json(
+            &mut ws,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                token: "secret-mobile-token".into(),
+                client_id: Uuid::new_v4(),
+                resume_from: Vec::new(),
+            },
+        )
+        .unwrap();
+        let Message::Text(hello_text) = ws.read().unwrap() else {
+            panic!("expected server hello");
+        };
+        let hello: ServerMessage = serde_json::from_str(hello_text.as_ref()).unwrap();
+        assert!(matches!(hello, ServerMessage::Hello { .. }));
+
+        // Untrusted cross-origin WebSocket upgrade is rejected during HTTP handshake.
+        let mut evil_req = ws_url.as_str().into_client_request().unwrap();
+        evil_req
+            .headers_mut()
+            .insert(ORIGIN, "https://evil.example".parse().unwrap());
+        let evil_tcp = TcpStream::connect(address).unwrap();
+        assert!(tungstenite::client(evil_req, evil_tcp).is_err());
+
+        write_json(&mut ws, &ClientMessage::Shutdown).unwrap();
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 }

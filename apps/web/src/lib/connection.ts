@@ -59,8 +59,53 @@ export function validateConnectionConfig(
   }
 }
 
+export function defaultDaemonAddress(): string {
+  if (typeof window === 'undefined') return ''
+  const { protocol, origin } = window.location
+  if (protocol !== 'http:' && protocol !== 'https:') return ''
+  try {
+    return normalizeDaemonAddress(origin)
+  } catch {
+    return ''
+  }
+}
+
+export function parsePairingHash(
+  hash: string,
+  fallbackOrigin?: string,
+): ConnectionConfig | null {
+  const trimmed = hash.replace(/^#/, '').trim()
+  if (!trimmed) return null
+  const params = new URLSearchParams(trimmed)
+  const token = params.get('token')?.trim()
+  if (!token) return null
+  const address = params.get('address')?.trim() || fallbackOrigin?.trim() || ''
+  if (!address) return null
+  const rememberParam = params.get('remember')?.trim().toLowerCase()
+  const remember = rememberParam !== '0' && rememberParam !== 'false'
+  try {
+    return validateConnectionConfig({ address, token, remember })
+  } catch {
+    return null
+  }
+}
+
 export function loadStoredConnection(): ConnectionConfig | null {
   if (typeof window === 'undefined') return null
+  const paired = parsePairingHash(window.location.hash, window.location.origin)
+  if (paired) {
+    storeConnection(paired)
+    try {
+      window.history.replaceState(
+        null,
+        '',
+        `${window.location.pathname}${window.location.search}`,
+      )
+    } catch {
+      // Ignore restricted history contexts.
+    }
+    return paired
+  }
   return (
     parseStoredConnection(window.sessionStorage.getItem(SESSION_KEY), false) ??
     parseStoredConnection(window.localStorage.getItem(PERSISTENT_KEY), true)

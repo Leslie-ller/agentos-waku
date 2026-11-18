@@ -1,5 +1,6 @@
 .DS_Store
 dist
+dist-spa
 node_modules
 .tanstack
 .wrangler

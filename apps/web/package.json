@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite dev",
     "build": "vite build && tsc --noEmit",
+    "build:spa": "vite build --config vite.spa.config.ts",
     "preview": "vite preview",
     "deploy": "bun run build && wrangler deploy",
     "typecheck": "tsc --noEmit",
