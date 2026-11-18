@@ -389,11 +389,20 @@ impl Backend for WakuBackend {
                         .iter_mut()
                         .find(|existing| existing.id == session.id)
                     {
-                        if session_projection_precedes(
-                            existing,
-                            &session,
-                            active_runtimes.get(&session.id).copied(),
-                        ) {
+                        let incoming_lacks_transcript = session.messages.is_empty()
+                            && session.transcript_blocks.is_empty()
+                            && session.turns.is_empty();
+                        let existing_owns_transcript = !existing.detail_loaded
+                            || !existing.messages.is_empty()
+                            || !existing.transcript_blocks.is_empty()
+                            || !existing.turns.is_empty();
+                        if (incoming_lacks_transcript && existing_owns_transcript)
+                            || session_projection_precedes(
+                                existing,
+                                &session,
+                                active_runtimes.get(&session.id).copied(),
+                            )
+                        {
                             merge_stale_session_metadata(existing, session);
                         } else {
                             preserve_daemon_checkpoints(existing, &mut session);
@@ -472,7 +481,11 @@ impl Backend for WakuBackend {
                     .find(|session| session.id == session_id)
                 {
                     self.task_store.hydrate(session)?;
-                    Some(session.clone())
+                    let mut outbound = session.clone();
+                    outbound.compact_for_wire_budget(
+                        waku_protocol::HYDRATE_WIRE_SOFT_BUDGET_BYTES,
+                    );
+                    Some(outbound)
                 } else {
                     None
                 };
@@ -2235,5 +2248,124 @@ mod tests {
             DriverEvent::PromptSubmitted { message, turn_id: decoded_turn, message_id: decoded_message }
                 if message == "ship it" && decoded_turn == turn_id && decoded_message == message_id
         ));
+    }
+
+    #[test]
+    fn oversized_monster_session_hydrates_within_wire_budget_without_mutating_sqlite() {
+        let dir = std::env::temp_dir().join(format!("agentos-waku-monster-{}", Uuid::new_v4()));
+        let settings = DaemonSettingsStore::open(dir.join("settings.json")).unwrap();
+        let store = StateStore::daemon(dir.join("app.db"));
+
+        let project = Project::from_path(dir.join("repo"));
+        let mut monster = AgentSession::new(project.id, ProviderKind::Codex);
+        monster.begin_turn("analyze 68MB monster history");
+        monster.push_message(crate::model::MessageRole::Assistant, "completed massive audit");
+        let big_arg = "a".repeat(16 * 1024);
+        let big_out = "b".repeat(18 * 1024);
+        let mut activities = Vec::with_capacity(2000);
+        for i in 0..2000 {
+            let mut item = crate::model::ActivityItem::new(
+                Some(format!("call-{i}")),
+                ActivityKind::Command,
+                format!("cargo test case_{i}"),
+                Some(big_arg.clone()),
+                true,
+            );
+            item.arguments = Some(big_arg.clone());
+            item.output = Some(big_out.clone());
+            activities.push(item);
+        }
+        monster.transcript_blocks.push(crate::model::TranscriptBlock {
+            after_message: 1,
+            turn_id: monster.turns.first().map(|t| t.id),
+            activities,
+        });
+        monster.finish_active_turn(crate::model::TurnStatus::Completed);
+        assert!(monster.estimated_wire_bytes() > 64 * 1024 * 1024);
+
+        let monster_id = monster.id;
+        let mut initial = PersistedState::empty();
+        initial.projects.push(project.clone());
+        initial.push_session(monster);
+        store.save(&mut initial).unwrap();
+
+        let backend = WakuBackend::new(settings, store).unwrap();
+        let sink = crate::server::EventSink::test_sink();
+        let payload = backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id: Uuid::nil(),
+                    runtime_id: Uuid::nil(),
+                    command: Command::HydrateSession {
+                        session_id: monster_id,
+                    },
+                },
+                sink.clone(),
+            )
+            .unwrap();
+
+        let ResponsePayload::Session {
+            session: Some(hydrated),
+        } = payload
+        else {
+            panic!("expected hydrated session payload");
+        };
+        let wire_json = serde_json::to_vec(&hydrated).unwrap();
+        assert!(
+            wire_json.len() <= waku_protocol::HYDRATE_WIRE_SOFT_BUDGET_BYTES,
+            "hydrated wire payload ({}) exceeded soft budget",
+            wire_json.len()
+        );
+        assert_eq!(hydrated.messages.len(), 2);
+        assert_eq!(hydrated.transcript_blocks[0].activities.len(), 2000);
+        assert!(
+            hydrated.transcript_blocks[0].activities[0]
+                .output
+                .as_deref()
+                .unwrap()
+                .contains("[truncated")
+        );
+
+        // Verify skeleton metadata save never wipes stored monster transcript
+        let mut skeleton = hydrated.list_projection();
+        skeleton.title = "Renamed without hydration".into();
+        skeleton.updated_at += 500;
+        backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id: Uuid::nil(),
+                    runtime_id: Uuid::nil(),
+                    command: Command::SaveTaskState {
+                        projects: vec![project],
+                        live_session_ids: vec![monster_id],
+                        sessions: vec![skeleton],
+                    },
+                },
+                sink,
+            )
+            .unwrap();
+
+        // Reload directly from SQLite and confirm all 2000 raw 18KB outputs remain lossless!
+        let verify_store = StateStore::daemon(dir.join("app.db"));
+        let mut reloaded = verify_store.load().unwrap();
+        let saved = reloaded
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == monster_id)
+            .unwrap();
+        assert_eq!(saved.title, "Renamed without hydration");
+        verify_store.hydrate(saved).unwrap();
+        assert_eq!(saved.transcript_blocks[0].activities.len(), 2000);
+        assert_eq!(
+            saved.transcript_blocks[0].activities[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .len(),
+            18 * 1024
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -28,7 +28,6 @@ use uuid::Uuid;
 use crate::blob_store::BlobStore;
 use crate::computer_use::ComputerAppGrant;
 use crate::i18n::AppLanguage;
-use crate::identity::DATA_DIRECTORY_NAME;
 use crate::model::{
     AgentSession, FavoriteModel, Message, MessageAttachment, MessageRole, Project, ProviderKind,
     RuntimeMode, SessionWorkspace,
@@ -911,6 +910,11 @@ impl StateStore {
     /// thrown away by deleting one directory. Release builds use the usual
     /// per-user application support directory.
     pub fn default_path() -> PathBuf {
+        if let Some(custom) =
+            std::env::var_os(waku_protocol::identity::DATA_DIR_ENV).filter(|val| !val.is_empty())
+        {
+            return PathBuf::from(custom).join("app.db");
+        }
         if cfg!(debug_assertions) {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
@@ -919,18 +923,13 @@ impl StateStore {
                 .join("temp")
                 .join("app.db")
         } else {
-            dirs::data_local_dir()
-                .unwrap_or_else(std::env::temp_dir)
-                .join(DATA_DIRECTORY_NAME)
-                .join("app.db")
+            waku_protocol::identity::default_release_data_dir().join("app.db")
         }
     }
 
     pub fn new(path: PathBuf) -> Self {
         let directory = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
-        let configuration_directory = dirs::home_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join(".waku");
+        let configuration_directory = waku_protocol::identity::default_config_dir();
         let (app_settings_path, legacy_settings_paths) = if cfg!(debug_assertions) {
             (
                 directory.join("app.json"),
@@ -1597,6 +1596,7 @@ fn session_data(session: &AgentSession) -> io::Result<String> {
     let mut value = serde_json::to_value(session).map_err(to_io_error)?;
     if let Some(object) = value.as_object_mut() {
         object.remove("messages");
+        object.remove("detail_loaded");
     }
     serde_json::to_string(&value).map_err(to_io_error)
 }
@@ -2556,10 +2556,8 @@ mod tests {
         }
         #[cfg(not(debug_assertions))]
         {
-            assert_eq!(directory, Some(std::ffi::OsStr::new("Waku")));
-            let configuration_directory = dirs::home_dir()
-                .unwrap_or_else(std::env::temp_dir)
-                .join(".waku");
+            assert_eq!(directory, Some(std::ffi::OsStr::new(DATA_DIRECTORY_NAME)));
+            let configuration_directory = waku_protocol::identity::default_config_dir();
             assert_eq!(
                 store.app_settings_path,
                 configuration_directory.join("app.json")

@@ -17,7 +17,6 @@ use uuid::Uuid;
 use crate::{Command, DaemonExposureSettings, DaemonSettings, DaemonSupervisor, ResponsePayload};
 use waku_protocol::computer_use::ComputerAppGrant;
 use waku_protocol::i18n::AppLanguage;
-use waku_protocol::identity::DATA_DIRECTORY_NAME;
 use waku_protocol::model::{
     AgentSession, FavoriteModel, Project, ProviderKind, ProviderResumeCursor,
     ProviderSessionHistory, ProviderSessionSummary, RuntimeMode,
@@ -34,6 +33,10 @@ const APP_STATE_VERSION: u32 = 1;
 
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 252.0;
 pub const DEFAULT_RIGHT_PANEL_WIDTH: f32 = 460.0;
+/// Maximum number of clean, idle background transcripts kept hydrated in a
+/// desktop client's memory. Older idle sessions revert to list skeletons and
+/// reload from `waku-daemon` on demand.
+pub const CLIENT_RESIDENT_TRANSCRIPT_WINDOW: usize = 8;
 
 /// How the desktop groups task history in the sidebar.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -431,6 +434,46 @@ impl PersistedState {
         self.sessions.push(session);
     }
 
+    /// Releases the resident transcripts of hydrated background sessions that
+    /// are persisted, unmodified, idle, and outside the newest `keep` by
+    /// `updated_at`.
+    pub fn trim_idle_transcripts(&mut self, pinned: &HashSet<Uuid>, keep: usize) -> usize {
+        let selected = self.selected_session;
+        let mut candidates = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, session)| {
+                let has_transcript = !(session.messages.is_empty()
+                    && session.transcript_blocks.is_empty()
+                    && session.turns.is_empty()
+                    && session.queued_messages.is_empty());
+                if session.detail_loaded
+                    && session.has_started()
+                    && has_transcript
+                    && Some(session.id) != selected
+                    && !session.status.is_busy()
+                    && !self.dirty_sessions.contains(&session.id)
+                    && !pinned.contains(&session.id)
+                {
+                    Some((index, session.updated_at))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() <= keep {
+            return 0;
+        }
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut released = 0;
+        for (index, _) in candidates.into_iter().skip(keep) {
+            self.sessions[index].release_transcript();
+            released += 1;
+        }
+        released
+    }
+
     pub fn empty() -> Self {
         Self {
             version: STATE_VERSION,
@@ -724,9 +767,7 @@ impl PersistedState {
 }
 
 fn configuration_directory() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join(".waku")
+    waku_protocol::identity::default_config_dir()
 }
 
 fn default_app_settings_path() -> PathBuf {
@@ -827,6 +868,11 @@ pub struct StateStore {
 
 impl StateStore {
     pub fn default_path() -> PathBuf {
+        if let Some(custom) =
+            std::env::var_os(waku_protocol::identity::DATA_DIR_ENV).filter(|val| !val.is_empty())
+        {
+            return PathBuf::from(custom).join("app.db");
+        }
         if cfg!(debug_assertions) {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
@@ -835,10 +881,7 @@ impl StateStore {
                 .join("temp")
                 .join("app.db")
         } else {
-            dirs::data_local_dir()
-                .unwrap_or_else(std::env::temp_dir)
-                .join(DATA_DIRECTORY_NAME)
-                .join("app.db")
+            waku_protocol::identity::default_release_data_dir().join("app.db")
         }
     }
 
@@ -1233,6 +1276,55 @@ mod tests {
         restore_task_state_skeletons(&mut sessions);
         assert!(!sessions[0].detail_loaded);
         assert!(sessions[0].has_started());
+    }
+
+    #[test]
+    fn client_trim_idle_transcripts_keeps_window_and_protects_selected_dirty_pinned_and_busy() {
+        let mut state = PersistedState::empty();
+        let project = Project::from_path(PathBuf::from("/tmp/project"));
+        let project_id = project.id;
+        state.projects.push(project);
+
+        let mut ids = Vec::new();
+        for i in 0..22_u64 {
+            let mut session = AgentSession::new(project_id, ProviderKind::Codex);
+            session.begin_turn(format!("prompt {i}"));
+            session.push_message(waku_protocol::model::MessageRole::Assistant, format!("reply {i}"));
+            session.finish_active_turn(waku_protocol::model::TurnStatus::Completed);
+            session.updated_at = 1000 + i;
+            ids.push(session.id);
+            state.sessions.push(session);
+        }
+
+        // Oldest 4 get special protections: selected, pinned, dirty, busy
+        let selected_id = ids[0];
+        let pinned_id = ids[1];
+        let dirty_id = ids[2];
+        let busy_id = ids[3];
+
+        state.selected_session = Some(selected_id);
+        state.mark_session_dirty(dirty_id);
+        state.sessions[3].status = waku_protocol::model::SessionStatus::Working;
+
+        let pinned = HashSet::from([pinned_id]);
+        let released = state.trim_idle_transcripts(&pinned, CLIENT_RESIDENT_TRANSCRIPT_WINDOW);
+
+        // 22 total - 4 protected = 18 releasable candidates; keeping newest 8 evicts 10 (indices 4..14)
+        assert_eq!(released, 10);
+        for protected in [selected_id, pinned_id, dirty_id, busy_id] {
+            let s = state.sessions.iter().find(|s| s.id == protected).unwrap();
+            assert!(s.detail_loaded, "protected session {protected} must stay hydrated");
+            assert!(!s.messages.is_empty());
+        }
+        for evicted_idx in 4..14 {
+            assert!(!state.sessions[evicted_idx].detail_loaded);
+            assert!(state.sessions[evicted_idx].messages.is_empty());
+            assert!(state.sessions[evicted_idx].has_started(), "evicted skeleton remains started history");
+        }
+        for kept_idx in 14..22 {
+            assert!(state.sessions[kept_idx].detail_loaded);
+            assert!(!state.sessions[kept_idx].messages.is_empty());
+        }
     }
 }
 

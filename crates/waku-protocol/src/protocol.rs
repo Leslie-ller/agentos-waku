@@ -20,7 +20,8 @@ use crate::usage_history::{UsageHistory, UsageWindow};
 use crate::workspace::{WorkspaceOperation, WorkspaceResult};
 
 pub const PROTOCOL_VERSION: u32 = 7;
-pub const MAX_WIRE_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
+pub const MAX_WIRE_MESSAGE_BYTES: usize = 96 * 1024 * 1024;
+pub const HYDRATE_WIRE_SOFT_BUDGET_BYTES: usize = 40 * 1024 * 1024;
 pub const DAEMON_TOKEN_ENV: &str = "WAKU_DAEMON_TOKEN";
 pub const DAEMON_ADDRESS_ENV: &str = "WAKU_DAEMON_ADDRESS";
 pub const APP_EXECUTABLE_ENV: &str = "WAKU_APP_EXECUTABLE";

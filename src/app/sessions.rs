@@ -148,6 +148,9 @@ impl Waku {
                             waku.reset_visible_state();
                             waku.reset_transcript_rows(waku.transcript_row_count());
                             waku.refresh_composer_sources(cx);
+                            waku.trim_client_idle_transcripts();
+                        } else {
+                            waku.trim_client_idle_transcripts();
                         }
                     }
                     Err(error) => {
@@ -224,6 +227,7 @@ impl Waku {
         self.refresh_composer_sources(cx);
         self.reset_transcript_rows(self.transcript_row_count());
         self.save();
+        self.trim_client_idle_transcripts();
         if self
             .selected_session()
             .is_some_and(AgentSession::has_started)
@@ -231,6 +235,24 @@ impl Waku {
             self.start_runtime_attachment(session_id, cx);
         }
         cx.notify();
+    }
+
+    /// Evicts clean, idle background session transcripts beyond the desktop
+    /// residency window while keeping the active selection, attached runtimes,
+    /// and in-flight hydrations resident.
+    pub(super) fn trim_client_idle_transcripts(&mut self) {
+        let mut pinned: HashSet<Uuid> = self.runtimes.keys().copied().collect();
+        pinned.extend(self.session_hydrations.iter().copied());
+        if let Some(pending) = self.pending_session_activation {
+            pinned.insert(pending.session_id);
+        }
+        if let Some(selected) = self.state.selected_session {
+            pinned.insert(selected);
+        }
+        self.state.trim_idle_transcripts(
+            &pinned,
+            waku_client::persistence::CLIENT_RESIDENT_TRANSCRIPT_WINDOW,
+        );
     }
 
     /// Drops cached answers about the workspace on disk.
