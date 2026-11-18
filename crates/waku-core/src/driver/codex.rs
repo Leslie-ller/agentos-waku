@@ -210,7 +210,16 @@ fn configure_computer_use_command(command: &mut Command, config: Option<&CodexCo
 }
 
 impl CodexDriver {
+    #[cfg(test)]
     pub fn start(options: DriverStartOptions, events: DriverEventSender) -> anyhow::Result<Self> {
+        Self::start_with_mcp(options, None, events)
+    }
+
+    pub fn start_with_mcp(
+        options: DriverStartOptions,
+        mcp_companion: Option<crate::mcp_companion::McpCompanionLaunch>,
+        events: DriverEventSender,
+    ) -> anyhow::Result<Self> {
         let DriverStartOptions {
             binary,
             cwd,
@@ -253,6 +262,28 @@ impl CodexDriver {
         )?;
         command.args(["app-server", "--stdio"]);
         configure_computer_use_command(&mut command, computer_use.as_ref());
+        if let Some(companion) = mcp_companion.as_ref() {
+            let cmd_toml = toml::Value::String(companion.executable.to_string_lossy().into_owned());
+            let args_toml = toml::Value::Array(
+                companion
+                    .args
+                    .iter()
+                    .cloned()
+                    .map(toml::Value::String)
+                    .collect(),
+            );
+            command
+                .arg("-c")
+                .arg(format!(
+                    "mcp_servers.\"{}\".command={}",
+                    companion.server_name, cmd_toml
+                ))
+                .arg("-c")
+                .arg(format!(
+                    "mcp_servers.\"{}\".args={}",
+                    companion.server_name, args_toml
+                ));
+        }
         let command = command
             .current_dir(&cwd)
             .stdin(Stdio::piped())

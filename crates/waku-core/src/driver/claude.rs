@@ -167,7 +167,16 @@ fn configure_stream_command(command: &mut Command, mode: RuntimeMode) {
 }
 
 impl ClaudeDriver {
+    #[cfg(test)]
     pub fn start(options: DriverStartOptions, events: DriverEventSender) -> anyhow::Result<Self> {
+        Self::start_with_mcp(options, None, events)
+    }
+
+    pub fn start_with_mcp(
+        options: DriverStartOptions,
+        mcp_companion: Option<crate::mcp_companion::McpCompanionLaunch>,
+        events: DriverEventSender,
+    ) -> anyhow::Result<Self> {
         let DriverStartOptions {
             binary,
             cwd,
@@ -216,6 +225,18 @@ impl ClaudeDriver {
             command.args(["--resume", &session_id]);
         } else {
             command.args(["--session-id", &session_id]);
+        }
+        if let Some(companion) = mcp_companion.as_ref() {
+            let mcp_json = serde_json::json!({
+                "mcpServers": {
+                    companion.server_name.clone(): {
+                        "type": "stdio",
+                        "command": companion.executable,
+                        "args": companion.args,
+                    }
+                }
+            });
+            command.args(["--mcp-config", &mcp_json.to_string()]);
         }
 
         let command = command

@@ -172,6 +172,32 @@ impl ProviderKind {
                 | Self::Pi
         )
     }
+
+    /// Providers that participate in lossless in-place cross-agent handoff via
+    /// [`AgentSession::parked_cursors`].
+    pub fn supports_in_place_handoff(self) -> bool {
+        matches!(
+            self,
+            Self::Antigravity
+                | Self::Claude
+                | Self::Codex
+                | Self::Cursor
+                | Self::DeepSeek
+                | Self::Grok
+                | Self::Kimi
+                | Self::OpenCode
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ParkedProviderCursor {
+    pub provider: ProviderKind,
+    pub cursor: ProviderResumeCursor,
+    pub parked_at_turn_count: usize,
+    pub parked_at_message_count: usize,
+    pub parked_at: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
@@ -995,6 +1021,15 @@ pub struct AgentSession {
     pub last_reply_at: Option<u64>,
     #[serde(default)]
     pub provider_cursor: Option<ProviderResumeCursor>,
+    /// Native provider cursors parked when the user switched this task to
+    /// another agent in place (`Codex -> Antigravity -> Codex`), enabling warm
+    /// delta resume instead of starting a blank native thread on return.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parked_cursors: Vec<ParkedProviderCursor>,
+    /// Context digest queued for the next outbound provider turn after an
+    /// in-place agent switch; cleared once delivered to the target driver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_handoff_seed: Option<String>,
     /// Slash commands the provider reported for this session's live process,
     /// kept so a resumed session still completes them before its next
     /// handshake.
@@ -1078,6 +1113,8 @@ impl AgentSession {
             last_reply_at: None,
             detail_loaded: true,
             provider_cursor: None,
+            parked_cursors: Vec::new(),
+            pending_handoff_seed: None,
             available_commands: Vec::new(),
             thread_goal: None,
             context_usage: None,
@@ -1114,6 +1151,8 @@ impl AgentSession {
             updated_at: self.updated_at,
             last_reply_at: self.last_reply_at,
             provider_cursor: None,
+            parked_cursors: Vec::new(),
+            pending_handoff_seed: None,
             available_commands: Vec::new(),
             thread_goal: None,
             context_usage: None,
@@ -1317,7 +1356,152 @@ impl AgentSession {
     }
 
     pub fn can_choose_model(&self, provider: ProviderKind) -> bool {
-        !self.status.is_busy() && (self.messages.is_empty() || self.provider == provider)
+        !self.status.is_busy()
+            && (self.messages.is_empty()
+                || self.provider == provider
+                || (self.provider.supports_in_place_handoff()
+                    && provider.supports_in_place_handoff()))
+    }
+
+    /// Switches this task to `target` in place, parking the outgoing provider's
+    /// native resume cursor in [`Self::parked_cursors`] and either restoring a
+    /// previously parked cursor for `target` (warm delta handoff) or seeding a
+    /// fresh native session with a bounded transcript digest (cold handoff).
+    pub fn switch_provider(&mut self, target: ProviderKind) -> bool {
+        if self.provider == target {
+            return false;
+        }
+        let now = unix_time();
+        let outgoing = self.provider;
+
+        if self.messages.is_empty() {
+            self.provider = target;
+            self.provider_cursor = None;
+            self.pending_handoff_seed = None;
+            self.agent_preset = None;
+            self.available_commands.clear();
+            self.updated_at = now;
+            return true;
+        }
+
+        if let Some(cursor) = self.provider_cursor.take() {
+            self.parked_cursors
+                .retain(|entry| entry.provider != outgoing);
+            self.parked_cursors.push(ParkedProviderCursor {
+                provider: outgoing,
+                cursor,
+                parked_at_turn_count: self.turns.len(),
+                parked_at_message_count: self.messages.len(),
+                parked_at: now,
+            });
+        }
+
+        if let Some(idx) = self
+            .parked_cursors
+            .iter()
+            .position(|entry| entry.provider == target)
+        {
+            let resumed = self.parked_cursors.remove(idx);
+            self.provider_cursor = Some(resumed.cursor);
+            self.pending_handoff_seed = self.build_handoff_context(
+                outgoing,
+                target,
+                resumed.parked_at_message_count,
+                true,
+            );
+        } else {
+            self.provider_cursor = None;
+            self.pending_handoff_seed = self.build_handoff_context(outgoing, target, 0, false);
+        }
+
+        self.provider = target;
+        self.agent_preset = None;
+        self.available_commands.clear();
+        self.updated_at = now;
+        true
+    }
+
+    pub fn take_pending_handoff_seed(&mut self) -> Option<String> {
+        let seed = self.pending_handoff_seed.take()?;
+        self.updated_at = unix_time();
+        Some(seed)
+    }
+
+    fn build_handoff_context(
+        &self,
+        from: ProviderKind,
+        to: ProviderKind,
+        start_message_idx: usize,
+        warm_return: bool,
+    ) -> Option<String> {
+        const MAX_HANDOFF_BYTES: usize = 32 * 1024;
+        const MAX_MSG_PREVIEW_BYTES: usize = 3_000;
+
+        let start = start_message_idx.min(self.messages.len());
+        let slice = &self.messages[start..];
+        if slice.is_empty() {
+            return None;
+        }
+
+        let mode_label = if warm_return {
+            "warm_delta"
+        } else {
+            "cold_seed"
+        };
+        let mut body = String::new();
+        body.push_str(&format!(
+            "<agent_handoff_context from=\"{}\" to=\"{}\" mode=\"{mode_label}\">\n",
+            from.display_name(),
+            to.display_name(),
+        ));
+        if warm_return {
+            body.push_str(
+                "The user temporarily switched to another agent and has now returned to your native session. Below are ONLY the delta turns completed while you were parked. Absorb them and execute the user's new instruction below.\n\n",
+            );
+        } else {
+            body.push_str(
+                "This task was handed off in place from another agent. Review the prior conversation summary below and continue seamlessly without redoing completed work.\n\n",
+            );
+        }
+
+        for (offset, msg) in slice.iter().enumerate() {
+            let msg_pos = start + offset + 1;
+            let role = match msg.role {
+                MessageRole::User => "User",
+                MessageRole::Assistant => "Assistant",
+                MessageRole::System => "System",
+            };
+            let mut snippet = msg.content.trim().to_owned();
+            truncate_utf8_with_notice(&mut snippet, MAX_MSG_PREVIEW_BYTES);
+            body.push_str(&format!("### {role}\n{snippet}\n\n"));
+
+            // Summarize any file changes attached right after this message.
+            for block in self
+                .transcript_blocks
+                .iter()
+                .filter(|b| b.after_message == msg_pos)
+            {
+                let edited_files: Vec<&str> = block
+                    .activities
+                    .iter()
+                    .flat_map(|act| act.file_changes.iter().map(|fc| fc.path.as_str()))
+                    .take(12)
+                    .collect();
+                if !edited_files.is_empty() {
+                    body.push_str(&format!(
+                        "- Modified files: {}\n\n",
+                        edited_files.join(", ")
+                    ));
+                }
+            }
+            if body.len() >= MAX_HANDOFF_BYTES {
+                truncate_utf8_with_notice(&mut body, MAX_HANDOFF_BYTES);
+                body.push('\n');
+                break;
+            }
+        }
+        body.push_str("</agent_handoff_context>");
+        Some(body)
     }
 
     pub fn migrate_legacy_state(&mut self) {
@@ -4223,10 +4407,72 @@ mod tests {
         let mut session = AgentSession::new(project.id, ProviderKind::Codex);
 
         assert!(session.can_choose_model(ProviderKind::Claude));
+        assert!(session.can_choose_model(ProviderKind::Amp));
 
         session.push_message(MessageRole::User, "first turn");
         assert!(session.can_choose_model(ProviderKind::Codex));
-        assert!(!session.can_choose_model(ProviderKind::Claude));
+        // Handoff-capable providers remain selectable when idle:
+        assert!(session.can_choose_model(ProviderKind::Antigravity));
+        assert!(session.can_choose_model(ProviderKind::Claude));
+        // Non-handoff providers remain locked once history exists:
+        assert!(!session.can_choose_model(ProviderKind::Amp));
+        assert!(!session.can_choose_model(ProviderKind::Pi));
+    }
+
+    #[test]
+    fn in_place_handoff_parks_cursor_seeds_cold_target_and_resumes_warm_delta_on_return() {
+        let project = Project::from_path(PathBuf::from("/tmp/waku"));
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        session.provider_cursor = Some(ProviderResumeCursor::Codex {
+            thread_id: "codex-thread-01".into(),
+        });
+        session.push_message(MessageRole::User, "Implement parser module");
+        session.push_message(MessageRole::Assistant, "Parser module implemented.");
+
+        // 1. Switch Codex -> Antigravity (cold handoff to Antigravity)
+        assert!(session.switch_provider(ProviderKind::Antigravity));
+        assert_eq!(session.provider, ProviderKind::Antigravity);
+        assert!(session.provider_cursor.is_none());
+        assert_eq!(session.parked_cursors.len(), 1);
+        assert_eq!(session.parked_cursors[0].provider, ProviderKind::Codex);
+        assert_eq!(
+            session.parked_cursors[0].cursor.native_id(),
+            "codex-thread-01"
+        );
+        assert_eq!(session.parked_cursors[0].parked_at_message_count, 2);
+        let cold_seed = session.take_pending_handoff_seed().unwrap();
+        assert!(cold_seed.contains("mode=\"cold_seed\""));
+        assert!(cold_seed.contains("Implement parser module"));
+        assert!(session.pending_handoff_seed.is_none());
+
+        // Antigravity runs turn 2
+        session.provider_cursor = Some(ProviderResumeCursor::Antigravity {
+            session_id: "agy-sess-99".into(),
+        });
+        session.push_message(MessageRole::User, "Review UI layout with Antigravity");
+        session.push_message(MessageRole::Assistant, "UI layout verified.");
+
+        // 2. Switch Antigravity -> Codex (warm return to Codex!)
+        assert!(session.switch_provider(ProviderKind::Codex));
+        assert_eq!(session.provider, ProviderKind::Codex);
+        assert_eq!(
+            session.provider_cursor,
+            Some(ProviderResumeCursor::Codex {
+                thread_id: "codex-thread-01".into()
+            })
+        );
+        assert_eq!(session.parked_cursors.len(), 1);
+        assert_eq!(
+            session.parked_cursors[0].provider,
+            ProviderKind::Antigravity
+        );
+        assert_eq!(session.parked_cursors[0].cursor.native_id(), "agy-sess-99");
+
+        // Warm seed includes ONLY Antigravity's delta messages, NOT turn 1!
+        let warm_seed = session.take_pending_handoff_seed().unwrap();
+        assert!(warm_seed.contains("mode=\"warm_delta\""));
+        assert!(warm_seed.contains("Review UI layout with Antigravity"));
+        assert!(!warm_seed.contains("Implement parser module"));
     }
 
     #[test]

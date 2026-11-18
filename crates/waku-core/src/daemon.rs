@@ -790,6 +790,62 @@ impl Backend for WakuBackend {
                 let previous = self.sessions.lock().remove(&session_id);
                 drop(previous);
                 let provider = decode_enum(&options.provider)?;
+                let mut requested_cursor: Option<ProviderResumeCursor> = options
+                    .provider_cursor
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .context("daemon received an invalid provider cursor")?;
+
+                // Reconcile cross-agent in-place handoff in daemon task state so
+                // Desktop, Web, and Mobile clients all park & restore native
+                // cursors consistently without cross-provider cursor errors.
+                {
+                    let mut state = self.task_state.lock();
+                    let mut switched = false;
+                    if let Some(stored_session) =
+                        state.sessions.iter_mut().find(|s| s.id == session_id)
+                    {
+                        let _ = self.task_store.hydrate(stored_session);
+                        if let Some(ref cur) = requested_cursor
+                            && cur.provider() != provider
+                            && stored_session.provider_cursor.is_none()
+                        {
+                            stored_session.provider_cursor = Some(cur.clone());
+                        }
+                        if stored_session.provider != provider {
+                            stored_session.switch_provider(provider);
+                            switched = true;
+                        }
+                        if requested_cursor
+                            .as_ref()
+                            .is_some_and(|cur| cur.provider() != provider)
+                        {
+                            requested_cursor = stored_session.provider_cursor.clone();
+                        } else if requested_cursor.is_none()
+                            && stored_session
+                                .provider_cursor
+                                .as_ref()
+                                .is_some_and(|cur| cur.provider() == provider)
+                        {
+                            requested_cursor = stored_session.provider_cursor.clone();
+                        }
+                    } else if requested_cursor
+                        .as_ref()
+                        .is_some_and(|cur| cur.provider() != provider)
+                    {
+                        requested_cursor = None;
+                    }
+                    if switched {
+                        state.mark_session_dirty(session_id);
+                        let _ = self.task_store.save(&mut state);
+                    }
+                }
+
+                let mcp_companion = crate::mcp_companion::companion_launch_for_session(
+                    session_id,
+                    self.task_store.path(),
+                    &options.cwd,
+                );
                 let options = DriverStartOptions {
                     binary: options.binary,
                     cwd: options.cwd,
@@ -800,15 +856,12 @@ impl Backend for WakuBackend {
                     context_window: options.context_window,
                     agent_preset: options.agent_preset,
                     computer_use_enabled: options.computer_use_enabled,
-                    provider_cursor: options
-                        .provider_cursor
-                        .map(serde_json::from_value)
-                        .transpose()
-                        .context("daemon received an invalid provider cursor")?,
+                    provider_cursor: requested_cursor,
                 };
                 let (wake, _wake_events) = smol::channel::bounded(1);
                 let (event_sender, event_receiver) = driver::event_channel(wake);
-                let handle = driver::start_local(provider, options, event_sender)?;
+                let handle =
+                    driver::start_local_with_mcp(provider, options, mcp_companion, event_sender)?;
                 let supports_steer = handle.supports_steer();
                 std::thread::Builder::new()
                     .name(format!("waku-daemon-events-{session_id}"))
@@ -858,24 +911,41 @@ impl Backend for WakuBackend {
                     }
                     driver.clone()
                 };
+                let mut command = command;
                 if let Command::Prompt {
                     prompt,
                     turn_id,
                     message_id,
-                } = &command
+                } = &mut command
                 {
-                    // Publish the submission into the runtime's event stream
-                    // before the provider can start the turn. Every attached
-                    // client mirrors the user message and its turn from this
-                    // event, so the submitting client's own save is no longer
-                    // the only record of the prompt — a follower that only
-                    // knew the provider's `turnStarted` used to persist a
-                    // projection without it, erasing the message for everyone.
+                    // Publish the user's clean prompt into the runtime event
+                    // stream before prepending any one-shot cross-agent handoff
+                    // digest for the underlying provider process.
                     events.send(event_to_wire(DriverEvent::PromptSubmitted {
                         message: prompt.clone(),
                         turn_id: turn_id.unwrap_or_else(Uuid::new_v4),
                         message_id: message_id.unwrap_or_else(Uuid::new_v4),
                     })?)?;
+
+                    let handoff_seed = {
+                        let mut state = self.task_state.lock();
+                        if let Some(stored) =
+                            state.sessions.iter_mut().find(|s| s.id == session_id)
+                        {
+                            let _ = self.task_store.hydrate(stored);
+                            let taken = stored.take_pending_handoff_seed();
+                            if taken.is_some() {
+                                state.mark_session_dirty(session_id);
+                                let _ = self.task_store.save(&mut state);
+                            }
+                            taken
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(seed) = handoff_seed {
+                        *prompt = format!("{seed}\n\n{prompt}");
+                    }
                 }
                 handle_driver_command(&driver, command)
             }
@@ -929,6 +999,12 @@ fn merge_stale_session_metadata(existing: &mut AgentSession, incoming: AgentSess
         existing.service_tier = incoming.service_tier;
         existing.context_window = incoming.context_window;
         existing.agent_preset = incoming.agent_preset;
+        if !incoming.parked_cursors.is_empty() {
+            existing.parked_cursors = incoming.parked_cursors;
+        }
+        if incoming.pending_handoff_seed.is_some() {
+            existing.pending_handoff_seed = incoming.pending_handoff_seed;
+        }
         existing.updated_at = incoming.updated_at;
         existing.last_reply_at = incoming.last_reply_at.or(existing.last_reply_at);
     }
@@ -2367,6 +2443,232 @@ mod tests {
                 .len(),
             18 * 1024
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_agent_handoff_codex_to_antigravity_and_back_preserves_parked_cursors_and_injects_codeg_mcp()
+     {
+        use crate::model::{MessageRole, RuntimeMode};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(format!("waku-handoff-e2e-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let workspace = dir.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        // Create a dummy waku-daemon MCP binary so companion_launch_for_session resolves it
+        let fake_mcp_bin = dir.join("waku-daemon");
+        std::fs::write(&fake_mcp_bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake_mcp_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let rpc_log = dir.join("agy_handoff_rpc.json");
+        let fake_agy_py = dir.join("fake_agy.py");
+        std::fs::write(
+            &fake_agy_py,
+            r#"#!/usr/bin/env python3
+import json, os, sys
+log_path = os.environ["AGY_HANDOFF_LOG"]
+def record(item):
+    arr = json.load(open(log_path)) if os.path.exists(log_path) else []
+    arr.append(item)
+    json.dump(arr, open(log_path, "w"))
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    msg = json.loads(raw)
+    method = msg.get("method")
+    rid = msg.get("id")
+    params = msg.get("params") or {}
+    record({"method": method, "params": params})
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": True, "sessionCapabilities": {"resume": {}}}, "agentInfo": {"name": "antigravity-acp", "version": "1.4.5"}}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": "agy-mid-session", "modes": {"currentModeId": "yolo", "availableModes": [{"id": "yolo", "name": "YOLO"}]}, "configOptions": []}})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": params["sessionId"], "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Antigravity completed step 2."}}}})
+        send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_agy_py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fake_agy_sh = dir.join("run_agy.sh");
+        std::fs::write(
+            &fake_agy_sh,
+            format!(
+                "#!/bin/sh\nexport AGY_HANDOFF_LOG='{}'\nexec python3 '{}' \"$@\"\n",
+                rpc_log.display(),
+                fake_agy_py.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_agy_sh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let project = Project::from_path(workspace.clone());
+        let mut session = AgentSession::new(project.id, ProviderKind::Codex);
+        let session_id = session.id;
+        session.provider_cursor = Some(crate::model::ProviderResumeCursor::Codex {
+            thread_id: "codex-orig-thread".into(),
+        });
+        session.push_message(MessageRole::User, "Step 1 on Codex");
+        session.push_message(MessageRole::Assistant, "Codex finished step 1.");
+
+        let store = StateStore::daemon(dir.join("app.db"));
+        let mut state = store.load().unwrap();
+        state.projects.push(project);
+        state.mark_session_dirty(session_id);
+        state.sessions.push(session);
+        store.save(&mut state).unwrap();
+
+        let settings = DaemonSettingsStore::open_with_legacy(
+            dir.join("settings.json"),
+            Vec::<std::path::PathBuf>::new(),
+        )
+        .unwrap();
+        let backend = WakuBackend::new(settings, store).unwrap();
+
+        unsafe {
+            std::env::set_var(crate::mcp_companion::MCP_BIN_ENV, &fake_mcp_bin);
+        }
+
+        // Start Antigravity on the existing Codex session (auto-parks Codex cursor & injects codeg-mcp)
+        let runtime_id = Uuid::new_v4();
+        backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id,
+                    runtime_id,
+                    command: Command::Start {
+                        options: waku_protocol::WireDriverStartOptions {
+                            provider: waku_protocol::encode_enum(ProviderKind::Antigravity)
+                                .unwrap(),
+                            binary: fake_agy_sh,
+                            cwd: workspace,
+                            mode: waku_protocol::encode_enum(RuntimeMode::FullAccess).unwrap(),
+                            model: None,
+                            reasoning_effort: None,
+                            service_tier: None,
+                            context_window: None,
+                            agent_preset: None,
+                            computer_use_enabled: false,
+                            provider_cursor: None,
+                        },
+                    },
+                },
+                EventSink::test_sink(),
+            )
+            .unwrap();
+
+        // Wait briefly for ACP handshake (`session/new`) to settle, then send Prompt
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id,
+                    runtime_id,
+                    command: Command::Prompt {
+                        prompt: "Continue step 2 on Antigravity".into(),
+                        turn_id: Some(Uuid::new_v4()),
+                        message_id: Some(Uuid::new_v4()),
+                    },
+                },
+                EventSink::test_sink(),
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id,
+                    runtime_id,
+                    command: Command::CloseSession,
+                },
+                EventSink::test_sink(),
+            )
+            .unwrap();
+
+        unsafe {
+            std::env::remove_var(crate::mcp_companion::MCP_BIN_ENV);
+        }
+
+        // Verify ACP wire RPC log: codeg-mcp injected on session/new AND cold handoff seed prepended on session/prompt!
+        let logged: Vec<Value> =
+            serde_json::from_str(&std::fs::read_to_string(&rpc_log).unwrap()).unwrap();
+        let new_call = logged
+            .iter()
+            .find(|item| item.get("method").and_then(Value::as_str) == Some("session/new"))
+            .expect("session/new must be called");
+        let mcp_servers = new_call
+            .pointer("/params/mcpServers")
+            .and_then(Value::as_array)
+            .expect("mcpServers array present");
+        assert!(
+            mcp_servers
+                .iter()
+                .any(|srv| srv.get("name").and_then(Value::as_str) == Some("codeg-mcp"))
+        );
+
+        let prompt_call = logged
+            .iter()
+            .find(|item| item.get("method").and_then(Value::as_str) == Some("session/prompt"))
+            .expect("session/prompt must be called");
+        let prompt_text = prompt_call
+            .pointer("/params/prompt/0/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(prompt_text.contains("<agent_handoff_context"));
+        assert!(prompt_text.contains("Step 1 on Codex"));
+        assert!(prompt_text.contains("Continue step 2 on Antigravity"));
+
+        // Verify SQLite persisted parked Codex cursor, cleared pending_handoff_seed, and warm-returns to Codex!
+        let verify_store = StateStore::daemon(dir.join("app.db"));
+        let mut reloaded = verify_store.load().unwrap();
+        let hydrated = reloaded
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == session_id)
+            .unwrap();
+        verify_store.hydrate(hydrated).unwrap();
+        assert_eq!(hydrated.provider, ProviderKind::Antigravity);
+        assert!(hydrated.pending_handoff_seed.is_none());
+        assert_eq!(hydrated.parked_cursors.len(), 1);
+        assert_eq!(
+            hydrated.parked_cursors[0].cursor.native_id(),
+            "codex-orig-thread"
+        );
+
+        // Simulate Antigravity's cursor + reply saved, then switch back to Codex:
+        hydrated.provider_cursor = Some(crate::model::ProviderResumeCursor::Antigravity {
+            session_id: "agy-mid-session".into(),
+        });
+        hydrated.push_message(MessageRole::User, "Continue step 2 on Antigravity");
+        hydrated.push_message(MessageRole::Assistant, "Antigravity completed step 2.");
+        assert!(hydrated.switch_provider(ProviderKind::Codex));
+        assert_eq!(
+            hydrated.provider_cursor.as_ref().map(|c| c.native_id()),
+            Some("codex-orig-thread")
+        );
+        assert_eq!(
+            hydrated.parked_cursors[0].cursor.native_id(),
+            "agy-mid-session"
+        );
+        let warm_seed = hydrated.take_pending_handoff_seed().unwrap();
+        assert!(warm_seed.contains("mode=\"warm_delta\""));
+        assert!(warm_seed.contains("Antigravity completed step 2."));
+        assert!(!warm_seed.contains("Step 1 on Codex"));
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }

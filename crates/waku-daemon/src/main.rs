@@ -9,6 +9,39 @@ use waku_protocol::{DAEMON_TOKEN_ENV, DaemonReady, PROTOCOL_VERSION};
 
 fn main() -> anyhow::Result<()> {
     let arguments = Arguments::parse(std::env::args().skip(1))?;
+    if arguments.mcp_stdio {
+        if let Some(parent_pid) = arguments.parent_pid {
+            std::thread::Builder::new()
+                .name("waku-mcp-parent".into())
+                .spawn(move || {
+                    loop {
+                        if !process_is_alive(parent_pid) {
+                            std::process::exit(0);
+                        }
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                })?;
+        }
+        let session_id = arguments
+            .mcp_session_id
+            .ok_or_else(|| anyhow!("--mcp-stdio requires --session-id"))?;
+        let db_path = arguments
+            .mcp_db
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(waku_core::persistence::StateStore::default_path);
+        let cwd = arguments
+            .mcp_cwd
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        return waku_core::mcp_companion::run_stdio_mcp_server(
+            waku_core::mcp_companion::McpContext {
+                session_id,
+                db_path,
+                cwd,
+            },
+        );
+    }
     let token =
         std::env::var(DAEMON_TOKEN_ENV).context("Waku daemon authentication token is missing")?;
     // The bearer capability belongs only to this server process. Remove it
@@ -76,6 +109,10 @@ struct Arguments {
     parent_pid: Option<u32>,
     allowed_origins: Vec<String>,
     allow_non_loopback: bool,
+    mcp_stdio: bool,
+    mcp_session_id: Option<String>,
+    mcp_db: Option<String>,
+    mcp_cwd: Option<String>,
 }
 
 impl Arguments {
@@ -84,9 +121,37 @@ impl Arguments {
         let mut parent_pid = None;
         let mut allowed_origins = Vec::new();
         let mut allow_non_loopback = false;
+        let mut mcp_stdio = false;
+        let mut mcp_session_id = None;
+        let mut mcp_db = None;
+        let mut mcp_cwd = None;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
+                "--mcp-stdio" => {
+                    mcp_stdio = true;
+                }
+                "--session-id" => {
+                    mcp_session_id = Some(
+                        arguments
+                            .next()
+                            .ok_or_else(|| anyhow!("--session-id requires a value"))?,
+                    );
+                }
+                "--db" => {
+                    mcp_db = Some(
+                        arguments
+                            .next()
+                            .ok_or_else(|| anyhow!("--db requires a path"))?,
+                    );
+                }
+                "--cwd" => {
+                    mcp_cwd = Some(
+                        arguments
+                            .next()
+                            .ok_or_else(|| anyhow!("--cwd requires a path"))?,
+                    );
+                }
                 "--bind" => {
                     bind = arguments
                         .next()
@@ -126,6 +191,10 @@ impl Arguments {
             parent_pid,
             allowed_origins,
             allow_non_loopback,
+            mcp_stdio,
+            mcp_session_id,
+            mcp_db,
+            mcp_cwd,
         })
     }
 }

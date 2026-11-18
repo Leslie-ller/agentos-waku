@@ -14,12 +14,13 @@ use std::time::Duration;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock, Implementation, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
-    PromptResponse, RequestId, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionConfigSelectOptions, SessionId, SessionModeId, SessionModeState, SessionNotification,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TextContent,
+    InitializeResponse, LoadSessionRequest, McpServer, McpServerStdio, NewSessionRequest,
+    PermissionOptionKind, PromptRequest, PromptResponse, RequestId, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigSelectOptions, SessionId, SessionModeId,
+    SessionModeState, SessionNotification, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    StopReason, TextContent,
 };
 use agent_client_protocol::{
     AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo, Handled, LineDirection, Responder,
@@ -116,9 +117,19 @@ fn launch_for(provider: ProviderKind, reasoning_effort: Option<&str>) -> anyhow:
 }
 
 impl AcpDriver {
+    #[cfg(test)]
     pub fn start(
         provider: ProviderKind,
         options: DriverStartOptions,
+        events: DriverEventSender,
+    ) -> anyhow::Result<Self> {
+        Self::start_with_mcp(provider, options, None, events)
+    }
+
+    pub fn start_with_mcp(
+        provider: ProviderKind,
+        options: DriverStartOptions,
+        mcp_companion: Option<crate::mcp_companion::McpCompanionLaunch>,
         events: DriverEventSender,
     ) -> anyhow::Result<Self> {
         let DriverStartOptions {
@@ -194,6 +205,7 @@ impl AcpDriver {
                     context_window,
                     resume_session_id,
                     fork_context,
+                    mcp_companion,
                     grok_title_home,
                     command_rx,
                     thread_events.clone(),
@@ -375,6 +387,7 @@ async fn run_sdk_connection(
     context_window: Option<String>,
     resume_session_id: Option<String>,
     fork_context: Option<String>,
+    mcp_companion: Option<crate::mcp_companion::McpCompanionLaunch>,
     grok_title_home: Option<std::path::PathBuf>,
     commands: smol::channel::Receiver<CommandMessage>,
     events: DriverEventSender,
@@ -526,11 +539,21 @@ async fn run_sdk_connection(
                 )
                 .block_task()
                 .await?;
+            let mcp_servers: Vec<McpServer> = mcp_companion
+                .into_iter()
+                .map(|companion| {
+                    McpServer::Stdio(
+                        McpServerStdio::new(companion.server_name, companion.executable)
+                            .args(companion.args),
+                    )
+                })
+                .collect();
             let (session_id, modes, config_options) = establish_session(
                 &connection,
                 &initialize,
                 resume_session_id.as_deref(),
                 &cwd,
+                &mcp_servers,
                 &suppress_session_updates,
             )
             .await?;
@@ -706,6 +729,7 @@ async fn establish_session(
     initialize: &InitializeResponse,
     resume_session_id: Option<&str>,
     cwd: &Path,
+    mcp_servers: &[McpServer],
     suppress_session_updates: &AtomicBool,
 ) -> agent_client_protocol::Result<(
     SessionId,
@@ -719,7 +743,10 @@ async fn establish_session(
             .resume
             .is_some()
             && let Ok(response) = connection
-                .send_request(ResumeSessionRequest::new(existing.to_owned(), cwd))
+                .send_request(
+                    ResumeSessionRequest::new(existing.to_owned(), cwd)
+                        .mcp_servers(mcp_servers.to_vec()),
+                )
                 .block_task()
                 .await
         {
@@ -733,7 +760,10 @@ async fn establish_session(
         if initialize.agent_capabilities.load_session {
             suppress_session_updates.store(true, Ordering::Release);
             let response = connection
-                .send_request(LoadSessionRequest::new(existing.to_owned(), cwd))
+                .send_request(
+                    LoadSessionRequest::new(existing.to_owned(), cwd)
+                        .mcp_servers(mcp_servers.to_vec()),
+                )
                 .block_task()
                 .await;
             suppress_session_updates.store(false, Ordering::Release);
@@ -748,7 +778,7 @@ async fn establish_session(
     }
 
     let response = connection
-        .send_request(NewSessionRequest::new(cwd))
+        .send_request(NewSessionRequest::new(cwd).mcp_servers(mcp_servers.to_vec()))
         .block_task()
         .await?;
     Ok((response.session_id, response.modes, response.config_options))

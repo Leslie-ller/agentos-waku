@@ -1256,6 +1256,8 @@ impl StateStore {
         session.queued_messages = stored.queued_messages;
         session.workspace = stored.workspace;
         session.provider_cursor = stored.provider_cursor;
+        session.parked_cursors = stored.parked_cursors;
+        session.pending_handoff_seed = stored.pending_handoff_seed;
         session.runtime_mode = stored.runtime_mode;
         session.reasoning_effort = stored.reasoning_effort;
         session.service_tier = stored.service_tier;
@@ -1549,6 +1551,8 @@ fn session_skeleton(row: SessionColumns) -> Option<AgentSession> {
         updated_at: updated_at as u64,
         last_reply_at: last_reply_at.map(|at| at as u64),
         provider_cursor: None,
+        parked_cursors: Vec::new(),
+        pending_handoff_seed: None,
         available_commands: Vec::new(),
         thread_goal: None,
         context_usage: None,
