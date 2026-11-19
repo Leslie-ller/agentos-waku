@@ -1,3 +1,4 @@
+# Zero-secret cloud build for AgentOS Waku (macOS Apple Silicon .app + Windows x86_64 ZIP + Web SPA)
 name: Build AgentOS Waku (macOS & Windows)
 
 on:
