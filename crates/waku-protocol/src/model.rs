@@ -851,6 +851,11 @@ pub struct AgentTurn {
     pub id: Uuid,
     pub turn_count: usize,
     pub status: TurnStatus,
+    /// Provider that owned and generated this turn, preserved across in-place
+    /// cross-agent handoffs and restarts so historical replies retain source
+    /// attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderKind>,
     #[serde(default)]
     pub provider_turn_started: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1609,6 +1614,7 @@ impl AgentSession {
                 id,
                 turn_count: offset + 1,
                 status: TurnStatus::Completed,
+                provider: Some(self.provider),
                 provider_turn_started: true,
                 provider_resume_at: None,
                 started_at,
@@ -1635,6 +1641,7 @@ impl AgentSession {
             id,
             turn_count: self.turns.len() + 1,
             status: TurnStatus::Running,
+            provider: Some(self.provider),
             provider_turn_started: false,
             provider_resume_at: None,
             started_at: now,
@@ -1662,6 +1669,7 @@ impl AgentSession {
             id,
             turn_count: self.turns.len() + 1,
             status: TurnStatus::Running,
+            provider: Some(self.provider),
             provider_turn_started: false,
             provider_resume_at: None,
             started_at: now,
@@ -1709,6 +1717,7 @@ impl AgentSession {
             id: turn_id,
             turn_count: self.turns.len() + 1,
             status: TurnStatus::Running,
+            provider: Some(self.provider),
             provider_turn_started: false,
             provider_resume_at: None,
             started_at: now,
@@ -1812,10 +1821,13 @@ impl AgentSession {
     }
 
     pub fn push_message(&mut self, role: MessageRole, content: impl Into<String>) -> Uuid {
-        let message = match self.active_turn_id() {
+        let mut message = match self.active_turn_id() {
             Some(turn_id) => Message::new_for_turn(role, content, turn_id),
             None => Message::new(role, content),
         };
+        if role == MessageRole::Assistant {
+            message.provider = Some(self.provider);
+        }
         let id = message.id;
         self.messages.push(message);
         id
@@ -1975,6 +1987,10 @@ pub struct Message {
     #[serde(default)]
     pub turn_id: Option<Uuid>,
     pub role: MessageRole,
+    /// Provider that authored this message (populated for assistant replies so
+    /// cross-agent handoff transcripts retain exact per-reply attribution).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderKind>,
     pub content: String,
     /// User-visible text before provider-facing attachment mentions were
     /// appended. Plain and legacy messages omit it.
@@ -1992,6 +2008,7 @@ impl Message {
             id: Uuid::new_v4(),
             turn_id: None,
             role,
+            provider: None,
             content: content.into(),
             display_content: None,
             attachments: Vec::new(),
@@ -2005,6 +2022,11 @@ impl Message {
             turn_id: Some(turn_id),
             ..Self::new(role, content)
         }
+    }
+
+    pub fn with_provider(mut self, provider: Option<ProviderKind>) -> Self {
+        self.provider = provider;
+        self
     }
 
     pub fn with_presentation(

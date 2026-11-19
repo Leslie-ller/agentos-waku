@@ -1268,10 +1268,15 @@ impl StateStore {
         let mut statement = connection
             .prepare(
                 "SELECT id, turn_id, role, content, display_content, attachments,
-                        created_at, streaming
+                        created_at, streaming, provider
                  FROM messages WHERE session_id = ?1 ORDER BY position",
             )
             .map_err(to_io_error)?;
+        let turn_providers: HashMap<Uuid, ProviderKind> = session
+            .turns
+            .iter()
+            .filter_map(|turn| turn.provider.map(|provider| (turn.id, provider)))
+            .collect();
         session.messages = statement
             .query_map(params![id], |row| {
                 Ok((
@@ -1283,11 +1288,20 @@ impl StateStore {
                     row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
                     row.get::<_, i64>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })
             .map_err(to_io_error)?
             .filter_map(Result::ok)
             .filter_map(message_from_row)
+            .map(|mut message| {
+                if message.role == MessageRole::Assistant && message.provider.is_none() {
+                    message.provider = message
+                        .turn_id
+                        .and_then(|turn_id| turn_providers.get(&turn_id).copied());
+                }
+                message
+            })
             .collect();
 
         session.detail_loaded = true;
@@ -1575,14 +1589,28 @@ type MessageColumns = (
     String,
     i64,
     i64,
+    Option<String>,
 );
 
 fn message_from_row(row: MessageColumns) -> Option<Message> {
-    let (id, turn_id, role, content, display_content, attachments, created_at, streaming) = row;
+    let (
+        id,
+        turn_id,
+        role,
+        content,
+        display_content,
+        attachments,
+        created_at,
+        streaming,
+        provider,
+    ) = row;
     Some(Message {
         id: Uuid::parse_str(&id).ok()?,
         turn_id: turn_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()),
         role: serde_json::from_value(serde_json::Value::String(role)).ok()?,
+        provider: provider.and_then(|tag| {
+            serde_json::from_value::<ProviderKind>(serde_json::Value::String(tag)).ok()
+        }),
         content,
         display_content,
         attachments: serde_json::from_str::<Vec<MessageAttachment>>(&attachments)
@@ -1607,8 +1635,8 @@ fn session_data(session: &AgentSession) -> io::Result<String> {
 
 const UPSERT_MESSAGE: &str = "INSERT INTO messages(
          id, session_id, turn_id, position, role, content, display_content,
-         attachments, created_at, streaming
-     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         attachments, created_at, streaming, provider
+     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
      ON CONFLICT(id) DO UPDATE SET
          session_id = excluded.session_id,
          turn_id    = excluded.turn_id,
@@ -1618,7 +1646,8 @@ const UPSERT_MESSAGE: &str = "INSERT INTO messages(
          display_content = excluded.display_content,
          attachments = excluded.attachments,
          created_at = excluded.created_at,
-         streaming  = excluded.streaming";
+         streaming  = excluded.streaming,
+         provider   = excluded.provider";
 
 /// Replaces a session's messages with the given list.
 ///
@@ -1674,6 +1703,9 @@ fn write_messages(
                     Value::Text(attachments),
                     Value::Integer(message.created_at as i64),
                     Value::Integer(i64::from(message.streaming)),
+                    message
+                        .provider
+                        .map_or(Value::Null, |provider| Value::Text(tag_of(provider))),
                 ]),
             )
             .map_err(to_io_error)?;
@@ -1709,6 +1741,12 @@ fn message_fingerprint(message: &Message, position: usize) -> u64 {
     fold(message.created_at);
     fold(u64::from(message.streaming));
     fold(fingerprint(&tag_of(message.role)));
+    if let Some(provider) = message.provider {
+        fold(1);
+        fold(fingerprint(&tag_of(provider)));
+    } else {
+        fold(0);
+    }
     let (high, low) = message.id.as_u64_pair();
     fold(high);
     fold(low);
@@ -3639,6 +3677,71 @@ mod tests {
         let state = store_in(&directory).load_or_fresh(PathBuf::from("/"));
         assert!(state.projects.is_empty());
         assert!(state.selected_session.is_none());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn cross_agent_turns_and_messages_persist_source_provider_across_restarts() {
+        let directory = temporary_directory();
+        let store = store_in(&directory);
+        let mut state = PersistedState::fresh(PathBuf::from("/tmp/handoff-project"));
+        let session_id = state.sessions[0].id;
+
+        // Turn 1 authored by Codex
+        {
+            let session = state.session_mut(session_id).unwrap();
+            session.provider = ProviderKind::Codex;
+            session.begin_turn("Codex turn prompt");
+            session.push_message(MessageRole::Assistant, "Reply from Codex");
+            session.finish_active_turn(crate::model::TurnStatus::Completed);
+            session.provider_cursor = Some(crate::model::ProviderResumeCursor::Codex {
+                thread_id: "codex-thread-1".into(),
+            });
+            assert!(session.switch_provider(ProviderKind::Antigravity));
+            // Turn 2 authored by Antigravity
+            session.begin_turn("Antigravity turn prompt");
+            session.push_message(MessageRole::Assistant, "Reply from Antigravity");
+            session.finish_active_turn(crate::model::TurnStatus::Completed);
+            session.provider_cursor = Some(crate::model::ProviderResumeCursor::Antigravity {
+                session_id: "agy-session-1".into(),
+            });
+            assert!(session.switch_provider(ProviderKind::Codex));
+            // Turn 3 back on Codex
+            session.begin_turn("Return to Codex prompt");
+            session.push_message(MessageRole::Assistant, "Second reply from Codex");
+            session.finish_active_turn(crate::model::TurnStatus::Completed);
+        }
+        state.mark_session_dirty(session_id);
+        store.save(&mut state).unwrap();
+
+        // Reopen from a fresh StateStore (simulating app/daemon restart)
+        let reopened = store_in(&directory);
+        let mut restored = reopened.load().unwrap();
+        let restored_session = restored.session_mut(session_id).unwrap();
+        reopened.hydrate(restored_session).unwrap();
+
+        assert_eq!(restored_session.turns.len(), 3);
+        assert_eq!(restored_session.turns[0].provider, Some(ProviderKind::Codex));
+        assert_eq!(
+            restored_session.turns[1].provider,
+            Some(ProviderKind::Antigravity)
+        );
+        assert_eq!(restored_session.turns[2].provider, Some(ProviderKind::Codex));
+
+        let assistant_providers: Vec<Option<ProviderKind>> = restored_session
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Assistant)
+            .map(|m| m.provider)
+            .collect();
+        assert_eq!(
+            assistant_providers,
+            vec![
+                Some(ProviderKind::Codex),
+                Some(ProviderKind::Antigravity),
+                Some(ProviderKind::Codex),
+            ]
+        );
         fs::remove_dir_all(directory).ok();
     }
 }

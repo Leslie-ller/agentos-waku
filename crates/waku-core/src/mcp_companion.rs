@@ -778,7 +778,17 @@ fn call_mcp_tool(
             let run_id = Uuid::new_v4().to_string();
             let turn_id = Uuid::new_v4().to_string();
             let max_turns = args.get("maxTurns").and_then(Value::as_i64);
+            if let Some(limit) = max_turns
+                && limit < 1
+            {
+                anyhow::bail!("maxTurns must be >= 1");
+            }
             let max_seconds = args.get("maxSeconds").and_then(Value::as_i64);
+            if let Some(limit) = max_seconds
+                && limit < 1
+            {
+                anyhow::bail!("maxSeconds must be >= 1");
+            }
             conn.execute(
                 "INSERT INTO agentos_goals (run_id, session_id, objective, status, max_turns, max_seconds, current_turn_id, turn_index, created_at, updated_at)
                  VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, 1, ?7, ?7)",
@@ -790,6 +800,9 @@ fn call_mcp_tool(
                 "turnId": turn_id,
                 "objective": objective,
                 "status": "active",
+                "turnIndex": 1,
+                "maxTurns": max_turns,
+                "maxSeconds": max_seconds,
             }))
         }
 
@@ -814,28 +827,89 @@ fn call_mcp_tool(
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("reason is required"))?;
 
+            let existing: Option<(String, i64, Option<i64>, Option<i64>, i64)> = conn
+                .query_row(
+                    "SELECT status, turn_index, max_turns, max_seconds, created_at
+                     FROM agentos_goals
+                     WHERE run_id = ?1 AND current_turn_id = ?2",
+                    params![run_id, turn_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional()?;
+            let Some((current_status, turn_index, max_turns, max_seconds, created_at)) = existing
+            else {
+                anyhow::bail!("no active goal matched runId={run_id} and turnId={turn_id}");
+            };
+            if current_status == "complete" {
+                anyhow::bail!("goal {run_id} is already complete");
+            }
+
+            if status == "continue" {
+                let turns_exhausted = max_turns.is_some_and(|limit| turn_index >= limit);
+                let elapsed_seconds = now.saturating_sub(created_at);
+                let time_exhausted = max_seconds.is_some_and(|limit| elapsed_seconds >= limit);
+                if turns_exhausted || time_exhausted {
+                    let exhaustion_reason = if turns_exhausted {
+                        format!(
+                            "goal maxTurns budget exhausted ({turn_index}/{}); cannot continue ({reason})",
+                            max_turns.unwrap_or(turn_index)
+                        )
+                    } else {
+                        format!(
+                            "goal maxSeconds budget exhausted ({elapsed_seconds}s/{}s); cannot continue ({reason})",
+                            max_seconds.unwrap_or(elapsed_seconds)
+                        )
+                    };
+                    conn.execute(
+                        "UPDATE agentos_goals
+                         SET status = 'blocked',
+                             last_reason = ?1,
+                             updated_at = ?2
+                         WHERE run_id = ?3 AND current_turn_id = ?4",
+                        params![exhaustion_reason, now, run_id, turn_id],
+                    )?;
+                    return Ok(json!({
+                        "recorded": true,
+                        "runId": run_id,
+                        "status": "blocked",
+                        "budgetExhausted": true,
+                        "turnIndex": turn_index,
+                        "maxTurns": max_turns,
+                        "maxSeconds": max_seconds,
+                        "nextTurnId": turn_id,
+                        "reason": exhaustion_reason,
+                    }));
+                }
+            }
+
             let next_turn_id = if status == "continue" {
                 Uuid::new_v4().to_string()
             } else {
                 turn_id.to_owned()
             };
-            let updated = conn.execute(
+            let next_turn_index = if status == "continue" {
+                turn_index + 1
+            } else {
+                turn_index
+            };
+            conn.execute(
                 "UPDATE agentos_goals
                  SET status = ?1,
                      last_reason = ?2,
                      current_turn_id = ?3,
-                     turn_index = CASE WHEN ?1 = 'continue' THEN turn_index + 1 ELSE turn_index END,
-                     updated_at = ?4
-                 WHERE run_id = ?5 AND current_turn_id = ?6",
-                params![status, reason, next_turn_id, now, run_id, turn_id],
+                     turn_index = ?4,
+                     updated_at = ?5
+                 WHERE run_id = ?6 AND current_turn_id = ?7",
+                params![status, reason, next_turn_id, next_turn_index, now, run_id, turn_id],
             )?;
-            if updated == 0 {
-                anyhow::bail!("no active goal matched runId={run_id} and turnId={turn_id}");
-            }
             Ok(json!({
                 "recorded": true,
                 "runId": run_id,
                 "status": status,
+                "budgetExhausted": false,
+                "turnIndex": next_turn_index,
+                "maxTurns": max_turns,
+                "maxSeconds": max_seconds,
                 "nextTurnId": next_turn_id,
             }))
         }
@@ -1300,6 +1374,236 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reported["result"]["structuredContent"]["status"], "complete");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn goal_enforces_max_turns_and_max_seconds_limits() {
+        let dir = std::env::temp_dir().join(format!("waku-mcp-goal-budget-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("app.db");
+        let conn = open_mcp_connection(&db).unwrap();
+        let ctx = McpContext {
+            session_id: Uuid::new_v4().to_string(),
+            db_path: db,
+            cwd: dir.clone(),
+        };
+
+        // 1. maxTurns = 1 must refuse continue and stay at turnIndex = 1 (blocked).
+        let created = dispatch_mcp_request(
+            &conn,
+            &ctx,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_goal",
+                    "arguments": {
+                        "objective": "One-turn goal",
+                        "maxTurns": 1,
+                        "toolSummary": "Create 1-turn goal"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let run_id = created["result"]["structuredContent"]["runId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let turn_id = created["result"]["structuredContent"]["turnId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let cont = dispatch_mcp_request(
+            &conn,
+            &ctx,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "report_goal",
+                    "arguments": {
+                        "runId": run_id,
+                        "turnId": turn_id,
+                        "status": "continue",
+                        "reason": "try exceeding maxTurns=1",
+                        "toolSummary": "Report continue at maxTurns limit"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(cont["result"]["structuredContent"]["status"], "blocked");
+        assert_eq!(cont["result"]["structuredContent"]["budgetExhausted"], true);
+        assert_eq!(cont["result"]["structuredContent"]["turnIndex"], 1);
+
+        let got = dispatch_mcp_request(
+            &conn,
+            &ctx,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_goal",
+                    "arguments": { "toolSummary": "Read blocked goal" }
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(got["result"]["structuredContent"]["status"], "blocked");
+        assert_eq!(got["result"]["structuredContent"]["turnIndex"], 1);
+
+        // 2. maxTurns = 2 allows turn 1 -> 2 and blocks turn 2 -> 3.
+        let ctx2 = McpContext {
+            session_id: Uuid::new_v4().to_string(),
+            db_path: ctx.db_path.clone(),
+            cwd: dir.clone(),
+        };
+        let created2 = dispatch_mcp_request(
+            &conn,
+            &ctx2,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_goal",
+                    "arguments": {
+                        "objective": "Two-turn goal",
+                        "maxTurns": 2,
+                        "toolSummary": "Create 2-turn goal"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let run2 = created2["result"]["structuredContent"]["runId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let turn2_1 = created2["result"]["structuredContent"]["turnId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let step1 = dispatch_mcp_request(
+            &conn,
+            &ctx2,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "report_goal",
+                    "arguments": {
+                        "runId": run2,
+                        "turnId": turn2_1,
+                        "status": "continue",
+                        "reason": "advance to turn 2",
+                        "toolSummary": "Continue to turn 2"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(step1["result"]["structuredContent"]["status"], "continue");
+        assert_eq!(step1["result"]["structuredContent"]["budgetExhausted"], false);
+        assert_eq!(step1["result"]["structuredContent"]["turnIndex"], 2);
+        let turn2_2 = step1["result"]["structuredContent"]["nextTurnId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let step2 = dispatch_mcp_request(
+            &conn,
+            &ctx2,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "report_goal",
+                    "arguments": {
+                        "runId": run2,
+                        "turnId": turn2_2,
+                        "status": "continue",
+                        "reason": "try turn 3",
+                        "toolSummary": "Try turn 3"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(step2["result"]["structuredContent"]["status"], "blocked");
+        assert_eq!(step2["result"]["structuredContent"]["budgetExhausted"], true);
+        assert_eq!(step2["result"]["structuredContent"]["turnIndex"], 2);
+
+        // 3. maxSeconds exhaustion also blocks continue.
+        let ctx3 = McpContext {
+            session_id: Uuid::new_v4().to_string(),
+            db_path: ctx.db_path.clone(),
+            cwd: dir.clone(),
+        };
+        let created3 = dispatch_mcp_request(
+            &conn,
+            &ctx3,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_goal",
+                    "arguments": {
+                        "objective": "Timed goal",
+                        "maxSeconds": 5,
+                        "toolSummary": "Create timed goal"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let run3 = created3["result"]["structuredContent"]["runId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let turn3 = created3["result"]["structuredContent"]["turnId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        conn.execute(
+            "UPDATE agentos_goals SET created_at = created_at - 10 WHERE run_id = ?1",
+            params![run3],
+        )
+        .unwrap();
+        let expired = dispatch_mcp_request(
+            &conn,
+            &ctx3,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "report_goal",
+                    "arguments": {
+                        "runId": run3,
+                        "turnId": turn3,
+                        "status": "continue",
+                        "reason": "try after expiry",
+                        "toolSummary": "Continue after maxSeconds"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(expired["result"]["structuredContent"]["status"], "blocked");
+        assert_eq!(expired["result"]["structuredContent"]["budgetExhausted"], true);
+        assert_eq!(expired["result"]["structuredContent"]["turnIndex"], 1);
 
         let _ = std::fs::remove_dir_all(dir);
     }

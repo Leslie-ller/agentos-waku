@@ -826,8 +826,25 @@ pub(super) fn render_message(params: MessageRender, cx: &mut App) -> AnyElement 
                 .flex_col()
                 .py(px(4.0))
                 .gap(px(3.0))
-                .group(group_name.clone())
-                .child(body);
+                .group(group_name.clone());
+            if let Some(source_provider) = message.provider {
+                column = column.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .text_size(sp(11.0))
+                        .line_height(sp(14.0))
+                        .text_color(theme.text_tertiary)
+                        .child(crate::ui::icon(
+                            crate::ui::provider_icon(source_provider),
+                            12.0,
+                            theme.text_tertiary,
+                        ))
+                        .child(SharedString::from(source_provider.display_name())),
+                );
+            }
+            column = column.child(body);
             // Turn-backed responses render one footer after every ordered row
             // in the turn. Only legacy/unkeyed assistant messages retain an
             // inline footer because they have no turn boundary to target.

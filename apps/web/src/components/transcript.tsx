@@ -10,7 +10,7 @@ import { Virtuoso, type ListItem, type VirtuosoHandle } from 'react-virtuoso'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { PreviewableImage } from '@/components/image-preview'
-import { FileTypeIcon, WakuIcon, type WakuIconName } from '@/components/waku-icon'
+import { FileTypeIcon, ProviderIcon, WakuIcon, providerMeta, type WakuIconName } from '@/components/waku-icon'
 import { readAttachmentImage } from '@/lib/attachments'
 import { useDaemon } from '@/lib/daemon-context'
 import { activitiesForBlock } from '@/lib/event-reducer'
@@ -1085,9 +1085,16 @@ function MessageRow({
       </div>
     )
   }
+  const sourceProvider = message.provider ?? null
   return (
     <MessageContextMenu content={copyContent} forkAction={forkAction} t={t}>
       <article className="group/message min-w-0 py-1">
+        {sourceProvider && (
+          <div className="mb-1 inline-flex items-center gap-1.5 text-[11px] font-medium leading-4 text-[var(--text-tertiary)]">
+            <ProviderIcon className="size-3.5" provider={sourceProvider} />
+            <span>{providerMeta(sourceProvider).shortName}</span>
+          </div>
+        )}
         <Markdown streaming={message.streaming} text={visible} />
         {beforeFooter && <div className="mb-[3px] mt-3 w-full">{beforeFooter}</div>}
         {footer && (

@@ -137,6 +137,7 @@ fn history_from_export(export: &Value) -> anyhow::Result<ProviderSessionHistory>
                 id: turn_id,
                 turn_count: history.turns.len() + 1,
                 status: TurnStatus::Completed,
+                provider: Some(crate::model::ProviderKind::Amp),
                 provider_turn_started: true,
                 provider_resume_at: None,
                 started_at: at,

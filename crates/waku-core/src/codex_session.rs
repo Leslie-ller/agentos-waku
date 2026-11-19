@@ -309,6 +309,7 @@ fn parse_session_history(response: &Value) -> ProviderSessionHistory {
             id: turn_id,
             turn_count: history.turns.len() + 1,
             status,
+            provider: Some(crate::model::ProviderKind::Codex),
             provider_turn_started: true,
             provider_resume_at: None,
             started_at,
