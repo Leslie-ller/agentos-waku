@@ -219,6 +219,7 @@ fn history_from_messages(messages: &[MessageInfo]) -> ProviderSessionHistory {
                         id,
                         turn_count: history.turns.len() + 1,
                         status: TurnStatus::Completed,
+                        provider: Some(ProviderKind::OpenCode),
                         provider_turn_started: true,
                         provider_resume_at: None,
                         started_at: 0,

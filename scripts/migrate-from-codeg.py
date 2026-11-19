@@ -25,8 +25,10 @@ import time
 import uuid
 
 NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")  # NAMESPACE_DNS
-TOOL_ARG_PREVIEW_LIMIT = 4000
-TOOL_OUT_PREVIEW_LIMIT = 8000
+# Wire soft budget in waku-core (40 MiB); persisted SQLite rows are 100% lossless
+# and never truncated on disk — only outbound wire clones compact if over budget.
+WIRE_SOFT_BUDGET_BYTES = 40 * 1024 * 1024
+DEFAULT_MIGRATED_RUNTIME_MODE = "ask"
 
 
 def uid(seed: str) -> str:
@@ -373,11 +375,9 @@ def convert_events(
                 except Exception:
                     pass
 
-            capped_args, arg_orig, arg_trunc = cap_preview(input_str, TOOL_ARG_PREVIEW_LIMIT)
+            arg_orig = len(input_str) if input_str is not None else 0
             orig_tool_chars += arg_orig
-            kept_tool_chars += min(arg_orig, TOOL_ARG_PREVIEW_LIMIT)
-            if arg_trunc > 0:
-                truncated_arg_fields += 1
+            kept_tool_chars += arg_orig
 
             act = {
                 "id": uid(f"c{conv_id}-act-{seq}"),
@@ -386,7 +386,7 @@ def convert_events(
                 "title": display_target if act_kind == "command" else tool_name,
                 "tool_name": tool_name[:80],
                 "detail": display_target[:300],
-                "arguments": capped_args,
+                "arguments": input_str,
                 "output": None,
                 "failed": False,
                 "complete": True,
@@ -415,12 +415,10 @@ def convert_events(
                 else (len(pending_activities) - 1 if pending_activities else None)
             )
             if target_idx is not None and 0 <= target_idx < len(pending_activities):
-                capped_out, out_orig, out_trunc = cap_preview(out_str, TOOL_OUT_PREVIEW_LIMIT)
+                out_orig = len(out_str) if out_str is not None else 0
                 orig_tool_chars += out_orig
-                kept_tool_chars += min(out_orig, TOOL_OUT_PREVIEW_LIMIT)
-                if out_trunc > 0:
-                    truncated_out_fields += 1
-                pending_activities[target_idx]["output"] = capped_out
+                kept_tool_chars += out_orig
+                pending_activities[target_idx]["output"] = out_str
                 pending_activities[target_idx]["failed"] = is_err
 
     flush_activities()
@@ -532,7 +530,12 @@ def file_stamp(path: Path) -> tuple[int, int] | None:
     return (st.st_size, st.st_mtime_ns)
 
 
-def run_migration(source_db: Path, target_dir: Path, report_path: Path | None) -> dict:
+def run_migration(
+    source_db: Path,
+    target_dir: Path,
+    report_path: Path | None,
+    require_static_source: bool = False,
+) -> dict:
     t0 = time.time()
     repo_root = Path(__file__).resolve().parent.parent
     source_db = source_db.resolve()
@@ -760,6 +763,9 @@ def run_migration(source_db: Path, target_dir: Path, report_path: Path | None) -
                 }
             )
 
+        for t in turns:
+            t.setdefault("provider", provider)
+
         act_count = sum(len(b["content"]["data"]) for b in blocks)
         total_messages += len(msgs)
         total_activities += act_count
@@ -772,7 +778,7 @@ def run_migration(source_db: Path, target_dir: Path, report_path: Path | None) -
             "project_id": proj_id,
             "provider": provider,
             "model": model,
-            "runtime_mode": "fullAccess",
+            "runtime_mode": DEFAULT_MIGRATED_RUNTIME_MODE,
             "status": "idle",
             "created_at": created_ts,
             "updated_at": updated_ts,
@@ -788,7 +794,20 @@ def run_migration(source_db: Path, target_dir: Path, report_path: Path | None) -
             "turns": turns,
         }
         details_json = json.dumps(sess_obj, ensure_ascii=False)
-        total_details_utf8_bytes += len(details_json.encode("utf-8"))
+        details_bytes = len(details_json.encode("utf-8"))
+        total_details_utf8_bytes += details_bytes
+        if details_bytes > WIRE_SOFT_BUDGET_BYTES:
+            truncation_records.append(
+                {
+                    "legacy_conv_id": cid,
+                    "session_id": sess_id,
+                    "title": clean_title[:120],
+                    "event_count": ev_count,
+                    "stored_details_bytes": details_bytes,
+                    "original_tool_chars": ev_stats["orig_tool_chars"],
+                    "kept_tool_chars": ev_stats["kept_tool_chars"],
+                }
+            )
 
         dst.execute(
             """INSERT INTO sessions(
@@ -829,6 +848,7 @@ def run_migration(source_db: Path, target_dir: Path, report_path: Path | None) -
             for pos, m in enumerate(msgs):
                 content_str = m["content"]
                 total_message_utf8_bytes += len(content_str.encode("utf-8"))
+                msg_provider = provider if m["role"] == "assistant" else None
                 msg_tuples.append(
                     (
                         m["id"],
@@ -841,13 +861,14 @@ def run_migration(source_db: Path, target_dir: Path, report_path: Path | None) -
                         "[]",
                         m["created_at"],
                         0,
+                        msg_provider,
                     )
                 )
             dst.executemany(
                 """INSERT INTO messages(
                     id, session_id, turn_id, position, role, content,
-                    display_content, attachments, created_at, streaming
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    display_content, attachments, created_at, streaming, provider
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 msg_tuples,
             )
         dst.execute(
@@ -1035,13 +1056,13 @@ def run_migration(source_db: Path, target_dir: Path, report_path: Path | None) -
     source_zero_modified = (
         src_stamp_before == src_stamp_after and wal_stamp_before == wal_stamp_after
     )
-    if not source_zero_modified:
+    if require_static_source and not source_zero_modified:
         raise RuntimeError(
             f"Source DB stamp changed unexpectedly: before={src_stamp_before}, after={src_stamp_after}"
         )
 
     truncation_records.sort(
-        key=lambda r: r["original_tool_chars"] - r["kept_tool_chars"], reverse=True
+        key=lambda r: r.get("stored_details_bytes", 0), reverse=True
     )
 
     report = {
@@ -1066,6 +1087,7 @@ def run_migration(source_db: Path, target_dir: Path, report_path: Path | None) -
         "target_counts": dst_counts,
         "fidelity": {
             "provider_distribution": provider_counts,
+            "migrated_runtime_mode": DEFAULT_MIGRATED_RUNTIME_MODE,
             "preserved_native_resume_cursors": preserved_native_cursors,
             "migrated_parked_cursor_sessions": migrated_parked_cursor_sessions,
             "migrated_parked_cursors_total": migrated_parked_cursors_total,
@@ -1076,12 +1098,11 @@ def run_migration(source_db: Path, target_dir: Path, report_path: Path | None) -
             "total_message_utf8_bytes": total_message_utf8_bytes,
             "total_session_details_utf8_bytes": total_details_utf8_bytes,
             "messages_truncated_count": 0,
-            "tool_preview_truncation": {
-                "arg_char_limit": TOOL_ARG_PREVIEW_LIMIT,
-                "output_char_limit": TOOL_OUT_PREVIEW_LIMIT,
-                "sessions_with_capped_tool_previews": len(truncation_records),
-                "capped_tool_arg_fields": total_truncated_arg_fields,
-                "capped_tool_output_fields": total_truncated_out_fields,
+            "tool_arguments_truncated_count": total_truncated_arg_fields,
+            "tool_outputs_truncated_count": total_truncated_out_fields,
+            "wire_compaction_candidates": {
+                "wire_soft_budget_bytes": WIRE_SOFT_BUDGET_BYTES,
+                "sessions_above_wire_soft_budget": len(truncation_records),
                 "top_20_sessions": truncation_records[:20],
             },
         },
@@ -1118,9 +1139,19 @@ def main() -> int:
         default=None,
         help="Optional path to write JSON reconciliation report",
     )
+    parser.add_argument(
+        "--require-static-source",
+        action="store_true",
+        help="Fail if source DB (or -wal) mtime/size changes during migration (use on offline snapshots)",
+    )
     args = parser.parse_args()
 
-    report = run_migration(args.source, args.target_dir, args.report)
+    report = run_migration(
+        args.source,
+        args.target_dir,
+        args.report,
+        require_static_source=args.require_static_source,
+    )
     print(
         json.dumps(
             {
@@ -1130,6 +1161,13 @@ def main() -> int:
                 "source_counts": report["source_counts"],
                 "target_counts": report["target_counts"],
                 "messages_truncated_count": report["fidelity"]["messages_truncated_count"],
+                "tool_arguments_truncated_count": report["fidelity"][
+                    "tool_arguments_truncated_count"
+                ],
+                "tool_outputs_truncated_count": report["fidelity"][
+                    "tool_outputs_truncated_count"
+                ],
+                "migrated_runtime_mode": report["fidelity"]["migrated_runtime_mode"],
                 "preserved_native_resume_cursors": report["fidelity"][
                     "preserved_native_resume_cursors"
                 ],

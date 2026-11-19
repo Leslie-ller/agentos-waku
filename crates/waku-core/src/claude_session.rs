@@ -545,6 +545,7 @@ fn provider_session_history_in(
                 id: turn_id,
                 turn_count: history.turns.len() + 1,
                 status: TurnStatus::Completed,
+                provider: Some(crate::model::ProviderKind::Claude),
                 provider_turn_started: true,
                 provider_resume_at: native_id.map(str::to_owned),
                 started_at: timestamp,

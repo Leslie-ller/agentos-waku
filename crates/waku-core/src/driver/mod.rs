@@ -244,7 +244,9 @@ pub(crate) fn start_local_with_mcp(
         | ProviderKind::Kimi => {
             Arc::new(acp::AcpDriver::start_with_mcp(provider, options, mcp_companion, events)?)
         }
-        ProviderKind::DeepSeek => Arc::new(deepseek::DeepSeekDriver::start(options, events)?),
+        ProviderKind::DeepSeek => {
+            Arc::new(deepseek::DeepSeekDriver::start_with_mcp(options, mcp_companion, events)?)
+        }
         // OpenCode is not a per-workspace server: one adopted background
         // service carries every workspace, and every Waku task rides its one
         // event stream.

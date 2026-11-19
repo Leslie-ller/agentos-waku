@@ -2655,6 +2655,11 @@ for raw in sys.stdin:
         });
         hydrated.push_message(MessageRole::User, "Continue step 2 on Antigravity");
         hydrated.push_message(MessageRole::Assistant, "Antigravity completed step 2.");
+        assert_eq!(hydrated.messages[1].provider, Some(ProviderKind::Codex));
+        assert_eq!(
+            hydrated.messages[3].provider,
+            Some(ProviderKind::Antigravity)
+        );
         assert!(hydrated.switch_provider(ProviderKind::Codex));
         assert_eq!(
             hydrated.provider_cursor.as_ref().map(|c| c.native_id()),

@@ -97,7 +97,11 @@ pub struct DeepSeekDriver {
 }
 
 impl DeepSeekDriver {
-    pub fn start(options: DriverStartOptions, events: DriverEventSender) -> anyhow::Result<Self> {
+    pub fn start_with_mcp(
+        options: DriverStartOptions,
+        mcp_companion: Option<crate::mcp_companion::McpCompanionLaunch>,
+        events: DriverEventSender,
+    ) -> anyhow::Result<Self> {
         let DriverStartOptions {
             binary,
             cwd,
@@ -123,7 +127,7 @@ impl DeepSeekDriver {
             _ => (Uuid::new_v4().to_string(), false),
         };
 
-        let server = crate::deepseek_pool::acquire(&binary)?;
+        let server = crate::deepseek_pool::acquire_with_mcp(&binary, mcp_companion.as_ref())?;
         // Subscribe first. A create immediately publishes host and mux state,
         // and buffering that state closes the create/history race.
         let event_rx = server.subscribe(&requested_session_id);

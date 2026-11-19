@@ -272,6 +272,7 @@ fn history_from_updates(provider: ProviderKind, updates: &[Value]) -> ProviderSe
                     id: turn_id,
                     turn_count: history.turns.len() + 1,
                     status: TurnStatus::Completed,
+                    provider: Some(provider),
                     provider_turn_started: true,
                     provider_resume_at: None,
                     started_at: 0,

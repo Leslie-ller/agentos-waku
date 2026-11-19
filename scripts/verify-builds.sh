@@ -91,9 +91,11 @@ EOF
       chmod +x "$RC_WRAP_DIR/llvm-rc"
       export PATH="$RC_WRAP_DIR:$PATH"
     fi
-    # On non-Windows cross hosts `gpui_windows` skips offline `fxc.exe` shader
-    # compilation and compiles HLSL shaders via `D3DCompile` when debug_assertions is on.
-    cargo-xwin xwin build --release --config "profile.release.debug-assertions=true" \
+    # Scope debug_assertions strictly to `gpui_windows` on non-Windows cross
+    # hosts so `gpui_windows` compiles HLSL shaders via runtime `D3DCompile`
+    # without `fxc.exe`, while `waku` / `waku-core` / `waku-daemon` remain true
+    # release binaries using `%LOCALAPPDATA%\AgentOS Waku\app.db`.
+    cargo-xwin xwin build --release --config "profile.release.package.gpui_windows.debug-assertions=true" \
       --target "$WIN_TRIPLE" --target-dir "$TARGET_DIR" \
       --package waku --bin waku --bin waku_js_repl \
       --package waku-daemon --bin waku-daemon \

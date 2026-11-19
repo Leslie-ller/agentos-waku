@@ -403,6 +403,7 @@ fn history_from_session(provider: ProviderKind, session: &ParsedSession) -> Prov
                 id: turn_id,
                 turn_count: history.turns.len() + 1,
                 status: TurnStatus::Interrupted,
+                provider: Some(provider),
                 provider_turn_started: true,
                 provider_resume_at: None,
                 started_at: entry.timestamp,

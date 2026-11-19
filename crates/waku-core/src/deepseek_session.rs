@@ -127,6 +127,7 @@ fn start_import_turn(history: &mut ProviderSessionHistory, timestamp: u64) -> Uu
         id,
         turn_count: history.turns.len() + 1,
         status: TurnStatus::Interrupted,
+        provider: Some(crate::model::ProviderKind::DeepSeek),
         provider_turn_started: true,
         provider_resume_at: None,
         started_at: timestamp,
@@ -383,39 +384,94 @@ pub(crate) struct DeepSeekServer {
     pub(crate) port: u16,
     events: Arc<EventHub>,
     streams: Arc<StreamControl>,
+    mcp_patch_file: Option<std::path::PathBuf>,
+}
+
+pub(crate) fn render_mcp_patch_yaml(mcp: &crate::mcp_companion::McpCompanionLaunch) -> String {
+    let server_name = serde_json::to_string(&mcp.server_name)
+        .unwrap_or_else(|_| "\"codeg-mcp\"".to_owned());
+    let command = serde_json::to_string(&mcp.executable.to_string_lossy().as_ref())
+        .unwrap_or_else(|_| "\"waku-daemon\"".to_owned());
+    let args_json = serde_json::to_string(&mcp.args).unwrap_or_else(|_| "[]".to_owned());
+    format!(
+        "- insert:\n    - id: {server_name}\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        serverName: {server_name}\n        transport: stdio\n        command: {command}\n        args: {args_json}\n        failOnStartupError: false\n"
+    )
+}
+
+pub(crate) fn build_dsh_web_args(
+    patch_path: Option<&Path>,
+    supports_no_open: bool,
+) -> Vec<std::ffi::OsString> {
+    let mut args = vec![std::ffi::OsString::from("web")];
+    if let Some(patch_path) = patch_path {
+        args.push(std::ffi::OsString::from("--patch"));
+        args.push(patch_path.as_os_str().to_os_string());
+    }
+    args.extend([
+        std::ffi::OsString::from("--host"),
+        std::ffi::OsString::from("127.0.0.1"),
+        std::ffi::OsString::from("--port"),
+        std::ffi::OsString::from("0"),
+    ]);
+    if supports_no_open {
+        args.push(std::ffi::OsString::from("--no-open"));
+    }
+    args
 }
 
 impl DeepSeekServer {
     pub(crate) fn start(binary: &Path) -> anyhow::Result<Self> {
+        Self::start_with_mcp(binary, None)
+    }
+
+    pub(crate) fn start_with_mcp(
+        binary: &Path,
+        mcp: Option<&crate::mcp_companion::McpCompanionLaunch>,
+    ) -> anyhow::Result<Self> {
         let isolated = crate::agent_profiles::resolve_isolated_profile(
             crate::model::ProviderKind::DeepSeek,
         )?
         .map(|profile| profile.directory);
-        Self::start_with_dsh_home(binary, isolated.as_deref())
+        Self::start_with_dsh_home_and_mcp(binary, isolated.as_deref(), mcp)
     }
 
-    fn start_with_dsh_home(binary: &Path, dsh_home: Option<&Path>) -> anyhow::Result<Self> {
+    fn start_with_dsh_home_and_mcp(
+        binary: &Path,
+        dsh_home: Option<&Path>,
+        mcp: Option<&crate::mcp_companion::McpCompanionLaunch>,
+    ) -> anyhow::Result<Self> {
         let supports_no_open = web_supports_no_open(binary, dsh_home);
         let catalog_cwd = crate::acp_session::catalog_working_directory()?;
+        let mcp_patch_file = if let Some(mcp) = mcp {
+            let patch_dir = dsh_home
+                .map(Path::to_path_buf)
+                .unwrap_or_else(std::env::temp_dir);
+            let _ = std::fs::create_dir_all(&patch_dir);
+            let patch_path = patch_dir.join(format!("waku-mcp-{}.patch.yml", Uuid::new_v4()));
+            std::fs::write(&patch_path, render_mcp_patch_yaml(mcp)).with_context(|| {
+                format!(
+                    "could not write DeepSeek Harness MCP patch file at {}",
+                    patch_path.display()
+                )
+            })?;
+            Some(patch_path)
+        } else {
+            None
+        };
+        let dsh_args = build_dsh_web_args(mcp_patch_file.as_deref(), supports_no_open);
         #[cfg(unix)]
         let mut command = {
             let mut command = crate::command_env::command("/bin/sh");
             command
                 .args(["-c", DSH_GUARDIAN_SCRIPT, "waku-dsh-guardian"])
                 .arg(binary)
-                .args(["web", "--host", "127.0.0.1", "--port", "0"]);
-            if supports_no_open {
-                command.arg("--no-open");
-            }
+                .args(&dsh_args);
             command
         };
         #[cfg(not(unix))]
         let mut command = {
             let mut command = crate::command_env::command(binary);
-            command.args(["web", "--host", "127.0.0.1", "--port", "0"]);
-            if supports_no_open {
-                command.arg("--no-open");
-            }
+            command.args(&dsh_args);
             command
         };
         command
@@ -555,6 +611,7 @@ impl DeepSeekServer {
             port,
             events,
             streams,
+            mcp_patch_file,
         })
     }
 
@@ -644,6 +701,9 @@ impl DeepSeekServer {
     pub(crate) fn shutdown(&self, timeout: Duration) {
         self.streams.cancel();
         terminate_child(&mut self.child.lock(), timeout);
+        if let Some(patch_path) = &self.mcp_patch_file {
+            let _ = std::fs::remove_file(patch_path);
+        }
     }
 }
 
@@ -1086,7 +1146,7 @@ mod tests {
             TempHarnessHome(std::env::temp_dir().join(format!("waku-dsh-test-{}", Uuid::new_v4())));
         std::fs::create_dir_all(&root.0).unwrap();
         {
-            let server = DeepSeekServer::start_with_dsh_home(&binary, Some(&root.0))
+            let server = DeepSeekServer::start_with_dsh_home_and_mcp(&binary, Some(&root.0), None)
                 .expect("Harness Host should start");
             let session_id = format!("waku-test-{}", Uuid::new_v4());
             let events = server.subscribe(&session_id);
@@ -1156,5 +1216,46 @@ mod tests {
             );
             server.shutdown(Duration::from_secs(5));
         }
+    }
+
+    #[test]
+    fn render_mcp_patch_yaml_declares_stdio_codeg_mcp_client() {
+        let launch = crate::mcp_companion::McpCompanionLaunch {
+            server_name: "codeg-mcp".into(),
+            executable: std::path::PathBuf::from("/usr/local/bin/waku-daemon"),
+            args: vec![
+                "--mcp-stdio".into(),
+                "--session-id".into(),
+                "00000000-0000-0000-0000-000000000001".into(),
+                "--db".into(),
+                "/tmp/agentos waku/app.db".into(),
+            ],
+        };
+        let yaml = render_mcp_patch_yaml(&launch);
+        assert!(yaml.contains("name: '@deepseek-ai/dsh-mcp-client'"));
+        assert!(yaml.contains("serverName: \"codeg-mcp\""));
+        assert!(yaml.contains("transport: stdio"));
+        assert!(yaml.contains("command: \"/usr/local/bin/waku-daemon\""));
+        assert!(yaml.contains("\"--mcp-stdio\""));
+        assert!(yaml.contains("\"/tmp/agentos waku/app.db\""));
+
+        let args = build_dsh_web_args(Some(Path::new("/tmp/waku-mcp.patch.yml")), true);
+        let strings: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            strings,
+            vec![
+                "web",
+                "--patch",
+                "/tmp/waku-mcp.patch.yml",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "0",
+                "--no-open",
+            ]
+        );
     }
 }

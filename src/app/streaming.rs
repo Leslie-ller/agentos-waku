@@ -1033,7 +1033,8 @@ pub(super) fn append_text_delta_to_session(
         let mut message = session
             .active_turn_id()
             .map(|turn_id| Message::new_for_turn(MessageRole::Assistant, delta.clone(), turn_id))
-            .unwrap_or_else(|| Message::new(MessageRole::Assistant, delta));
+            .unwrap_or_else(|| Message::new(MessageRole::Assistant, delta))
+            .with_provider(Some(session.provider));
         message.streaming = true;
         session.messages.push(message);
     }
