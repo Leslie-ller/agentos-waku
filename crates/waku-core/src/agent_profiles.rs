@@ -65,6 +65,9 @@ pub fn profiles_root() -> PathBuf {
     {
         return expand_tilde(&configured, dirs::home_dir().as_deref());
     }
+    if let Some(bootstrapped) = crate::identity::configured_agent_profiles_dir() {
+        return bootstrapped;
+    }
     default_runtime_data_dir().join("agent-profiles")
 }
 
