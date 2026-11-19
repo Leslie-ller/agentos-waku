@@ -1885,7 +1885,7 @@ fn settings_search_filters_pages_for_arrow_cycling() {
         SettingsPage::Usage,
         SettingsPage::Daemon,
     ];
-    if cfg!(debug_assertions) {
+    if crate::computer_use::is_available() {
         all_pages.push(SettingsPage::ComputerUse);
     }
     assert_eq!(pages(""), all_pages);
@@ -1899,7 +1899,7 @@ fn settings_search_filters_pages_for_arrow_cycling() {
         SettingsPage::Skills,
         SettingsPage::Usage,
     ];
-    if cfg!(debug_assertions) {
+    if crate::computer_use::is_available() {
         codex_pages.push(SettingsPage::ComputerUse);
     }
     assert_eq!(pages("codex"), codex_pages);
@@ -1908,13 +1908,13 @@ fn settings_search_filters_pages_for_arrow_cycling() {
 }
 
 #[test]
-fn computer_use_navigation_is_debug_only() {
+fn computer_use_navigation_matches_availability() {
     use super::SettingsPage;
 
     assert!(SettingsPage::General.is_visible_in_navigation());
     assert_eq!(
         SettingsPage::ComputerUse.is_visible_in_navigation(),
-        cfg!(debug_assertions)
+        crate::computer_use::is_available()
     );
 }
 

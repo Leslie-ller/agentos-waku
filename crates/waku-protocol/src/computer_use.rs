@@ -4,12 +4,11 @@ use ts_rs::TS;
 
 /// Whether this build may run Computer Use.
 ///
-/// The feature is experimental, so only development builds expose it. Release
-/// builds refuse it even when a client asks, which keeps a stale setting, a
-/// hand-edited settings file, or a third-party daemon client from turning it on
-/// in production.
+/// AgentOS Waku enables the built-in macOS Computer Use helper (`AgentOS Waku
+/// Computer Use.app`) in both debug and release builds on macOS, and in debug
+/// builds on other platforms.
 pub const fn is_available() -> bool {
-    cfg!(debug_assertions)
+    cfg!(target_os = "macos") || cfg!(debug_assertions)
 }
 
 /// Clamp a requested Computer Use enablement to what this build ships.
@@ -137,8 +136,11 @@ mod tests {
     use super::{is_available, resolve_enabled};
 
     #[test]
-    fn computer_use_is_development_only() {
-        assert_eq!(is_available(), cfg!(debug_assertions));
+    fn computer_use_availability_matches_platform_gate() {
+        assert_eq!(
+            is_available(),
+            cfg!(target_os = "macos") || cfg!(debug_assertions)
+        );
         assert!(!resolve_enabled(false));
         assert_eq!(resolve_enabled(true), is_available());
     }
