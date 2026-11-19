@@ -2539,7 +2539,7 @@ for raw in sys.stdin:
             std::env::set_var(crate::mcp_companion::MCP_BIN_ENV, &fake_mcp_bin);
         }
 
-        // Start Antigravity on the existing Codex session (auto-parks Codex cursor & injects codeg-mcp)
+        // Start Antigravity on the existing Codex session (auto-parks Codex cursor & injects agentos-mcp)
         let runtime_id = Uuid::new_v4();
         backend
             .handle(
@@ -2603,7 +2603,7 @@ for raw in sys.stdin:
             std::env::remove_var(crate::mcp_companion::MCP_BIN_ENV);
         }
 
-        // Verify ACP wire RPC log: codeg-mcp injected on session/new AND cold handoff seed prepended on session/prompt!
+        // Verify ACP wire RPC log: agentos-mcp injected on session/new AND cold handoff seed prepended on session/prompt!
         let logged: Vec<Value> =
             serde_json::from_str(&std::fs::read_to_string(&rpc_log).unwrap()).unwrap();
         let new_call = logged
@@ -2617,7 +2617,7 @@ for raw in sys.stdin:
         assert!(
             mcp_servers
                 .iter()
-                .any(|srv| srv.get("name").and_then(Value::as_str) == Some("codeg-mcp"))
+                .any(|srv| srv.get("name").and_then(Value::as_str) == Some("agentos-mcp"))
         );
 
         let prompt_call = logged

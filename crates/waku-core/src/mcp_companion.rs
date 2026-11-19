@@ -1,4 +1,4 @@
-//! Built-in `codeg-mcp` compatible stdio MCP server backed by Waku's SQLite DB.
+//! Built-in AgentOS stdio MCP server backed by Waku's SQLite DB.
 //!
 //! Invoked via `waku-daemon --mcp-stdio --session-id <uuid> --db <path> --cwd <dir>`
 //! so every ACP, Codex, and Claude session receives durable task memory
@@ -17,7 +17,7 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-pub const MCP_SERVER_NAME: &str = "codeg-mcp";
+pub const MCP_SERVER_NAME: &str = "agentos-mcp";
 pub const MCP_BIN_ENV: &str = "AGENTOS_WAKU_MCP_BIN";
 pub const DISABLE_MCP_ENV: &str = "AGENTOS_WAKU_DISABLE_MCP";
 
@@ -1161,7 +1161,7 @@ mod tests {
             &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
         )
         .unwrap();
-        assert_eq!(init["result"]["serverInfo"]["name"], "codeg-mcp");
+        assert_eq!(init["result"]["serverInfo"]["name"], "agentos-mcp");
 
         let list = dispatch_mcp_request(
             &conn,

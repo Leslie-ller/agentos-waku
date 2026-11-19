@@ -85,7 +85,7 @@ pub(crate) fn acquire(binary: &Path) -> anyhow::Result<PooledDeepSeekServer> {
     acquire_with_start(binary, || DeepSeekServer::start(binary))
 }
 
-/// Starts a session-scoped Harness Host patched with the companion `codeg-mcp`
+/// Starts a session-scoped Harness Host patched with the companion `agentos-mcp`
 /// stdio server so DeepSeek sessions receive isolated Memory / Goal tools, or
 /// reuses the pooled Host when no companion MCP launch is provided.
 pub(crate) fn acquire_with_mcp(

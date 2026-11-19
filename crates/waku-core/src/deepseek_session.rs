@@ -389,7 +389,7 @@ pub(crate) struct DeepSeekServer {
 
 pub(crate) fn render_mcp_patch_yaml(mcp: &crate::mcp_companion::McpCompanionLaunch) -> String {
     let server_name = serde_json::to_string(&mcp.server_name)
-        .unwrap_or_else(|_| "\"codeg-mcp\"".to_owned());
+        .unwrap_or_else(|_| "\"agentos-mcp\"".to_owned());
     let command = serde_json::to_string(&mcp.executable.to_string_lossy().as_ref())
         .unwrap_or_else(|_| "\"waku-daemon\"".to_owned());
     let args_json = serde_json::to_string(&mcp.args).unwrap_or_else(|_| "[]".to_owned());
@@ -1221,7 +1221,7 @@ mod tests {
     #[test]
     fn render_mcp_patch_yaml_declares_stdio_codeg_mcp_client() {
         let launch = crate::mcp_companion::McpCompanionLaunch {
-            server_name: "codeg-mcp".into(),
+            server_name: "agentos-mcp".into(),
             executable: std::path::PathBuf::from("/usr/local/bin/waku-daemon"),
             args: vec![
                 "--mcp-stdio".into(),
@@ -1233,7 +1233,7 @@ mod tests {
         };
         let yaml = render_mcp_patch_yaml(&launch);
         assert!(yaml.contains("name: '@deepseek-ai/dsh-mcp-client'"));
-        assert!(yaml.contains("serverName: \"codeg-mcp\""));
+        assert!(yaml.contains("serverName: \"agentos-mcp\""));
         assert!(yaml.contains("transport: stdio"));
         assert!(yaml.contains("command: \"/usr/local/bin/waku-daemon\""));
         assert!(yaml.contains("\"--mcp-stdio\""));

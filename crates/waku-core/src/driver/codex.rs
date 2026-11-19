@@ -275,12 +275,12 @@ impl CodexDriver {
             command
                 .arg("-c")
                 .arg(format!(
-                    "mcp_servers.\"{}\".command={}",
+                    "mcp_servers.{}.command={}",
                     companion.server_name, cmd_toml
                 ))
                 .arg("-c")
                 .arg(format!(
-                    "mcp_servers.\"{}\".args={}",
+                    "mcp_servers.{}.args={}",
                     companion.server_name, args_toml
                 ));
         }
