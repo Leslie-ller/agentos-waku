@@ -1740,6 +1740,16 @@ mod tests {
 
 impl Waku {
     pub(super) fn open_transcript_link(&mut self, target: &str, cx: &mut Context<Self>) -> bool {
+        if let Some(raw_id) = target
+            .strip_prefix("agentos://session/")
+            .or_else(|| target.strip_prefix("codeg://session/"))
+            && let Ok(session_id) = Uuid::parse_str(raw_id.trim())
+            && self.state.sessions.iter().any(|session| session.id == session_id)
+        {
+            self.settings_page = None;
+            self.select_session(session_id, cx);
+            return true;
+        }
         match transcript_link_route(target, self.selected_workspace_path()) {
             TranscriptLinkRoute::ProjectFile(relative_path) => {
                 self.open_right_panel_surface(RightPanelSurface::Files, cx);

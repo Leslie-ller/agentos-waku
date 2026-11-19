@@ -10,6 +10,7 @@ pub fn provider_probe(provider: ProviderKind, binary_override: Option<&str>) -> 
         None if provider == ProviderKind::Antigravity => {
             crate::agent_profiles::find_antigravity_binary()
         }
+        None if provider == ProviderKind::Codex => find_codex_binary(),
         None => crate::command_env::find_executable(provider.command()),
     };
     ProviderProbe {
@@ -19,6 +20,55 @@ pub fn provider_probe(provider: ProviderKind, binary_override: Option<&str>) -> 
         models: crate::model_catalog::fallback_models(provider),
         agent_presets: crate::model_catalog::fallback_agent_presets(provider),
     }
+}
+
+/// Resolve the newest installed Codex CLI binary. On macOS, ChatGPT.app bundles
+/// a newer `codex-cli` binary than older standalone `~/.local/bin/codex`
+/// installs; preferring the higher version ensures newly released models (such
+/// as GPT-6.2) are visible out of the box without manual override.
+fn find_codex_binary() -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = crate::command_env::find_executable(ProviderKind::Codex.command()) {
+        candidates.push(path);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut mac_candidates = vec![std::path::PathBuf::from(
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+        )];
+        if let Some(home) = dirs::home_dir() {
+            mac_candidates
+                .push(home.join("Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"));
+        }
+        for candidate in mac_candidates {
+            if candidate.is_file() && !candidates.iter().any(|existing| existing == &candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    if candidates.len() <= 1 {
+        return candidates.into_iter().next();
+    }
+    candidates
+        .into_iter()
+        .max_by_key(|candidate| {
+            probe_provider_version(candidate)
+                .map(|v| parse_version_key(&v))
+                .unwrap_or_default()
+        })
+}
+
+fn parse_version_key(version: &str) -> (u64, u64, u64, u8) {
+    let clean = version.trim().trim_start_matches('v');
+    let (core, is_stable) = match clean.split_once('-') {
+        Some((c, _)) => (c, 0_u8),
+        None => (clean, 1_u8),
+    };
+    let mut parts = core.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    let patch = parts.next().unwrap_or(0);
+    (major, minor, patch, is_stable)
 }
 
 /// Detect a provider and hydrate its catalog from the daemon-owned cache.

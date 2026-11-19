@@ -1119,3 +1119,32 @@ usage_error.curl_did_not_finish: curl がリクエストを完了しませんで
 usage_error.curl_failed: "curl に失敗しました：%{error}"
 usage_error.unknown_error: 不明なエラー
 usage_error.curl_no_status: curl から HTTP ステータス行が返されませんでした
+
+settings.memory: メモリ
+settings.memory_keywords: メモリ 知識 ノート チェックポイント memory knowledge notes checkpoints
+autocomplete.session_badge: セッション
+memory.subtitle: AgentOS が保存したクロスセッション知識、作業ノート、チェックポイントを確認・管理します。
+memory.search: 知識、ノート、チェックポイント、プロジェクトを検索…
+memory.current_project: 現在のプロジェクト
+memory.all_projects: すべてのプロジェクト
+memory.refresh: 更新
+memory.refreshing: 更新中…
+memory.tab_knowledge: 知識
+memory.tab_notes: ノート
+memory.tab_checkpoints: チェックポイント
+memory.loading: メモリを読み込み中…
+memory.empty_knowledge: 条件に一致する知識はありません。
+memory.empty_notes: 条件に一致するノートはありません。
+memory.empty_checkpoints: 条件に一致するチェックポイントはありません。
+memory.status_promoted: 採用済み
+memory.status_candidate: 候補
+memory.status_rejected: 却下
+memory.action_promote: 採用
+memory.action_reject: 却下
+memory.action_delete: 削除
+memory.cp_completed: 完了
+memory.cp_in_progress: 進行中
+memory.cp_next_actions: 次のアクション
+memory.cp_open_questions: 未解決の質問
+memory.cp_constraints: 制約事項
+memory.cp_rejected: 却下した案

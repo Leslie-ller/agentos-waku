@@ -19,7 +19,8 @@ use std::rc::Rc;
 use gpui::{
     Anchor, App, Bounds, Font, KeyBinding, Pixels, StyledText, TextRun, anchored, deferred,
 };
-use nucleo_matcher::Matcher;
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Matcher, Utf32Str};
 
 use crate::composer_complete::{
     self, FILE_INDEX_CAP, FileEntry, Scored, SlashCommand, Trigger, TriggerKind,
@@ -52,9 +53,19 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct SessionMention {
+    pub session_id: Uuid,
+    pub title: String,
+    pub project_name: String,
+    pub provider: ProviderKind,
+    pub positions: Vec<u32>,
+}
+
 pub(super) enum AutocompleteRow {
     Command(Scored<SlashCommand>),
     File(Scored<FileEntry>),
+    Session(SessionMention),
 }
 
 /// Filter results for one (kind, query, source index) — the popup's rows are
@@ -64,6 +75,8 @@ struct ResultsMemo {
     query: String,
     /// `Rc::as_ptr` identity of the source index the rows were filtered from.
     source: usize,
+    /// Fingerprint of the session list for `@` session mentions.
+    session_source: u64,
     rows: Rc<Vec<AutocompleteRow>>,
 }
 
@@ -291,10 +304,17 @@ impl Waku {
             TriggerKind::Command => Rc::as_ptr(&self.slash_command_index) as usize,
             TriggerKind::File => Rc::as_ptr(&self.mention_file_index) as usize,
         };
+        let session_source = match trigger.kind {
+            TriggerKind::Command => 0,
+            TriggerKind::File => self.session_mention_fingerprint(),
+        };
         {
             let memo = self.composer_autocomplete.results.borrow();
             if let Some(memo) = memo.as_ref().filter(|memo| {
-                memo.kind == trigger.kind && memo.query == trigger.query && memo.source == source
+                memo.kind == trigger.kind
+                    && memo.query == trigger.query
+                    && memo.source == source
+                    && memo.session_source == session_source
             }) {
                 return memo.rows.clone();
             }
@@ -309,23 +329,162 @@ impl Waku {
             .into_iter()
             .map(AutocompleteRow::Command)
             .collect::<Vec<_>>(),
-            TriggerKind::File => composer_complete::filter_files(
-                &self.mention_file_index,
-                &trigger.query,
-                &mut matcher,
-            )
-            .into_iter()
-            .map(AutocompleteRow::File)
-            .collect(),
+            TriggerKind::File => {
+                let (sessions_only, session_query) = strip_session_mention_prefix(&trigger.query);
+                let session_cap = if sessions_only {
+                    20
+                } else if trigger.query.trim().is_empty() {
+                    3
+                } else {
+                    6
+                };
+                let mut rows: Vec<AutocompleteRow> = self
+                    .filter_session_mentions(session_query, session_cap, &mut matcher)
+                    .into_iter()
+                    .map(AutocompleteRow::Session)
+                    .collect();
+                if !sessions_only {
+                    rows.extend(
+                        composer_complete::filter_files(
+                            &self.mention_file_index,
+                            &trigger.query,
+                            &mut matcher,
+                        )
+                        .into_iter()
+                        .map(AutocompleteRow::File),
+                    );
+                }
+                rows
+            }
         };
         let rows = Rc::new(rows);
         *self.composer_autocomplete.results.borrow_mut() = Some(ResultsMemo {
             kind: trigger.kind,
             query: trigger.query.clone(),
             source,
+            session_source,
             rows: rows.clone(),
         });
         rows
+    }
+
+    fn session_mention_fingerprint(&self) -> u64 {
+        let mut acc: u64 = self.state.sessions.len() as u64;
+        if let Some(selected) = self.state.selected_session {
+            acc = acc.wrapping_mul(31).wrapping_add(selected.as_u128() as u64);
+        }
+        if let Some(project) = self.state.selected_project {
+            acc = acc.wrapping_mul(31).wrapping_add(project.as_u128() as u64);
+        }
+        for session in &self.state.sessions {
+            acc = acc
+                .wrapping_mul(131)
+                .wrapping_add(session.updated_at)
+                .wrapping_add(session.display_title().len() as u64);
+        }
+        acc
+    }
+
+    fn filter_session_mentions(
+        &self,
+        query: &str,
+        cap: usize,
+        matcher: &mut Matcher,
+    ) -> Vec<SessionMention> {
+        let current_session = self.state.selected_session;
+        let current_project = self
+            .selected_session()
+            .map(|session| session.project_id)
+            .or(self.state.selected_project);
+        let project_names: HashMap<Uuid, String> = self
+            .state
+            .projects
+            .iter()
+            .map(|project| (project.id, project.display_name()))
+            .collect();
+
+        let mut candidates: Vec<(&AgentSession, String, String, bool)> = self
+            .state
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.has_started() && Some(session.id) != current_session
+            })
+            .map(|session| {
+                let title = session.display_title().trim().to_owned();
+                let project_name = project_names
+                    .get(&session.project_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let same_project = current_project == Some(session.project_id);
+                (session, title, project_name, same_project)
+            })
+            .filter(|(_, title, _, _)| !title.is_empty())
+            .collect();
+
+        // Most recent sessions in the current project come first.
+        candidates.sort_by(|a, b| {
+            b.3.cmp(&a.3)
+                .then_with(|| {
+                    b.0.last_reply_at
+                        .unwrap_or(b.0.created_at)
+                        .cmp(&a.0.last_reply_at.unwrap_or(a.0.created_at))
+                })
+        });
+
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return candidates
+                .into_iter()
+                .take(cap)
+                .map(|(session, title, project_name, _)| SessionMention {
+                    session_id: session.id,
+                    title,
+                    project_name,
+                    provider: session.provider,
+                    positions: Vec::new(),
+                })
+                .collect();
+        }
+
+        let pattern = Pattern::parse(trimmed, CaseMatching::Ignore, Normalization::Smart);
+        let mut buf = Vec::new();
+        let mut scored: Vec<(u32, bool, u64, usize)> = Vec::new();
+        for (idx, (session, title, project_name, same_project)) in candidates.iter().enumerate() {
+            let haystack = if project_name.is_empty() {
+                title.clone()
+            } else {
+                format!("{title} {project_name}")
+            };
+            if let Some(score) = pattern.score(Utf32Str::new(&haystack, &mut buf), matcher) {
+                let recency = session.last_reply_at.unwrap_or(session.created_at);
+                scored.push((score, *same_project, recency, idx));
+            }
+        }
+        scored.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| b.0.cmp(&a.0))
+                .then_with(|| b.2.cmp(&a.2))
+        });
+
+        scored
+            .into_iter()
+            .take(cap)
+            .map(|(_, _, _, idx)| {
+                let (session, ref title, ref project_name, _) = candidates[idx];
+                let mut positions = Vec::new();
+                pattern.indices(Utf32Str::new(title, &mut buf), matcher, &mut positions);
+                positions.sort_unstable();
+                positions.dedup();
+                SessionMention {
+                    session_id: session.id,
+                    title: title.clone(),
+                    project_name: project_name.clone(),
+                    provider: session.provider,
+                    positions,
+                }
+            })
+            .collect()
     }
 
     pub(super) fn move_autocomplete_highlight(
@@ -376,6 +535,14 @@ impl Waku {
                 format!("{composer_text} ")
             }
             AutocompleteRow::File(scored) => format!("@{} ", scored.item.path),
+            AutocompleteRow::Session(mention) => {
+                let safe_title = mention
+                    .title
+                    .replace('[', "(")
+                    .replace(']', ")")
+                    .replace('\n', " ");
+                format!("[{safe_title}](agentos://session/{}) ", mention.session_id)
+            }
         };
         if matches!(row, AutocompleteRow::Command(_)) {
             let mut submission = self.composer.read(cx).content(cx).to_owned();
@@ -630,8 +797,67 @@ impl Waku {
                     })
                     .into_any_element()
             }
+            AutocompleteRow::Session(mention) => {
+                let mut title_font = font.clone();
+                title_font.weight = FontWeight::MEDIUM;
+                base.child(icon(
+                    crate::ui::provider_icon(mention.provider),
+                    13.0,
+                    theme.text_tertiary,
+                ))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(sp(12.5))
+                        .child(matched_text(
+                            mention.title.clone(),
+                            highlight_byte_ranges(&mention.title, &mention.positions, 0),
+                            theme.text,
+                            theme.accent,
+                            title_font,
+                        )),
+                )
+                .when(!mention.project_name.is_empty(), |element| {
+                    element.child(
+                        div()
+                            .flex_none()
+                            .max_w(px(140.0))
+                            .truncate()
+                            .text_size(sp(12.0))
+                            .text_color(theme.text_ghost)
+                            .child(SharedString::from(mention.project_name.clone())),
+                    )
+                })
+                .child(
+                    div()
+                        .h(px(18.0))
+                        .px(px(5.0))
+                        .flex_none()
+                        .rounded(px(4.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .flex()
+                        .items_center()
+                        .text_size(sp(11.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.text_tertiary)
+                        .child(tr!("autocomplete.session_badge")),
+                )
+                .into_any_element()
+            }
         }
     }
+}
+
+fn strip_session_mention_prefix(query: &str) -> (bool, &str) {
+    for prefix in ["session:", "Session:", "SESSION:", "s:", "S:", "会话:", "会话："] {
+        if let Some(rest) = query.strip_prefix(prefix) {
+            return (true, rest);
+        }
+    }
+    (false, query)
 }
 
 /// Text with the fuzzy-matched byte ranges lifted to the accent colour and a

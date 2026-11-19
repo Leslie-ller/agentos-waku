@@ -337,6 +337,43 @@ impl Backend for WakuBackend {
                 crate::skills::trash_skills(&dirs).map_err(|error| anyhow!(error))?;
                 Ok(ResponsePayload::Ack)
             }
+            Command::LoadMemoryLibrary {
+                project_path,
+                query,
+            } => {
+                let library = crate::mcp_companion::load_memory_library(
+                    self.task_store.path(),
+                    project_path.as_deref(),
+                    query.as_deref(),
+                )?;
+                Ok(ResponsePayload::MemoryLibrary { library })
+            }
+            Command::UpdateMemoryKnowledgeStatus {
+                knowledge_id,
+                status,
+            } => {
+                crate::mcp_companion::update_memory_knowledge_status(
+                    self.task_store.path(),
+                    &knowledge_id,
+                    &status,
+                )?;
+                Ok(ResponsePayload::Ack)
+            }
+            Command::DeleteMemoryEntry {
+                kind,
+                id,
+                note_id,
+                scope,
+            } => {
+                crate::mcp_companion::delete_memory_entry(
+                    self.task_store.path(),
+                    kind,
+                    &id,
+                    note_id.as_deref(),
+                    scope.as_deref(),
+                )?;
+                Ok(ResponsePayload::Ack)
+            }
             Command::LoadTaskState => {
                 let state = self.task_state.lock();
                 Ok(ResponsePayload::TaskState {
@@ -1992,6 +2029,9 @@ fn handle_driver_command(
         | Command::LoadSkills { .. }
         | Command::SetSkillsEnabled { .. }
         | Command::TrashSkills { .. }
+        | Command::LoadMemoryLibrary { .. }
+        | Command::UpdateMemoryKnowledgeStatus { .. }
+        | Command::DeleteMemoryEntry { .. }
         | Command::LoadTaskState
         | Command::SaveTaskState { .. }
         | Command::RemoveSession

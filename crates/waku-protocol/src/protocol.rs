@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::attachments::{AttachmentUpload, StoredAttachment};
 use crate::computer_use::ComputerPermissions;
+use crate::memory::{MemoryEntryKind, MemoryLibrarySnapshot};
 use crate::model::{
     AgentSession, GoalOperation, Project, ProviderKind, ProviderProbe, ProviderResumeCursor,
     ProviderSessionHistory, ProviderSessionSummary, UserInputAnswer,
@@ -169,6 +170,25 @@ pub enum Command {
     },
     TrashSkills {
         dirs: Vec<PathBuf>,
+    },
+    LoadMemoryLibrary {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+    },
+    UpdateMemoryKnowledgeStatus {
+        knowledge_id: String,
+        status: String,
+    },
+    DeleteMemoryEntry {
+        kind: MemoryEntryKind,
+        /// Primary identifier: `knowledge_id`, `checkpoint_id`, or `session_id` (for notes).
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
     },
     LoadTaskState,
     SaveTaskState {
@@ -407,6 +427,9 @@ pub enum ResponsePayload {
     },
     SkillsCatalog {
         catalog: SkillsCatalog,
+    },
+    MemoryLibrary {
+        library: MemoryLibrarySnapshot,
     },
     TaskState {
         projects: Vec<Project>,

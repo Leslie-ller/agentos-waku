@@ -48,7 +48,11 @@ pub fn fallback_models(provider: ProviderKind) -> Vec<ProviderModel> {
         .map(|model| model.reasoning(reasoning_options(["low", "medium", "high"]), "high"))
         .collect(),
         ProviderKind::Codex => [
-            ProviderModel::new("gpt-5.6-sol", "GPT-5.6-Sol").default(),
+            ProviderModel::new("gpt-6.2-sol", "GPT-6.2-Sol").default(),
+            ProviderModel::new("gpt-6.2-astra", "GPT-6.2-Astra"),
+            ProviderModel::new("gpt-6.1-terra", "GPT-6.1 Terra"),
+            ProviderModel::new("gpt-6.1-sol", "GPT-6.1-Sol"),
+            ProviderModel::new("gpt-5.6-sol", "GPT-5.6-Sol"),
             ProviderModel::new("gpt-5.6-terra", "GPT-5.6-Terra"),
             ProviderModel::new("gpt-5.6-luna", "GPT-5.6-Luna"),
             ProviderModel::new("gpt-5.5", "GPT-5.5"),
@@ -1306,7 +1310,8 @@ fn pi_reasoning_options(dialect: PiDialect, model: &Value) -> Vec<ProviderModelO
 }
 
 fn discover_codex_models(binary: &Path) -> Vec<ProviderModel> {
-    let mut command = crate::command_env::command(binary);
+    let mut command = crate::command_env::command_for_provider(ProviderKind::Codex, binary)
+        .unwrap_or_else(|_| crate::command_env::command(binary));
     let command = command
         .args(["app-server", "--stdio"])
         .stdin(Stdio::piped())

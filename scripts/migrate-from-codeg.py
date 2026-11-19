@@ -530,11 +530,24 @@ def file_stamp(path: Path) -> tuple[int, int] | None:
     return (st.st_size, st.st_mtime_ns)
 
 
+def is_temp_fixture_path(path_str: str) -> bool:
+    p = path_str.strip()
+    if not p or p in (".", "/"):
+        return True
+    if p.startswith("/tmp/") or p.startswith("/private/tmp/"):
+        return True
+    if "/AgentOS/tmp/" in p:
+        return True
+    return False
+
+
 def run_migration(
     source_db: Path,
     target_dir: Path,
     report_path: Path | None,
     require_static_source: bool = False,
+    active_only: bool = False,
+    projectless_root: Path | None = None,
 ) -> dict:
     t0 = time.time()
     repo_root = Path(__file__).resolve().parent.parent
@@ -559,32 +572,55 @@ def run_migration(
     apply_waku_schema(dst, repo_root, now_ts)
 
     # 1. Migrate folders -> projects
-    folder_rows = src.execute(
-        """SELECT id, name, path, created_at, deleted_at, sort_order
-           FROM folder
-           ORDER BY (deleted_at IS NOT NULL) ASC, id ASC"""
-    ).fetchall()
+    if active_only:
+        folder_rows = src.execute(
+            """SELECT id, name, path, created_at, deleted_at, sort_order, kind, alias
+               FROM folder
+               WHERE deleted_at IS NULL AND is_open = 1
+               ORDER BY sort_order ASC, id ASC"""
+        ).fetchall()
+    else:
+        folder_rows = src.execute(
+            """SELECT id, name, path, created_at, deleted_at, sort_order, kind, alias
+               FROM folder
+               ORDER BY (deleted_at IS NOT NULL) ASC, id ASC"""
+        ).fetchall()
 
     path_to_proj_id: dict[str, str] = {}
     proj_id_to_path: dict[str, str] = {}
     folder_id_to_proj_id: dict[int, str] = {}
     next_position = 0
+    resolved_projectless_root = projectless_root or (Path.home() / ".waku" / "projects")
+    projectless_chat_path = str(resolved_projectless_root / "codeg-chat")
+    projectless_chat_proj_id = uid(f"project-path:{projectless_chat_path}")
+    skipped_temp_folders = 0
+    merged_chat_folders = 0
 
     with dst:
         default_path = str(repo_root)
         default_proj_id = uid(f"project-path:{default_path}")
-        path_to_proj_id[default_path] = default_proj_id
-        proj_id_to_path[default_proj_id] = default_path
-        dst.execute(
-            """INSERT INTO projects(id, name, path, position, created_at)
-               VALUES(?, ?, ?, ?, ?)
-               ON CONFLICT(id) DO UPDATE SET name = excluded.name, path = excluded.path""",
-            (default_proj_id, "AgentOS (Unassigned)", default_path, next_position, now_ts - 86400),
-        )
-        next_position += 1
+        if not active_only:
+            path_to_proj_id[default_path] = default_proj_id
+            proj_id_to_path[default_proj_id] = default_path
+            dst.execute(
+                """INSERT INTO projects(id, name, path, position, created_at)
+                   VALUES(?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET name = excluded.name, path = excluded.path""",
+                (default_proj_id, "AgentOS (Unassigned)", default_path, next_position, now_ts - 86400),
+            )
+            next_position += 1
 
-        for fid, fname, fpath, fcreated, _fdeleted, _sort_order in folder_rows:
+        chat_folder_ids: list[int] = []
+        for fid, fname, fpath, fcreated, _fdeleted, _sort_order, fkind, falias in folder_rows:
             clean_path = (fpath or f"/Volumes/data/Codex/AgentOS/legacy-folder-{fid}").strip()
+            if active_only:
+                if (fkind or "").strip().lower() == "chat" or "/chat-sessions/" in clean_path:
+                    chat_folder_ids.append(fid)
+                    merged_chat_folders += 1
+                    continue
+                if is_temp_fixture_path(clean_path):
+                    skipped_temp_folders += 1
+                    continue
             if clean_path in path_to_proj_id:
                 pid = path_to_proj_id[clean_path]
                 folder_id_to_proj_id[fid] = pid
@@ -593,25 +629,58 @@ def run_migration(
             path_to_proj_id[clean_path] = pid
             proj_id_to_path[pid] = clean_path
             folder_id_to_proj_id[fid] = pid
-            proj_name = (fname or Path(clean_path).name or f"Folder {fid}").strip()
+            proj_name = (falias or fname or Path(clean_path).name or f"Folder {fid}").strip()
             created_ts = parse_ts(fcreated, now_ts - 86400)
             dst.execute(
                 """INSERT INTO projects(id, name, path, position, created_at)
                    VALUES(?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        name = excluded.name,
-                       path = excluded.path""",
+                       path = excluded.path,
+                       position = excluded.position""",
                 (pid, proj_name, clean_path, next_position, created_ts),
             )
             next_position += 1
 
+        if chat_folder_ids:
+            path_to_proj_id[projectless_chat_path] = projectless_chat_proj_id
+            proj_id_to_path[projectless_chat_proj_id] = projectless_chat_path
+            for fid in chat_folder_ids:
+                folder_id_to_proj_id[fid] = projectless_chat_proj_id
+            dst.execute(
+                """INSERT INTO projects(id, name, path, position, created_at)
+                   VALUES(?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       name = excluded.name,
+                       path = excluded.path,
+                       position = excluded.position""",
+                (
+                    projectless_chat_proj_id,
+                    "codeg-chat",
+                    projectless_chat_path,
+                    next_position,
+                    now_ts - 86400,
+                ),
+            )
+            next_position += 1
+
     # 2. Load conversations & handoffs metadata
-    conv_rows = src.execute(
-        """SELECT id, folder_id, title, agent_type, status, model, external_id,
-                  message_count, created_at, updated_at, deleted_at, origin_cwd
-           FROM conversation
-           ORDER BY id ASC"""
-    ).fetchall()
+    if active_only:
+        all_active_convs = src.execute(
+            """SELECT id, folder_id, title, agent_type, status, model, external_id,
+                      message_count, created_at, updated_at, deleted_at, origin_cwd
+               FROM conversation
+               WHERE deleted_at IS NULL
+               ORDER BY id ASC"""
+        ).fetchall()
+        conv_rows = [row for row in all_active_convs if row[1] in folder_id_to_proj_id]
+    else:
+        conv_rows = src.execute(
+            """SELECT id, folder_id, title, agent_type, status, model, external_id,
+                      message_count, created_at, updated_at, deleted_at, origin_cwd
+               FROM conversation
+               ORDER BY id ASC"""
+        ).fetchall()
     conv_by_id = {row[0]: row for row in conv_rows}
 
     handoff_by_conv: dict[int, tuple] = {}
@@ -948,6 +1017,13 @@ def run_migration(
                 AND n.revision = h.revision"""
         ).fetchall()
         for task_ref, note_id, scope, revision, u_at, body, src_refs in note_rows:
+            if active_only and isinstance(task_ref, str) and task_ref.startswith("conv:"):
+                try:
+                    cid = int(task_ref.split(":", 1)[1])
+                    if cid not in conv_id_to_sess_id:
+                        continue
+                except Exception:
+                    continue
             sid, ppath = resolve_task_ref(task_ref)
             dst.execute(
                 """INSERT INTO agentos_memory_notes(
@@ -976,6 +1052,13 @@ def run_migration(
             "SELECT checkpoint_id, task_ref, payload, created_at FROM memory_checkpoint"
         ).fetchall()
         for cp_id, task_ref, payload, c_at in cp_rows:
+            if active_only and isinstance(task_ref, str) and task_ref.startswith("conv:"):
+                try:
+                    cid = int(task_ref.split(":", 1)[1])
+                    if cid not in conv_id_to_sess_id:
+                        continue
+                except Exception:
+                    continue
             sid, ppath = resolve_task_ref(task_ref)
             dst.execute(
                 """INSERT INTO agentos_memory_checkpoints(
@@ -996,6 +1079,9 @@ def run_migration(
                FROM memory_knowledge"""
         ).fetchall()
         for kn_id, scope, fid, task_ref, claim, app_json, src_refs, status, c_at in kn_rows:
+            if active_only and (scope or "project") != "user":
+                if isinstance(fid, int) and fid not in folder_id_to_proj_id:
+                    continue
             sid, ppath = resolve_task_ref(task_ref)
             if isinstance(fid, int) and fid in folder_id_to_proj_id:
                 ppath = proj_id_to_path.get(folder_id_to_proj_id[fid], ppath)
@@ -1144,6 +1230,17 @@ def main() -> int:
         action="store_true",
         help="Fail if source DB (or -wal) mtime/size changes during migration (use on offline snapshots)",
     )
+    parser.add_argument(
+        "--active-only",
+        action="store_true",
+        help="Migrate only non-deleted open projects (is_open=1, excluding /tmp fixtures), their non-deleted conversations, and merge chat folders into Waku's projectless group",
+    )
+    parser.add_argument(
+        "--projectless-root",
+        type=Path,
+        default=None,
+        help="Override Waku projectless workspace root (defaults to ~/.waku/projects)",
+    )
     args = parser.parse_args()
 
     report = run_migration(
@@ -1151,6 +1248,8 @@ def main() -> int:
         args.target_dir,
         args.report,
         require_static_source=args.require_static_source,
+        active_only=args.active_only,
+        projectless_root=args.projectless_root,
     )
     print(
         json.dumps(

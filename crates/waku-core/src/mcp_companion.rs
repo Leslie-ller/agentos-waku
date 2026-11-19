@@ -17,6 +17,10 @@ use anyhow::{Context as _, anyhow};
 use rusqlite::{Connection, OptionalExtension as _, params};
 use serde_json::{Value, json};
 use uuid::Uuid;
+use waku_protocol::memory::{
+    MemoryCheckpointRecord, MemoryEntryKind, MemoryKnowledgeRecord, MemoryLibrarySnapshot,
+    MemoryNoteRecord,
+};
 use waku_protocol::model::{
     GoalOperation, ProviderKind, ThreadGoal, ThreadGoalStatus, UserInputAnswer, UserInputOption,
     UserInputQuestion,
@@ -27,6 +31,7 @@ pub const MCP_SERVER_NAME: &str = "agentos-mcp";
 pub const MCP_BIN_ENV: &str = "AGENTOS_WAKU_MCP_BIN";
 pub const DISABLE_MCP_ENV: &str = "AGENTOS_WAKU_DISABLE_MCP";
 pub const AGENTOS_QUESTION_PREFIX: &str = "agentos-q:";
+pub const MEMORY_MCP_INSTRUCTIONS: &str = "Persistent cross-session memory is available via memory_search (default scope=\"project\") and memory_read. Whenever the user references past state or behavior (e.g. 'before', 'last time', 'previously', 'still connected', 'again', '以前', '上次', '之前', '还在吗', '又...了', '连过', '配过'), or when troubleshooting devices, local network/SSH/proxy topology, credentials, deployment setup, or unexpected environment discrepancies, call memory_search(scope=\"project\") with 1-3 focused keywords BEFORE guessing or running broad diagnostics. Whenever the user's message mentions a past session link such as [Session title](agentos://session/<id>) or [Session title](codeg://session/<id>), call get_session_info(session_id=\"<id>\") to inspect its title, workspace, and recent transcript.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpCompanionLaunch {
@@ -315,14 +320,20 @@ pub fn dispatch_mcp_request(conn: &Connection, ctx: &McpContext, req: &Value) ->
 
     let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
     let outcome = match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {} },
-            "serverInfo": {
-                "name": MCP_SERVER_NAME,
-                "version": env!("CARGO_PKG_VERSION"),
+        "initialize" => {
+            let mut init = json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": {} },
+                "serverInfo": {
+                    "name": MCP_SERVER_NAME,
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
+            });
+            if ctx.mcp_settings().memory_enabled {
+                init["instructions"] = json!(MEMORY_MCP_INSTRUCTIONS);
             }
-        })),
+            Ok(init)
+        }
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": mcp_tool_definitions_for(&ctx.mcp_settings()) })),
         "tools/call" => {
@@ -460,16 +471,15 @@ fn call_mcp_tool(
         }
 
         "memory_search" => {
-            let query = args
+            let raw_query = args
                 .get("query")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
-                .trim()
-                .to_lowercase();
+                .trim();
             let scope = args
                 .get("scope")
                 .and_then(Value::as_str)
-                .unwrap_or("task_shared");
+                .unwrap_or("project");
             let limit = args
                 .get("limit")
                 .and_then(Value::as_u64)
@@ -486,23 +496,26 @@ fn call_mcp_tool(
                 })
                 .unwrap_or_default();
             let allow_kind = |k: &str| kinds.is_empty() || kinds.iter().any(|item| item == k);
+            let terms = extract_search_terms(raw_query);
+            let has_query = !terms.is_empty();
 
-            let mut hits = Vec::new();
-            let like_pattern = format!("%{query}%");
+            // Collect (relevance_score, sort_ts, hit_json) across all kinds and rank globally.
+            let mut scored_hits: Vec<(f64, i64, Value)> = Vec::new();
+            let scan_limit = ((limit * 5).max(100)).min(500) as i64;
 
             if allow_kind("note") {
                 let mut stmt = if scope == "task_shared" {
                     conn.prepare(
                         "SELECT session_id, scope, note_id, revision, body, updated_at
                          FROM agentos_memory_notes
-                         WHERE session_id = ?1 AND (?2 = '' OR lower(note_id) LIKE ?3 OR lower(body) LIKE ?3)
-                         ORDER BY updated_at DESC LIMIT ?4",
+                         WHERE session_id = ?1
+                         ORDER BY updated_at DESC LIMIT ?2",
                     )?
                 } else {
                     conn.prepare(
                         "SELECT session_id, scope, note_id, revision, body, updated_at
                          FROM agentos_memory_notes
-                         WHERE (?1 = 'user' OR project_path = ?5) AND (?2 = '' OR lower(note_id) LIKE ?3 OR lower(body) LIKE ?3)
+                         WHERE (?1 = 'user' OR project_path = ?2 OR session_id = ?3)
                          ORDER BY updated_at DESC LIMIT ?4",
                     )?
                 };
@@ -517,147 +530,155 @@ fn call_mcp_tool(
                     ))
                 };
                 let collected: Vec<_> = if scope == "task_shared" {
-                    stmt.query_map(
-                        params![ctx.session_id, query, like_pattern, limit as i64],
-                        map_note_row,
-                    )?
-                    .flatten()
-                    .collect()
+                    stmt.query_map(params![ctx.session_id, scan_limit], map_note_row)?
+                        .flatten()
+                        .collect()
                 } else {
                     stmt.query_map(
-                        params![scope, query, like_pattern, limit as i64, project_path],
+                        params![scope, project_path, ctx.session_id, scan_limit],
                         map_note_row,
                     )?
                     .flatten()
                     .collect()
                 };
-                for row in collected {
-                    let snippet: String = row.4.chars().take(240).collect();
-                    hits.push(json!({
-                        "id": format!("note:{}:{}:{}", row.0, row.1, row.2),
-                        "kind": "note",
-                        "note_id": row.2,
-                        "revision": row.3,
-                        "snippet": snippet,
-                        "updated_at": row.5,
-                    }));
+                for (sid, nscope, nid, rev, body, ts) in collected {
+                    let combined = format!("{nid}\n{body}");
+                    let score = if has_query {
+                        score_text_terms(&combined, &terms)
+                    } else {
+                        1.0
+                    };
+                    if has_query && score <= 0.0 {
+                        continue;
+                    }
+                    let snippet = extract_match_snippet(&body, &terms, 240);
+                    scored_hits.push((
+                        score * 1.15,
+                        ts,
+                        json!({
+                            "id": format!("note:{sid}:{nscope}:{nid}"),
+                            "kind": "note",
+                            "note_id": nid,
+                            "revision": rev,
+                            "snippet": snippet,
+                            "updated_at": ts,
+                        }),
+                    ));
                 }
             }
 
-            if allow_kind("checkpoint") && hits.len() < limit {
+            if allow_kind("checkpoint") {
                 let mut stmt = conn.prepare(
                     "SELECT checkpoint_id, payload_json, created_at
                      FROM agentos_memory_checkpoints
-                     WHERE (?1 = 'project' AND project_path = ?2) OR session_id = ?3
+                     WHERE ?1 = 'user'
+                        OR (?1 = 'project' AND (project_path = ?2 OR session_id = ?3))
+                        OR (?1 = 'task_shared' AND session_id = ?3)
                      ORDER BY created_at DESC LIMIT ?4",
                 )?;
                 let rows = stmt.query_map(
-                    params![scope, project_path, ctx.session_id, (limit - hits.len()) as i64],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)),
-                )?;
-                for (cid, payload, ts) in rows.flatten() {
-                    if query.is_empty() || payload.to_lowercase().contains(&query) {
-                        let snippet: String = payload.chars().take(240).collect();
-                        hits.push(json!({
-                            "id": format!("ckpt:{cid}"),
-                            "kind": "checkpoint",
-                            "snippet": snippet,
-                            "created_at": ts,
-                        }));
-                    }
-                }
-            }
-
-            if allow_kind("knowledge") && hits.len() < limit {
-                let mut stmt = conn.prepare(
-                    "SELECT knowledge_id, claim, scope, status, created_at
-                     FROM agentos_memory_knowledge
-                     WHERE (?1 = 'user' OR project_path = ?2 OR scope = 'user')
-                       AND (?3 = '' OR lower(claim) LIKE ?4)
-                     ORDER BY created_at DESC LIMIT ?5",
-                )?;
-                let rows = stmt.query_map(
-                    params![
-                        scope,
-                        project_path,
-                        query,
-                        like_pattern,
-                        (limit - hits.len()) as i64
-                    ],
+                    params![scope, project_path, ctx.session_id, scan_limit],
                     |r| {
                         Ok((
                             r.get::<_, String>(0)?,
                             r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                            r.get::<_, String>(3)?,
-                            r.get::<_, i64>(4)?,
+                            r.get::<_, i64>(2)?,
                         ))
                     },
                 )?;
-                for (kid, claim, kscope, status, ts) in rows.flatten() {
-                    hits.push(json!({
-                        "id": format!("know:{kid}"),
-                        "kind": "knowledge",
-                        "scope": kscope,
-                        "status": status,
-                        "snippet": claim,
-                        "created_at": ts,
-                    }));
+                for (cid, payload, ts) in rows.flatten() {
+                    let score = if has_query {
+                        score_text_terms(&payload, &terms)
+                    } else {
+                        1.0
+                    };
+                    if has_query && score <= 0.0 {
+                        continue;
+                    }
+                    let snippet = extract_match_snippet(&payload, &terms, 240);
+                    scored_hits.push((
+                        score * 1.10,
+                        ts,
+                        json!({
+                            "id": format!("ckpt:{cid}"),
+                            "kind": "checkpoint",
+                            "snippet": snippet,
+                            "created_at": ts,
+                        }),
+                    ));
                 }
             }
 
-            if allow_kind("history") && hits.len() < limit {
-                // Search Waku's own `messages` table if initialized in this DB.
-                let has_messages: bool = conn
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages')",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(false);
-                if has_messages {
-                    let sql = if scope == "task_shared" {
-                        "SELECT id, session_id, role, content, created_at FROM messages
-                         WHERE session_id = ?1 AND (?2 = '' OR lower(content) LIKE ?3)
-                         ORDER BY position DESC LIMIT ?4"
-                    } else {
-                        "SELECT id, session_id, role, content, created_at FROM messages
-                         WHERE (?1 != '' OR 1=1) AND (?2 = '' OR lower(content) LIKE ?3)
-                         ORDER BY created_at DESC LIMIT ?4"
-                    };
-                    if let Ok(mut stmt) = conn.prepare(sql)
-                        && let Ok(rows) = stmt.query_map(
-                            params![
-                                ctx.session_id,
-                                query,
-                                like_pattern,
-                                (limit - hits.len()) as i64
-                            ],
-                            |r| {
-                                Ok((
-                                    r.get::<_, String>(0)?,
-                                    r.get::<_, String>(1)?,
-                                    r.get::<_, String>(2)?,
-                                    r.get::<_, String>(3)?,
-                                    r.get::<_, i64>(4)?,
-                                ))
-                            },
-                        )
-                    {
-                        for (mid, sid, role, content, ts) in rows.flatten() {
-                            let snippet: String = content.chars().take(240).collect();
-                            hits.push(json!({
-                                "id": format!("msg:{mid}"),
-                                "kind": "history",
-                                "session_id": sid,
-                                "role": role,
-                                "snippet": snippet,
-                                "created_at": ts,
-                            }));
-                        }
+            if allow_kind("knowledge") {
+                let mut stmt = conn.prepare(
+                    "SELECT knowledge_id, claim, applicability_json, scope, status, created_at
+                     FROM agentos_memory_knowledge
+                     WHERE status != 'rejected' AND (?1 = 'user' OR project_path = ?2 OR scope = 'user')
+                     ORDER BY CASE status WHEN 'promoted' THEN 0 ELSE 1 END, created_at DESC LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![scope, project_path, scan_limit], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, i64>(5)?,
+                    ))
+                })?;
+                for (kid, claim, app_json, kscope, status, ts) in rows.flatten() {
+                    if status == "retracted" {
+                        continue;
                     }
+                    let combined = format!("{claim}\n{app_json}");
+                    let score = if has_query {
+                        score_text_terms(&combined, &terms)
+                    } else {
+                        1.0
+                    };
+                    if has_query && score <= 0.0 {
+                        continue;
+                    }
+                    let snippet = extract_match_snippet(&claim, &terms, 240);
+                    scored_hits.push((
+                        score * 1.25,
+                        ts,
+                        json!({
+                            "id": format!("know:{kid}"),
+                            "kind": "knowledge",
+                            "scope": kscope,
+                            "status": status,
+                            "snippet": snippet,
+                            "created_at": ts,
+                        }),
+                    ));
                 }
             }
+
+            if allow_kind("history") {
+                let history_hits = search_waku_message_history(
+                    conn,
+                    ctx,
+                    &project_path,
+                    scope,
+                    raw_query,
+                    &terms,
+                    limit,
+                );
+                scored_hits.extend(history_hits);
+            }
+
+            if has_query {
+                scored_hits.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| b.1.cmp(&a.1))
+                });
+            } else {
+                scored_hits.sort_by(|a, b| b.1.cmp(&a.1));
+            }
+            scored_hits.truncate(limit);
+            let hits: Vec<Value> = scored_hits.into_iter().map(|(_, _, v)| v).collect();
 
             Ok(json!({ "hits": hits }))
         }
@@ -1060,14 +1081,18 @@ fn call_mcp_tool(
                 .and_then(Value::as_u64)
                 .unwrap_or(20)
                 .min(200) as usize;
+            let raw_text = args.get("session_id").and_then(Value::as_str).map(|s| {
+                let trimmed = s.trim();
+                trimmed
+                    .strip_prefix("agentos://session/")
+                    .or_else(|| trimmed.strip_prefix("codeg://session/"))
+                    .unwrap_or(trimmed)
+                    .trim()
+            });
             let legacy_num = args
                 .get("session_id")
                 .and_then(Value::as_i64)
-                .or_else(|| {
-                    args.get("session_id")
-                        .and_then(Value::as_str)
-                        .and_then(|s| s.trim().parse::<i64>().ok())
-                });
+                .or_else(|| raw_text.and_then(|s| s.parse::<i64>().ok()));
             let resolved_sid = if let Some(num) = legacy_num {
                 conn.query_row(
                     "SELECT session_id FROM agentos_legacy_session_map WHERE legacy_id = ?1",
@@ -1076,8 +1101,8 @@ fn call_mcp_tool(
                 )
                 .optional()?
                 .unwrap_or_else(|| format!("codeg-conv-{num}"))
-            } else if let Some(text) = args.get("session_id").and_then(Value::as_str) {
-                text.trim().to_owned()
+            } else if let Some(text) = raw_text.filter(|s| !s.is_empty()) {
+                text.to_owned()
             } else {
                 anyhow::bail!("session_id is required");
             };
@@ -1092,9 +1117,21 @@ fn call_mcp_tool(
             if !has_sessions {
                 return Ok(json!({ "found": false, "session_id": resolved_sid }));
             }
-            let row = conn
+            let has_projects: bool = conn
                 .query_row(
-                    "SELECT title, provider, model, status FROM sessions WHERE id = ?1",
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='projects')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            let row = if has_projects {
+                conn.query_row(
+                    "SELECT COALESCE(NULLIF(NULLIF(s.title, 'New task'), ''), NULLIF(s.auto_title, ''), s.title),
+                            s.provider, s.model, s.status, s.created_at, s.updated_at,
+                            p.name, p.path
+                     FROM sessions s
+                     LEFT JOIN projects p ON p.id = s.project_id
+                     WHERE s.id = ?1",
                     params![resolved_sid],
                     |r| {
                         Ok((
@@ -1102,14 +1139,54 @@ fn call_mcp_tool(
                             r.get::<_, String>(1)?,
                             r.get::<_, Option<String>>(2)?,
                             r.get::<_, String>(3)?,
+                            r.get::<_, Option<i64>>(4)?,
+                            r.get::<_, Option<i64>>(5)?,
+                            r.get::<_, Option<String>>(6)?,
+                            r.get::<_, Option<String>>(7)?,
                         ))
                     },
                 )
-                .optional()?;
-            let Some((title, provider, model, status)) = row else {
+                .optional()?
+            } else {
+                conn.query_row(
+                    "SELECT title, provider, model, status, NULL, NULL, NULL, NULL FROM sessions WHERE id = ?1",
+                    params![resolved_sid],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, Option<i64>>(4)?,
+                            r.get::<_, Option<i64>>(5)?,
+                            r.get::<_, Option<String>>(6)?,
+                            r.get::<_, Option<String>>(7)?,
+                        ))
+                    },
+                )
+                .optional()?
+            };
+            let Some((
+                title,
+                provider,
+                model,
+                status,
+                created_at,
+                updated_at,
+                project_name,
+                workspace_folder,
+            )) = row
+            else {
                 return Ok(json!({ "found": false, "session_id": resolved_sid }));
             };
 
+            let total_messages: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM messages WHERE session_id = ?1",
+                    params![resolved_sid],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
             let mut recent = Vec::new();
             if max_messages > 0
                 && let Ok(mut stmt) = conn.prepare(
@@ -1122,7 +1199,7 @@ fn call_mcp_tool(
                 let mut collected: Vec<_> = rows.flatten().collect();
                 collected.reverse();
                 for (role, content) in collected {
-                    let compact: String = content.chars().take(600).collect();
+                    let compact: String = content.chars().take(1200).collect();
                     recent.push(json!({ "role": role, "content": compact }));
                 }
             }
@@ -1133,6 +1210,11 @@ fn call_mcp_tool(
                 "provider": provider,
                 "model": model,
                 "status": status,
+                "project_name": project_name,
+                "workspace_folder": workspace_folder,
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "message_count": total_messages,
                 "messages": recent,
             }))
         }
@@ -2249,20 +2331,889 @@ pub fn apply_host_goal_operation(
     }
 }
 
+/// Host helper for the Memory Library UI: load knowledge items, working notes,
+/// and recovery checkpoints from the daemon's SQLite database.
+pub fn load_memory_library(
+    db_path: &Path,
+    project_path: Option<&str>,
+    query: Option<&str>,
+) -> anyhow::Result<MemoryLibrarySnapshot> {
+    let conn = open_mcp_connection(db_path)?;
+    ensure_mcp_tables(&conn)?;
+    let has_sessions: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    let filter_project = project_path
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let needle = query
+        .map(|q| q.trim().to_lowercase())
+        .filter(|q| !q.is_empty());
+
+    let matches_query = |fields: &[&str]| -> bool {
+        let Some(ref needle) = needle else {
+            return true;
+        };
+        fields
+            .iter()
+            .any(|field| field.to_lowercase().contains(needle.as_str()))
+    };
+
+    let mut knowledge = Vec::new();
+    {
+        let sql = if has_sessions {
+            "SELECT k.knowledge_id, k.scope, k.project_path, k.session_id,
+                    COALESCE(NULLIF(NULLIF(s.title, 'New task'), ''), NULLIF(s.auto_title, ''), s.title),
+                    k.claim, k.applicability_json, k.evidence_json, k.status, k.created_at
+             FROM agentos_memory_knowledge k
+             LEFT JOIN sessions s ON s.id = k.session_id
+             ORDER BY CASE k.status WHEN 'promoted' THEN 0 WHEN 'candidate' THEN 1 ELSE 2 END,
+                      k.created_at DESC
+             LIMIT 500"
+        } else {
+            "SELECT knowledge_id, scope, project_path, session_id, NULL,
+                    claim, applicability_json, evidence_json, status, created_at
+             FROM agentos_memory_knowledge
+             ORDER BY CASE status WHEN 'promoted' THEN 0 WHEN 'candidate' THEN 1 ELSE 2 END,
+                      created_at DESC
+             LIMIT 500"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok(MemoryKnowledgeRecord {
+                knowledge_id: r.get(0)?,
+                scope: r.get(1)?,
+                project_path: r.get(2)?,
+                session_id: r.get(3)?,
+                session_title: r.get(4)?,
+                claim: r.get(5)?,
+                applicability_json: r.get(6)?,
+                evidence_json: r.get(7)?,
+                status: r.get(8)?,
+                created_at: r.get(9)?,
+            })
+        })?;
+        for item in rows.flatten() {
+            if let Some(proj) = filter_project
+                && item.scope != "user"
+                && item.project_path != proj
+            {
+                continue;
+            }
+            if !matches_query(&[
+                &item.claim,
+                &item.knowledge_id,
+                &item.project_path,
+                &item.status,
+                item.session_title.as_deref().unwrap_or(""),
+            ]) {
+                continue;
+            }
+            knowledge.push(item);
+        }
+    }
+
+    let mut notes = Vec::new();
+    {
+        let sql = if has_sessions {
+            "SELECT n.session_id,
+                    COALESCE(NULLIF(NULLIF(s.title, 'New task'), ''), NULLIF(s.auto_title, ''), s.title),
+                    n.project_path, n.note_id, n.scope, n.revision, n.body,
+                    n.source_refs_json, n.updated_at
+             FROM agentos_memory_notes n
+             LEFT JOIN sessions s ON s.id = n.session_id
+             ORDER BY n.updated_at DESC
+             LIMIT 500"
+        } else {
+            "SELECT session_id, NULL, project_path, note_id, scope, revision, body,
+                    source_refs_json, updated_at
+             FROM agentos_memory_notes
+             ORDER BY updated_at DESC
+             LIMIT 500"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok(MemoryNoteRecord {
+                session_id: r.get(0)?,
+                session_title: r.get(1)?,
+                project_path: r.get(2)?,
+                note_id: r.get(3)?,
+                scope: r.get(4)?,
+                revision: r.get(5)?,
+                body: r.get(6)?,
+                source_refs_json: r.get(7)?,
+                updated_at: r.get(8)?,
+            })
+        })?;
+        for item in rows.flatten() {
+            if let Some(proj) = filter_project
+                && item.project_path != proj
+            {
+                continue;
+            }
+            if !matches_query(&[
+                &item.note_id,
+                &item.body,
+                &item.project_path,
+                item.session_title.as_deref().unwrap_or(""),
+            ]) {
+                continue;
+            }
+            notes.push(item);
+        }
+    }
+
+    let mut checkpoints = Vec::new();
+    {
+        let sql = if has_sessions {
+            "SELECT c.checkpoint_id, c.session_id,
+                    COALESCE(NULLIF(NULLIF(s.title, 'New task'), ''), NULLIF(s.auto_title, ''), s.title),
+                    c.project_path, c.payload_json, c.created_at
+             FROM agentos_memory_checkpoints c
+             LEFT JOIN sessions s ON s.id = c.session_id
+             ORDER BY c.created_at DESC
+             LIMIT 500"
+        } else {
+            "SELECT checkpoint_id, session_id, NULL, project_path, payload_json, created_at
+             FROM agentos_memory_checkpoints
+             ORDER BY created_at DESC
+             LIMIT 500"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok(MemoryCheckpointRecord {
+                checkpoint_id: r.get(0)?,
+                session_id: r.get(1)?,
+                session_title: r.get(2)?,
+                project_path: r.get(3)?,
+                payload_json: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })?;
+        for item in rows.flatten() {
+            if let Some(proj) = filter_project
+                && item.project_path != proj
+            {
+                continue;
+            }
+            if !matches_query(&[
+                &item.checkpoint_id,
+                &item.payload_json,
+                &item.project_path,
+                item.session_title.as_deref().unwrap_or(""),
+            ]) {
+                continue;
+            }
+            checkpoints.push(item);
+        }
+    }
+
+    Ok(MemoryLibrarySnapshot {
+        knowledge,
+        notes,
+        checkpoints,
+    })
+}
+
+/// Host helper for the Memory Library UI: promote, revert to candidate, or
+/// reject a knowledge entry.
+pub fn update_memory_knowledge_status(
+    db_path: &Path,
+    knowledge_id: &str,
+    status: &str,
+) -> anyhow::Result<()> {
+    let normalized = match status.trim() {
+        "promoted" | "candidate" | "rejected" => status.trim(),
+        other => anyhow::bail!("unsupported knowledge status `{other}`"),
+    };
+    let conn = open_mcp_connection(db_path)?;
+    ensure_mcp_tables(&conn)?;
+    conn.execute(
+        "UPDATE agentos_memory_knowledge SET status = ?1 WHERE knowledge_id = ?2",
+        params![normalized, knowledge_id.trim()],
+    )?;
+    Ok(())
+}
+
+/// Host helper for the Memory Library UI: delete one knowledge item, note, or
+/// recovery checkpoint.
+pub fn delete_memory_entry(
+    db_path: &Path,
+    kind: MemoryEntryKind,
+    id: &str,
+    note_id: Option<&str>,
+    scope: Option<&str>,
+) -> anyhow::Result<()> {
+    let conn = open_mcp_connection(db_path)?;
+    ensure_mcp_tables(&conn)?;
+    match kind {
+        MemoryEntryKind::Knowledge => {
+            conn.execute(
+                "DELETE FROM agentos_memory_knowledge WHERE knowledge_id = ?1",
+                params![id.trim()],
+            )?;
+        }
+        MemoryEntryKind::Checkpoint => {
+            conn.execute(
+                "DELETE FROM agentos_memory_checkpoints WHERE checkpoint_id = ?1",
+                params![id.trim()],
+            )?;
+        }
+        MemoryEntryKind::Note => {
+            let note_slug = note_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow!("note_id is required to delete a note"))?;
+            if let Some(scope) = scope.map(str::trim).filter(|s| !s.is_empty()) {
+                conn.execute(
+                    "DELETE FROM agentos_memory_notes WHERE session_id = ?1 AND note_id = ?2 AND scope = ?3",
+                    params![id.trim(), note_slug, scope],
+                )?;
+            } else {
+                conn.execute(
+                    "DELETE FROM agentos_memory_notes WHERE session_id = ?1 AND note_id = ?2",
+                    params![id.trim(), note_slug],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Expand non-ASCII alphanumeric (CJK) runs into overlapping bigrams + single
+/// chars so SQLite FTS5 `unicode61` supports Chinese substring recall.
+fn fts_normalize_cjk(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 2);
+    let mut run: Vec<char> = Vec::new();
+    let flush = |run: &mut Vec<char>, out: &mut String| {
+        if run.len() >= 2 {
+            for w in run.windows(2) {
+                out.push(w[0]);
+                out.push(w[1]);
+                out.push(' ');
+            }
+            for c in run.iter() {
+                out.push(*c);
+                out.push(' ');
+            }
+        } else {
+            for c in run.iter() {
+                out.push(*c);
+                out.push(' ');
+            }
+        }
+        run.clear();
+    };
+    for c in text.chars() {
+        if c.is_alphanumeric() && !c.is_ascii() {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            if c.is_ascii_alphanumeric() {
+                out.push(c.to_ascii_lowercase());
+            } else {
+                out.push(' ');
+            }
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+/// Split a free-text query into deduplicated, lowercased semantic terms
+/// (keeping IPs/identifiers like `192.168.1.1` or `UNNC-Living` intact).
+fn extract_search_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for raw in query.split_whitespace() {
+        let trimmed = raw.trim_matches(|c: char| {
+            matches!(
+                c,
+                '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '，' | '。' | '？' | '！' | '、' | '：'
+            )
+        });
+        let lower = trimmed.to_lowercase();
+        if !lower.is_empty() && !terms.contains(&lower) {
+            terms.push(lower);
+            if terms.len() >= 12 {
+                break;
+            }
+        }
+    }
+    terms
+}
+
+/// Convert one whitespace-delimited query term into an FTS5 expression that
+/// matches `fts_normalize_cjk`-indexed text cleanly (phrases for dotted/hyphenated
+/// ASCII identifiers, bigrams for CJK runs ≥ 2 without single-char noise).
+fn term_to_fts_expr(term: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cjk_run: Vec<char> = Vec::new();
+    let mut ascii_tokens: Vec<String> = Vec::new();
+    let mut current_ascii = String::new();
+
+    let flush_cjk = |run: &mut Vec<char>, parts: &mut Vec<String>| {
+        if run.len() >= 2 {
+            for w in run.windows(2) {
+                let bg: String = w.iter().collect();
+                let tok = format!("\"{bg}\"");
+                if !parts.contains(&tok) {
+                    parts.push(tok);
+                }
+            }
+        } else if let Some(&c) = run.first() {
+            let tok = format!("\"{c}\"");
+            if !parts.contains(&tok) {
+                parts.push(tok);
+            }
+        }
+        run.clear();
+    };
+    let flush_ascii = |cur: &mut String, toks: &mut Vec<String>| {
+        if !cur.is_empty() {
+            toks.push(std::mem::take(cur));
+        }
+    };
+    let commit_ascii_phrase = |toks: &mut Vec<String>, parts: &mut Vec<String>| {
+        if !toks.is_empty() {
+            let phrase = format!("\"{}\"", toks.join(" "));
+            if !parts.contains(&phrase) {
+                parts.push(phrase);
+            }
+            toks.clear();
+        }
+    };
+
+    for c in term.chars() {
+        if c.is_alphanumeric() && !c.is_ascii() {
+            flush_ascii(&mut current_ascii, &mut ascii_tokens);
+            commit_ascii_phrase(&mut ascii_tokens, &mut parts);
+            cjk_run.push(c);
+        } else if c.is_ascii_alphanumeric() {
+            flush_cjk(&mut cjk_run, &mut parts);
+            current_ascii.push(c.to_ascii_lowercase());
+        } else {
+            flush_cjk(&mut cjk_run, &mut parts);
+            flush_ascii(&mut current_ascii, &mut ascii_tokens);
+        }
+    }
+    flush_cjk(&mut cjk_run, &mut parts);
+    flush_ascii(&mut current_ascii, &mut ascii_tokens);
+    commit_ascii_phrase(&mut ascii_tokens, &mut parts);
+
+    match parts.len() {
+        0 => None,
+        1 => parts.into_iter().next(),
+        _ => Some(format!("({})", parts.join(" AND "))),
+    }
+}
+
+/// Build `(strict_and_fts, relaxed_or_fts)` queries for two-stage BM25 recall.
+fn build_fts_queries(terms: &[String]) -> (Option<String>, Option<String>) {
+    let mut group_exprs = Vec::new();
+    for t in terms {
+        if let Some(expr) = term_to_fts_expr(t)
+            && !group_exprs.contains(&expr)
+        {
+            group_exprs.push(expr);
+        }
+    }
+    match group_exprs.len() {
+        0 => (None, None),
+        1 => (group_exprs.into_iter().next(), None),
+        _ => {
+            let strict = group_exprs.join(" AND ");
+            let relaxed = group_exprs.join(" OR ");
+            (Some(strict), Some(relaxed))
+        }
+    }
+}
+
+/// Score a piece of text against query terms: rewards distinct-term coverage,
+/// term specificity (longer tokens / IPs / identifiers), and capped TF.
+fn score_text_terms(text: &str, terms: &[String]) -> f64 {
+    if terms.is_empty() {
+        return 1.0;
+    }
+    let lower = text.to_lowercase();
+    let mut matched_terms = 0usize;
+    let mut specificity_sum = 0.0f64;
+    let mut tf_bonus = 0.0f64;
+
+    for term in terms {
+        let count = lower.matches(term.as_str()).count();
+        if count > 0 {
+            matched_terms += 1;
+            let char_len = term.chars().count() as f64;
+            let has_digit_or_punct = term
+                .chars()
+                .any(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '_');
+            let weight = (char_len.min(12.0) / 3.0).max(0.6)
+                + if has_digit_or_punct { 0.8 } else { 0.0 };
+            specificity_sum += weight;
+            tf_bonus += ((count as f64).min(5.0)).ln_1p() * 0.35;
+        }
+    }
+
+    if matched_terms == 0 {
+        return 0.0;
+    }
+
+    let coverage = matched_terms as f64 / terms.len() as f64;
+    let full_match_bonus = if matched_terms == terms.len() { 6.0 } else { 0.0 };
+    coverage * 6.0 + specificity_sum + tf_bonus + full_match_bonus
+}
+
+/// Extract a UTF-8-safe snippet centered around the highest-specificity matched
+/// term instead of blindly taking the first N characters.
+fn extract_match_snippet(text: &str, terms: &[String], max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    if terms.is_empty() {
+        let mut s: String = text.chars().take(max_chars).collect();
+        s.push_str("...");
+        return s;
+    }
+    let lower = text.to_lowercase();
+    // Prefer longer / more specific terms when choosing where to center the snippet.
+    let mut ordered_terms: Vec<&String> = terms.iter().collect();
+    ordered_terms.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
+
+    let mut match_char_idx: Option<usize> = None;
+    for term in ordered_terms {
+        if let Some(byte_pos) = lower.find(term.as_str()) {
+            match_char_idx = Some(lower[..byte_pos].chars().count());
+            break;
+        }
+    }
+    let Some(center_idx) = match_char_idx else {
+        let mut s: String = text.chars().take(max_chars).collect();
+        s.push_str("...");
+        return s;
+    };
+
+    let total_chars = text.chars().count();
+    let lead = (max_chars / 4).min(60);
+    let start = center_idx.saturating_sub(lead);
+    let end = (start + max_chars).min(total_chars);
+    let start = end.saturating_sub(max_chars);
+
+    let slice: String = text.chars().skip(start).take(end - start).collect();
+    let mut out = String::with_capacity(slice.len() + 6);
+    if start > 0 {
+        out.push_str("...");
+    }
+    out.push_str(&slice);
+    if end < total_chars {
+        out.push_str("...");
+    }
+    out
+}
+
+/// Detect raw self-echo payloads from `memory_search` tool calls/results so
+/// searches never pollute themselves.
+fn is_memory_search_echo(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{')
+        && (trimmed.contains("\"toolSummary\"") || trimmed.contains("\"memory_search\""))
+        && trimmed.contains("\"query\"")
+        && trimmed.contains("\"scope\"")
+    {
+        return true;
+    }
+    false
+}
+
+/// Incrementally sync non-streaming rows from `messages` into `agentos_messages_fts`.
+/// Returns `true` when the FTS index is ready for querying.
+fn sync_messages_fts(conn: &Connection) -> bool {
+    if conn
+        .execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS agentos_messages_fts USING fts5(content, tokenize='unicode61');
+             CREATE TABLE IF NOT EXISTS agentos_messages_fts_sync (
+                 msg_rowid INTEGER PRIMARY KEY,
+                 content_len INTEGER NOT NULL
+             );",
+        )
+        .is_err()
+    {
+        return false;
+    }
+
+    let pending: Vec<(i64, String)> = {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT m.rowid, m.content
+             FROM messages m
+             LEFT JOIN agentos_messages_fts_sync s ON s.msg_rowid = m.rowid
+             WHERE m.streaming = 0
+               AND (s.msg_rowid IS NULL OR s.content_len != length(m.content))",
+        ) else {
+            return false;
+        };
+        let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        else {
+            return false;
+        };
+        rows.flatten().collect()
+    };
+
+    if !pending.is_empty() {
+        if conn.execute_batch("BEGIN IMMEDIATE").is_err() {
+            return false;
+        }
+        let mut ok = true;
+        {
+            let del = conn.prepare("DELETE FROM agentos_messages_fts WHERE rowid = ?1");
+            let ins = conn
+                .prepare("INSERT INTO agentos_messages_fts(rowid, content) VALUES (?1, ?2)");
+            let mark = conn.prepare(
+                "INSERT OR REPLACE INTO agentos_messages_fts_sync(msg_rowid, content_len) VALUES (?1, ?2)",
+            );
+            if let (Ok(mut del), Ok(mut ins), Ok(mut mark)) = (del, ins, mark) {
+                for (rowid, content) in pending {
+                    let norm = fts_normalize_cjk(&content);
+                    let len = content.len() as i64;
+                    if del.execute(params![rowid]).is_err()
+                        || ins.execute(params![rowid, norm]).is_err()
+                        || mark.execute(params![rowid, len]).is_err()
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+            } else {
+                ok = false;
+            }
+        }
+        if ok {
+            if conn.execute_batch("COMMIT").is_err() {
+                let _ = conn.execute_batch("ROLLBACK");
+                return false;
+            }
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+            return false;
+        }
+    }
+
+    true
+}
+
+fn search_waku_message_history(
+    conn: &Connection,
+    ctx: &McpContext,
+    project_path: &str,
+    scope: &str,
+    raw_query: &str,
+    terms: &[String],
+    limit: usize,
+) -> Vec<(f64, i64, Value)> {
+    let has_messages: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if !has_messages {
+        return Vec::new();
+    }
+    let has_sessions_and_projects: bool = conn
+        .query_row(
+            "SELECT COUNT(*) = 2 FROM sqlite_master WHERE type='table' AND name IN ('sessions', 'projects')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+
+    let mut out: Vec<(f64, i64, Value)> = Vec::new();
+    let mut seen_ids = std::collections::HashSet::<String>::new();
+
+    // Empty query: return most recent non-streaming messages within scope.
+    if raw_query.is_empty() || terms.is_empty() {
+        let sql = if has_sessions_and_projects {
+            match scope {
+                "task_shared" => {
+                    "SELECT m.id, m.session_id, COALESCE(s.title, ''), m.role, m.content, m.created_at
+                     FROM messages m
+                     LEFT JOIN sessions s ON s.id = m.session_id
+                     WHERE m.streaming = 0 AND m.session_id = ?1
+                     ORDER BY m.created_at DESC, m.position DESC LIMIT ?3"
+                }
+                "user" => {
+                    "SELECT m.id, m.session_id, COALESCE(s.title, ''), m.role, m.content, m.created_at
+                     FROM messages m
+                     LEFT JOIN sessions s ON s.id = m.session_id
+                     WHERE m.streaming = 0 AND (?1 != '' OR 1=1) AND (?2 != '' OR 1=1)
+                     ORDER BY m.created_at DESC, m.position DESC LIMIT ?3"
+                }
+                _ => {
+                    "SELECT m.id, m.session_id, COALESCE(s.title, ''), m.role, m.content, m.created_at
+                     FROM messages m
+                     LEFT JOIN sessions s ON s.id = m.session_id
+                     LEFT JOIN projects p ON p.id = s.project_id
+                     WHERE m.streaming = 0 AND (p.path = ?2 OR m.session_id = ?1)
+                     ORDER BY m.created_at DESC, m.position DESC LIMIT ?3"
+                }
+            }
+        } else if scope == "task_shared" {
+            "SELECT id, session_id, '', role, content, created_at FROM messages
+             WHERE streaming = 0 AND session_id = ?1 AND (?2 != '' OR 1=1)
+             ORDER BY created_at DESC, position DESC LIMIT ?3"
+        } else {
+            "SELECT id, session_id, '', role, content, created_at FROM messages
+             WHERE streaming = 0 AND (?1 != '' OR 1=1) AND (?2 != '' OR 1=1)
+             ORDER BY created_at DESC, position DESC LIMIT ?3"
+        };
+        if let Ok(mut stmt) = conn.prepare(sql)
+            && let Ok(rows) = stmt.query_map(
+                params![ctx.session_id, project_path, (limit * 2) as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+        {
+            for (mid, sid, title, role, content, ts) in rows.flatten() {
+                if is_memory_search_echo(&content) || !seen_ids.insert(mid.clone()) {
+                    continue;
+                }
+                let snippet = extract_match_snippet(&content, terms, 240);
+                let mut hit = json!({
+                    "id": format!("msg:{mid}"),
+                    "kind": "history",
+                    "session_id": sid,
+                    "role": role,
+                    "snippet": snippet,
+                    "created_at": ts,
+                });
+                if !title.is_empty() {
+                    hit["session_title"] = json!(title);
+                }
+                out.push((1.0, ts, hit));
+            }
+        }
+        return out;
+    }
+
+    // Two-stage FTS5 BM25 search (strict AND -> relaxed OR fallback).
+    let (strict_fts, relaxed_fts) = build_fts_queries(terms);
+    if sync_messages_fts(conn)
+        && let Some(strict_q) = strict_fts
+    {
+        let fts_sql = if has_sessions_and_projects {
+            match scope {
+                "task_shared" => {
+                    "SELECT m.id, m.session_id, COALESCE(s.title, ''), m.role, m.content, m.created_at,
+                            bm25(agentos_messages_fts) AS rank_score
+                     FROM agentos_messages_fts f
+                     JOIN messages m ON m.rowid = f.rowid
+                     LEFT JOIN sessions s ON s.id = m.session_id
+                     WHERE agentos_messages_fts MATCH ?1
+                       AND m.streaming = 0
+                       AND m.session_id = ?2
+                       AND (?3 != '' OR 1=1)
+                     ORDER BY rank_score ASC, m.created_at DESC
+                     LIMIT ?4"
+                }
+                "user" => {
+                    "SELECT m.id, m.session_id, COALESCE(s.title, ''), m.role, m.content, m.created_at,
+                            bm25(agentos_messages_fts) AS rank_score
+                     FROM agentos_messages_fts f
+                     JOIN messages m ON m.rowid = f.rowid
+                     LEFT JOIN sessions s ON s.id = m.session_id
+                     WHERE agentos_messages_fts MATCH ?1
+                       AND m.streaming = 0
+                       AND (?2 != '' OR 1=1)
+                       AND (?3 != '' OR 1=1)
+                     ORDER BY rank_score ASC, m.created_at DESC
+                     LIMIT ?4"
+                }
+                _ => {
+                    "SELECT m.id, m.session_id, COALESCE(s.title, ''), m.role, m.content, m.created_at,
+                            bm25(agentos_messages_fts) AS rank_score
+                     FROM agentos_messages_fts f
+                     JOIN messages m ON m.rowid = f.rowid
+                     LEFT JOIN sessions s ON s.id = m.session_id
+                     LEFT JOIN projects p ON p.id = s.project_id
+                     WHERE agentos_messages_fts MATCH ?1
+                       AND m.streaming = 0
+                       AND (p.path = ?3 OR m.session_id = ?2)
+                     ORDER BY rank_score ASC, m.created_at DESC
+                     LIMIT ?4"
+                }
+            }
+        } else if scope == "task_shared" {
+            "SELECT m.id, m.session_id, '', m.role, m.content, m.created_at,
+                    bm25(agentos_messages_fts) AS rank_score
+             FROM agentos_messages_fts f
+             JOIN messages m ON m.rowid = f.rowid
+             WHERE agentos_messages_fts MATCH ?1
+               AND m.streaming = 0
+               AND m.session_id = ?2
+               AND (?3 != '' OR 1=1)
+             ORDER BY rank_score ASC, m.created_at DESC
+             LIMIT ?4"
+        } else {
+            "SELECT m.id, m.session_id, '', m.role, m.content, m.created_at,
+                    bm25(agentos_messages_fts) AS rank_score
+             FROM agentos_messages_fts f
+             JOIN messages m ON m.rowid = f.rowid
+             WHERE agentos_messages_fts MATCH ?1
+               AND m.streaming = 0
+               AND (?2 != '' OR 1=1)
+               AND (?3 != '' OR 1=1)
+             ORDER BY rank_score ASC, m.created_at DESC
+             LIMIT ?4"
+        };
+
+        let fetch_limit = ((limit * 4).max(40)).min(200) as i64;
+        let run_stage = |fts_query: &str,
+                         stage_bonus: f64,
+                         seen: &mut std::collections::HashSet<String>,
+                         acc: &mut Vec<(f64, i64, Value)>| {
+            if let Ok(mut stmt) = conn.prepare(fts_sql)
+                && let Ok(rows) = stmt.query_map(
+                    params![fts_query, ctx.session_id, project_path, fetch_limit],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, i64>(5)?,
+                            r.get::<_, f64>(6)?,
+                        ))
+                    },
+                )
+            {
+                for (mid, sid, title, role, content, ts, bm25_val) in rows.flatten() {
+                    if is_memory_search_echo(&content) || !seen.insert(mid.clone()) {
+                        continue;
+                    }
+                    let bm25_boost = (-bm25_val).clamp(0.0, 20.0) * 0.25;
+                    let term_score = score_text_terms(&content, terms);
+                    let score = stage_bonus + bm25_boost + term_score;
+                    let snippet = extract_match_snippet(&content, terms, 240);
+                    let mut hit = json!({
+                        "id": format!("msg:{mid}"),
+                        "kind": "history",
+                        "session_id": sid,
+                        "role": role,
+                        "snippet": snippet,
+                        "created_at": ts,
+                    });
+                    if !title.is_empty() {
+                        hit["session_title"] = json!(title);
+                    }
+                    acc.push((score, ts, hit));
+                }
+            }
+        };
+
+        run_stage(&strict_q, 8.0, &mut seen_ids, &mut out);
+        if out.len() < limit
+            && let Some(relaxed_q) = relaxed_fts
+        {
+            run_stage(&relaxed_q, 0.0, &mut seen_ids, &mut out);
+        }
+        return out;
+    }
+
+    // Fallback (e.g. read-only DB where FTS table cannot be created): bounded scan + multi-term scoring.
+    let fallback_sql = if has_sessions_and_projects && scope == "project" {
+        "SELECT m.id, m.session_id, COALESCE(s.title, ''), m.role, m.content, m.created_at
+         FROM messages m
+         LEFT JOIN sessions s ON s.id = m.session_id
+         LEFT JOIN projects p ON p.id = s.project_id
+         WHERE m.streaming = 0 AND (p.path = ?2 OR m.session_id = ?1)
+         ORDER BY m.created_at DESC LIMIT 2000"
+    } else if scope == "task_shared" {
+        "SELECT id, session_id, '', role, content, created_at FROM messages
+         WHERE streaming = 0 AND session_id = ?1 AND (?2 != '' OR 1=1)
+         ORDER BY position DESC LIMIT 2000"
+    } else {
+        "SELECT id, session_id, '', role, content, created_at FROM messages
+         WHERE streaming = 0 AND (?1 != '' OR 1=1) AND (?2 != '' OR 1=1)
+         ORDER BY created_at DESC LIMIT 2000"
+    };
+    if let Ok(mut stmt) = conn.prepare(fallback_sql)
+        && let Ok(rows) = stmt.query_map(params![ctx.session_id, project_path], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })
+    {
+        for (mid, sid, title, role, content, ts) in rows.flatten() {
+            if is_memory_search_echo(&content) || !seen_ids.insert(mid.clone()) {
+                continue;
+            }
+            let score = score_text_terms(&content, terms);
+            if score <= 0.0 {
+                continue;
+            }
+            let snippet = extract_match_snippet(&content, terms, 240);
+            let mut hit = json!({
+                "id": format!("msg:{mid}"),
+                "kind": "history",
+                "session_id": sid,
+                "role": role,
+                "snippet": snippet,
+                "created_at": ts,
+            });
+            if !title.is_empty() {
+                hit["session_title"] = json!(title);
+            }
+            out.push((score, ts, hit));
+        }
+    }
+    out
+}
+
 fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
     let mut tools = Vec::new();
     if settings.memory_enabled {
         tools.extend([
             json!({
                 "name": "memory_search",
-                "description": "Search task notes, checkpoints, project knowledge, and session history.",
+                "description": "Search persistent cross-session memory across this workspace (past sessions, device/network/SSH/proxy/env configs, prior fixes, working notes, checkpoints, and project knowledge). CALL THIS FIRST (default scope=\"project\") whenever the user refers to past behavior or prior setup ('before', 'last time', 'still connected', 'again', '以前', '上次', '之前', '还在吗', '连过', '配过'), or when live checks contradict expectations or involve environment/device/config troubleshooting. Use 1-3 focused keywords (e.g. 'AX3000T 192.168.1.1' or 'adb 无线') rather than long multi-topic strings; pass returned ids to memory_read for full text.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string" },
-                        "scope": { "type": "string", "enum": ["task_shared", "project", "user"] },
-                        "kinds": { "type": "array", "items": { "type": "string", "enum": ["history", "note", "checkpoint", "knowledge", "artifact"] } },
-                        "limit": { "type": "integer" },
+                        "query": {
+                            "type": "string",
+                            "description": "Focused keyword query (1-3 terms work best; space-separated terms are ranked by relevance with partial-match fallback). Empty string returns most recent items."
+                        },
+                        "scope": {
+                            "type": "string",
+                            "enum": ["project", "task_shared", "user"],
+                            "description": "project (default): history, notes, checkpoints, and knowledge across all sessions in this project. task_shared: only the current session. user: cross-project history and user-level knowledge."
+                        },
+                        "kinds": {
+                            "type": "array",
+                            "items": { "type": "string", "enum": ["history", "note", "checkpoint", "knowledge", "artifact"] },
+                            "description": "Restrict to these memory kinds; omit to search all."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max hits (default 20, max 100)."
+                        },
                         "toolSummary": { "type": "string" }
                     },
                     "required": ["toolSummary"]
@@ -2392,13 +3343,13 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
     if settings.session_info_enabled {
         tools.push(json!({
             "name": "get_session_info",
-            "description": "Look up a session by UUID or legacy numeric codeg session id.",
+            "description": "Look up a past session mentioned in the user's prompt (e.g. [Title](agentos://session/<uuid>) or [Title](codeg://session/<id>)) by UUID, agentos://session/<uuid> link, or legacy numeric codeg session id, returning its title, workspace folder, provider/model, message count, and recent transcript.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session_id": {
                         "type": "string",
-                        "description": "Session UUID or legacy numeric codeg conversation id."
+                        "description": "Session UUID, agentos://session/<uuid> URL, or legacy numeric codeg conversation id."
                     },
                     "max_messages": { "type": "integer" },
                     "toolSummary": { "type": "string" }
@@ -3245,6 +4196,385 @@ mod tests {
             ask_resp["result"]["structuredContent"]["answers"][0]["answers"][0],
             "Mac"
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn memory_search_fts_bm25_relaxed_or_scope_snippets_and_instructions() {
+        let dir = std::env::temp_dir().join(format!("waku-mcp-search-opt-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("app.db");
+        let conn = open_mcp_connection(&db).unwrap();
+
+        // Set up Waku projects/sessions/messages schema.
+        conn.execute_batch(
+            "CREATE TABLE projects (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL,
+                position INTEGER NOT NULL, created_at INTEGER NOT NULL
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL,
+                provider TEXT NOT NULL, model TEXT, status TEXT NOT NULL,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_reply_at INTEGER
+            );
+            CREATE TABLE messages (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, turn_id TEXT,
+                position INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
+                created_at INTEGER NOT NULL, streaming INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+
+        let proj_a = dir.to_string_lossy().to_string();
+        let proj_b = "/tmp/other-project".to_string();
+        conn.execute(
+            "INSERT INTO projects(id, name, path, position, created_at) VALUES ('pa', 'Diag', ?1, 0, 100), ('pb', 'Other', ?2, 1, 100)",
+            params![proj_a, proj_b],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions(id, project_id, title, provider, status, created_at, updated_at)
+             VALUES
+               ('s-old', 'pa', '路由器与手机ADB排错', 'codex', 'idle', 100, 100),
+               ('s-cur', 'pa', '手机ADB还在吗', 'antigravity', 'running', 200, 200),
+               ('s-other', 'pb', '跨项目路由器笔记', 'claude', 'idle', 150, 150)",
+            [],
+        )
+        .unwrap();
+
+        let long_prefix = "无关背景日志 ".repeat(80);
+        let router_msg = format!(
+            "{long_prefix}AX3000T 路由器 (192.168.1.1) 通过 phy1-sta0 连在 UNNC-Living，OpenClash @localnetwork 放行 172.16.0.0/12，手机无线 ADB 172.19.115.104:5555 可直连。"
+        );
+        let rax_msg = "手机连接 RAX 2.4G 后拿到 192.168.1.6，无线 ADB 可用。";
+        let echo_msg = r#"{"query":"192.168.1.6 192.168.1.10 RAX SK-D841N AX3000T","scope":"project","toolSummary":"Search project memory"}"#;
+        let other_proj_msg = "另一个项目里提到的 AX3000T 192.168.1.1 OpenClash 备忘。";
+
+        conn.execute(
+            "INSERT INTO messages(id, session_id, position, role, content, created_at, streaming)
+             VALUES
+               ('m1', 's-old', 0, 'assistant', ?1, 101, 0),
+               ('m2', 's-old', 1, 'assistant', ?2, 102, 0),
+               ('m3', 's-cur', 0, 'assistant', ?3, 201, 0),
+               ('m4', 's-other', 0, 'assistant', ?4, 151, 0)",
+            params![router_msg, rax_msg, echo_msg, other_proj_msg],
+        )
+        .unwrap();
+
+        let ctx = McpContext {
+            session_id: "s-cur".to_string(),
+            db_path: db.clone(),
+            cwd: dir.clone(),
+            caller_provider: Some(ProviderKind::Antigravity),
+            settings_path: Some(dir.join("settings.json")),
+        };
+
+        // 1. initialize returns proactive memory instructions.
+        let init = dispatch_mcp_request(
+            &conn,
+            &ctx,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        )
+        .unwrap();
+        let instructions = init["result"]["instructions"].as_str().unwrap_or("");
+        assert!(instructions.contains("memory_search"));
+        assert!(instructions.contains("以前"));
+
+        // 2. Multi-keyword query with conflicting/extra terms falls back to relaxed OR,
+        //    excludes self-echo m3, isolates project scope (excludes m4), and finds m1 & m2.
+        let resp = dispatch_mcp_request(
+            &conn,
+            &ctx,
+            &json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {
+                    "name": "memory_search",
+                    "arguments": {
+                        "query": "192.168.1.6 192.168.1.10 RAX SK-D841N AX3000T",
+                        "toolSummary": "Search router and RAX history"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let hits = resp["result"]["structuredContent"]["hits"]
+            .as_array()
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().filter_map(|h| h["id"].as_str()).collect();
+        assert!(ids.contains(&"msg:m1"), "should find AX3000T msg: {ids:?}");
+        assert!(ids.contains(&"msg:m2"), "should find RAX 192.168.1.6 msg: {ids:?}");
+        assert!(!ids.contains(&"msg:m3"), "must filter self-echo: {ids:?}");
+        assert!(
+            !ids.contains(&"msg:m4"),
+            "default project scope must exclude other projects: {ids:?}"
+        );
+        // Match-centered snippet for m1 must show AX3000T instead of only the long prefix.
+        let m1_hit = hits.iter().find(|h| h["id"] == "msg:m1").unwrap();
+        let snippet = m1_hit["snippet"].as_str().unwrap();
+        assert!(
+            snippet.contains("AX3000T"),
+            "snippet should center around match, got: {snippet}"
+        );
+        assert_eq!(m1_hit["session_title"], "路由器与手机ADB排错");
+
+        // 3. CJK + ASCII mixed query hits m1 with default project scope.
+        let cjk_resp = dispatch_mcp_request(
+            &conn,
+            &ctx,
+            &json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {
+                    "name": "memory_search",
+                    "arguments": {
+                        "query": "路由器 无线 ADB",
+                        "toolSummary": "Search CJK + ASCII"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let cjk_hits = cjk_resp["result"]["structuredContent"]["hits"]
+            .as_array()
+            .unwrap();
+        assert_eq!(cjk_hits[0]["id"], "msg:m1");
+
+        // 4. scope="user" includes cross-project hit m4.
+        let user_resp = dispatch_mcp_request(
+            &conn,
+            &ctx,
+            &json!({
+                "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": {
+                    "name": "memory_search",
+                    "arguments": {
+                        "query": "AX3000T OpenClash",
+                        "scope": "user",
+                        "toolSummary": "Search across projects"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let user_ids: Vec<&str> = user_resp["result"]["structuredContent"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|h| h["id"].as_str())
+            .collect();
+        assert!(user_ids.contains(&"msg:m1"));
+        assert!(user_ids.contains(&"msg:m4"));
+
+        // 5. scope="task_shared" stays strictly inside current session s-cur (and filters echo m3).
+        let task_resp = dispatch_mcp_request(
+            &conn,
+            &ctx,
+            &json!({
+                "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                "params": {
+                    "name": "memory_search",
+                    "arguments": {
+                        "query": "AX3000T",
+                        "scope": "task_shared",
+                        "toolSummary": "Search current session only"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        assert!(
+            task_resp["result"]["structuredContent"]["hits"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn get_session_info_resolves_agentos_url_auto_title_and_workspace() {
+        let dir = std::env::temp_dir().join(format!("agentos-sessinfo-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("app.db");
+        let conn = open_mcp_connection(&db).unwrap();
+        ensure_mcp_tables(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL, position INTEGER NOT NULL, created_at INTEGER NOT NULL);
+             CREATE TABLE sessions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL, auto_title TEXT, provider TEXT NOT NULL, model TEXT, status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_reply_at INTEGER);
+             CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, turn_id TEXT, position INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, display_content TEXT, attachments TEXT, created_at INTEGER NOT NULL, streaming INTEGER NOT NULL, provider TEXT);",
+        )
+        .unwrap();
+        let sid = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO projects VALUES ('p1', 'AgentOS', '/tmp/AgentOS', 0, 100)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES (?1, 'p1', 'New task', '修复 OAuth 登录弹窗', 'codex', 'gpt-6.2-sol', 'idle', 100, 200, 200)",
+            params![sid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages VALUES ('m1', ?1, 't1', 0, 'user', '为什么老是弹登录', NULL, '[]', 110, 0, NULL)",
+            params![sid],
+        )
+        .unwrap();
+        let ctx = McpContext {
+            session_id: Uuid::new_v4().to_string(),
+            db_path: db.clone(),
+            cwd: PathBuf::from("/tmp/AgentOS"),
+            caller_provider: Some(ProviderKind::Codex),
+            settings_path: None,
+        };
+        let resp = dispatch_mcp_request(
+            &conn,
+            &ctx,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_session_info",
+                    "arguments": {
+                        "session_id": format!("agentos://session/{sid}"),
+                        "toolSummary": "Inspect referenced session"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let sc = &resp["result"]["structuredContent"];
+        assert_eq!(sc["found"], true);
+        assert_eq!(sc["title"], "修复 OAuth 登录弹窗");
+        assert_eq!(sc["project_name"], "AgentOS");
+        assert_eq!(sc["workspace_folder"], "/tmp/AgentOS");
+        assert_eq!(sc["message_count"], 1);
+        assert_eq!(sc["messages"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn memory_library_load_promote_reject_and_delete_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("agentos-memlib-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("app.db");
+        let conn = open_mcp_connection(&db).unwrap();
+        ensure_mcp_tables(&conn).unwrap();
+        let sid = Uuid::new_v4().to_string();
+        let ctx = McpContext {
+            session_id: sid.clone(),
+            db_path: db.clone(),
+            cwd: PathBuf::from("/tmp/ProjectA"),
+            caller_provider: Some(ProviderKind::Codex),
+            settings_path: None,
+        };
+        let kn_resp = dispatch_mcp_request(
+            &conn,
+            &ctx,
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "memory_knowledge_propose",
+                    "arguments": {
+                        "claim": "Always run CNB stop after remote builds",
+                        "scope": "project",
+                        "toolSummary": "Propose knowledge"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let kid = kn_resp["result"]["structuredContent"]["knowledge_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        dispatch_mcp_request(
+            &conn,
+            &ctx,
+            &json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {
+                    "name": "memory_note_write",
+                    "arguments": {
+                        "note_id": "plan",
+                        "body": "Step 1 done",
+                        "toolSummary": "Write note"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let cp_resp = dispatch_mcp_request(
+            &conn,
+            &ctx,
+            &json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {
+                    "name": "memory_checkpoint_prepare",
+                    "arguments": {
+                        "completed": ["Built UI"],
+                        "next_actions": ["Run tests"],
+                        "toolSummary": "Prepare checkpoint"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let cpid = cp_resp["result"]["structuredContent"]["checkpoint_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let snap = load_memory_library(&db, Some("/tmp/ProjectA"), None).unwrap();
+        assert_eq!(snap.knowledge.len(), 1);
+        assert_eq!(snap.notes.len(), 1);
+        assert_eq!(snap.checkpoints.len(), 1);
+
+        update_memory_knowledge_status(&db, &kid, "rejected").unwrap();
+        let search_after_reject = dispatch_mcp_request(
+            &conn,
+            &ctx,
+            &json!({
+                "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": {
+                    "name": "memory_search",
+                    "arguments": {
+                        "query": "CNB stop",
+                        "kinds": ["knowledge"],
+                        "toolSummary": "Verify rejected knowledge hidden"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        assert!(
+            search_after_reject["result"]["structuredContent"]["hits"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        update_memory_knowledge_status(&db, &kid, "promoted").unwrap();
+        let snap2 = load_memory_library(&db, Some("/tmp/ProjectA"), Some("CNB")).unwrap();
+        assert_eq!(snap2.knowledge.len(), 1);
+        assert_eq!(snap2.knowledge[0].status, "promoted");
+
+        delete_memory_entry(&db, MemoryEntryKind::Knowledge, &kid, None, None).unwrap();
+        delete_memory_entry(
+            &db,
+            MemoryEntryKind::Note,
+            &sid,
+            Some("plan"),
+            Some("task_shared"),
+        )
+        .unwrap();
+        delete_memory_entry(&db, MemoryEntryKind::Checkpoint, &cpid, None, None).unwrap();
+        let snap3 = load_memory_library(&db, None, None).unwrap();
+        assert!(snap3.knowledge.is_empty());
+        assert!(snap3.notes.is_empty());
+        assert!(snap3.checkpoints.is_empty());
 
         let _ = std::fs::remove_dir_all(dir);
     }

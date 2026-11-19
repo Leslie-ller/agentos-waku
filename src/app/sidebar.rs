@@ -937,6 +937,28 @@ impl Waku {
                         this.open_settings_action(&OpenSettings, window, cx);
                     })),
             )
+            .child(
+                div()
+                    .id("open-memory-library")
+                    .tab_index(0)
+                    .focus_visible(|style| style.border_1().border_color(theme.accent))
+                    .ml(px(4.0))
+                    .w(px(26.0))
+                    .h(px(26.0))
+                    .flex_none()
+                    .rounded(px(6.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_default()
+                    .hover(|element| element.bg(theme.overlay))
+                    .active(|element| element.bg(theme.overlay_strong))
+                    .tooltip(Tooltip::text(tr_cow!("settings.memory")))
+                    .child(icon("icons/hexagon.svg", 14.0, theme.text_tertiary))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_settings_page(SettingsPage::Memory, cx);
+                    })),
+            )
             .child(div().flex_1())
             .when_some(self.render_updater_button(cx), |footer, button| {
                 footer.child(button)

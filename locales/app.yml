@@ -2189,3 +2189,60 @@ usage_error.unknown_error:
   en: unknown error
 usage_error.curl_no_status:
   en: curl returned no HTTP status line
+
+settings.memory:
+  en: Memory
+settings.memory_keywords:
+  en: memory knowledge notes checkpoints recall library 记忆 记忆库 知识 笔记 检查点
+autocomplete.session_badge:
+  en: Session
+memory.subtitle:
+  en: Review and manage persistent cross-session knowledge, working notes, and recovery checkpoints stored by AgentOS.
+memory.search:
+  en: Search memory claims, notes, checkpoints, or projects…
+memory.current_project:
+  en: Current Project
+memory.all_projects:
+  en: All Projects
+memory.refresh:
+  en: Refresh
+memory.refreshing:
+  en: Refreshing…
+memory.tab_knowledge:
+  en: Knowledge
+memory.tab_notes:
+  en: Notes
+memory.tab_checkpoints:
+  en: Checkpoints
+memory.loading:
+  en: Loading memory library…
+memory.empty_knowledge:
+  en: No knowledge records match this filter.
+memory.empty_notes:
+  en: No working notes match this filter.
+memory.empty_checkpoints:
+  en: No recovery checkpoints match this filter.
+memory.status_promoted:
+  en: Promoted
+memory.status_candidate:
+  en: Candidate
+memory.status_rejected:
+  en: Rejected
+memory.action_promote:
+  en: Promote
+memory.action_reject:
+  en: Reject
+memory.action_delete:
+  en: Delete
+memory.cp_completed:
+  en: Completed
+memory.cp_in_progress:
+  en: In Progress
+memory.cp_next_actions:
+  en: Next Actions
+memory.cp_open_questions:
+  en: Open Questions
+memory.cp_constraints:
+  en: Constraints
+memory.cp_rejected:
+  en: Rejected Approaches

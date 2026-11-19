@@ -215,6 +215,7 @@ enum SettingsPage {
     General,
     Providers,
     Skills,
+    Memory,
     Usage,
     Daemon,
     ComputerUse,
@@ -1436,6 +1437,14 @@ pub struct Waku {
     skills_scanned_at: Option<Instant>,
     /// Filter query over the Skills page's rows.
     skills_search: Entity<TextInput>,
+    /// AgentOS persistent memory library snapshot loaded from the daemon.
+    memory_library: Option<Rc<waku_client::memory::MemoryLibrarySnapshot>>,
+    memory_load_generation: u64,
+    memory_loading: bool,
+    memory_loaded_at: Option<Instant>,
+    memory_tab: memory_page::MemoryTab,
+    memory_scope_filter: memory_page::MemoryScopeFilter,
+    memory_search: Entity<TextInput>,
     /// Virtualized list over the filtered skill rows.
     skills_list_state: ListState,
     skills_scrollbar: Rc<ScrollbarState>,
@@ -1632,6 +1641,7 @@ mod goal_dialog;
 mod image_preview;
 mod project_picker;
 mod render;
+mod memory_page;
 mod right_panel;
 mod runtime;
 mod sessions;
@@ -2042,6 +2052,11 @@ impl Waku {
                 .clear_on_escape()
                 .placeholder(tr!("skills.search"))
         });
+        let memory_search = cx.new(|cx| {
+            TextInput::new(window, cx)
+                .clear_on_escape()
+                .placeholder(tr!("memory.search"))
+        });
         let session_rename_input = cx.new(|cx| TextInput::new(window, cx));
         let provider_path_input = cx.new(|cx| {
             TextInput::new(window, cx)
@@ -2381,6 +2396,9 @@ impl Waku {
                     if this.settings_page == Some(SettingsPage::Skills) {
                         this.ensure_skills_catalog(true, cx);
                     }
+                    if this.settings_page == Some(SettingsPage::Memory) {
+                        this.ensure_memory_library(true, cx);
+                    }
                 }
             })
             .detach();
@@ -2600,6 +2618,12 @@ impl Waku {
                 .detach();
             }
             cx.subscribe(&skills_search, |_: &mut Self, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Edited) {
+                    cx.notify();
+                }
+            })
+            .detach();
+            cx.subscribe(&memory_search, |_: &mut Self, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Edited) {
                     cx.notify();
                 }
@@ -2967,6 +2991,13 @@ impl Waku {
                 skills_scan_pending: false,
                 skills_scanned_at: None,
                 skills_search,
+                memory_library: None,
+                memory_load_generation: 0,
+                memory_loading: false,
+                memory_loaded_at: None,
+                memory_tab: memory_page::MemoryTab::Knowledge,
+                memory_scope_filter: memory_page::MemoryScopeFilter::CurrentProject,
+                memory_search,
                 skills_list_state: ListState::new(0, ListAlignment::Top, px(512.0)),
                 skills_scrollbar: ScrollbarState::new(),
                 skills_rows: RefCell::new(Vec::new()),

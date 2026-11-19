@@ -1067,3 +1067,32 @@ usage_error.curl_did_not_finish: curl 未能完成请求
 usage_error.curl_failed: "curl 失败：%{error}"
 usage_error.unknown_error: 未知错误
 usage_error.curl_no_status: curl 未返回 HTTP 状态行
+
+settings.memory: 记忆库
+settings.memory_keywords: 记忆 记忆库 知识 笔记 检查点 memory knowledge notes checkpoints
+autocomplete.session_badge: 会话
+memory.subtitle: 查看、筛选并管理 AgentOS 持久化保存的跨会话知识、工作笔记与恢复检查点。
+memory.search: 搜索知识、笔记、检查点或项目名…
+memory.current_project: 当前项目
+memory.all_projects: 全部项目
+memory.refresh: 刷新
+memory.refreshing: 正在刷新…
+memory.tab_knowledge: 知识库
+memory.tab_notes: 工作笔记
+memory.tab_checkpoints: 检查点
+memory.loading: 正在加载记忆库…
+memory.empty_knowledge: 当前筛选条件下暂无知识记录。
+memory.empty_notes: 当前筛选条件下暂无工作笔记。
+memory.empty_checkpoints: 当前筛选条件下暂无恢复检查点。
+memory.status_promoted: 已采纳
+memory.status_candidate: 候选
+memory.status_rejected: 已忽略
+memory.action_promote: 采纳
+memory.action_reject: 忽略
+memory.action_delete: 删除
+memory.cp_completed: 已完成
+memory.cp_in_progress: 进行中
+memory.cp_next_actions: 下一步
+memory.cp_open_questions: 待确认问题
+memory.cp_constraints: 约束条件
+memory.cp_rejected: 已排除方案
