@@ -252,6 +252,25 @@ pub fn ensure_antigravity_settings(gemini_home: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Returns `true` when the isolated Antigravity profile already contains stored
+/// OAuth/token credentials on disk. Background model discovery uses this guard
+/// so it never spawns `session/new` on an unauthenticated `oauth-personal`
+/// profile (which would otherwise repeatedly pop open a browser OAuth login).
+pub fn antigravity_has_stored_credentials() -> bool {
+    let Ok(Some(profile)) = resolve_isolated_profile(ProviderKind::Antigravity) else {
+        return false;
+    };
+    antigravity_profile_has_credentials(&profile.directory)
+}
+
+pub fn antigravity_profile_has_credentials(gemini_home: &Path) -> bool {
+    let acp_dir = gemini_home.join("antigravity-acp");
+    ["acp_token.json", "oauth_creds.json"].iter().any(|name| {
+        let path = acp_dir.join(name);
+        fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() > 2)
+    })
+}
+
 /// Ensures `<CODEX_HOME>/config.toml` stores credentials in its isolated file
 /// rather than the user's shared OS Keychain.
 pub fn ensure_codex_file_auth_store(codex_home: &Path) -> anyhow::Result<()> {

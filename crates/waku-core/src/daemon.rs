@@ -43,7 +43,7 @@ fn trim_resident_transcripts(state: &mut PersistedState, pinned: &HashSet<Uuid>)
 }
 
 pub struct WakuBackend {
-    sessions: Mutex<HashMap<Uuid, (Uuid, DriverHandle)>>,
+    sessions: Mutex<HashMap<Uuid, (Uuid, ProviderKind, DriverHandle)>>,
     terminals: Mutex<HashMap<Uuid, (Uuid, crate::terminal::DaemonTerminal)>>,
     #[cfg(all(test, unix))]
     terminal_shell: Option<alacritty_terminal::tty::Shell>,
@@ -229,7 +229,7 @@ impl Backend for WakuBackend {
         match request.command {
             Command::AttachSession => {
                 let sessions = self.sessions.lock();
-                let Some((runtime_id, driver)) = sessions.get(&session_id) else {
+                let Some((runtime_id, _, driver)) = sessions.get(&session_id) else {
                     return Ok(ResponsePayload::SessionRuntime {
                         runtime_id: None,
                         supports_steer: false,
@@ -359,7 +359,7 @@ impl Backend for WakuBackend {
                     .sessions
                     .lock()
                     .iter()
-                    .map(|(session_id, (runtime_id, _))| (*session_id, *runtime_id))
+                    .map(|(session_id, (runtime_id, _, _))| (*session_id, *runtime_id))
                     .collect::<HashMap<_, _>>();
                 let mut state = self.task_state.lock();
                 let removed_session_ids = self.removed_session_ids.lock();
@@ -841,10 +841,12 @@ impl Backend for WakuBackend {
                     }
                 }
 
-                let mcp_companion = crate::mcp_companion::companion_launch_for_session(
+                let mcp_companion = crate::mcp_companion::companion_launch_for_session_with_provider(
                     session_id,
                     self.task_store.path(),
                     &options.cwd,
+                    Some(provider),
+                    Some(self.settings.path()),
                 );
                 let options = DriverStartOptions {
                     binary: options.binary,
@@ -863,35 +865,103 @@ impl Backend for WakuBackend {
                 let handle =
                     driver::start_local_with_mcp(provider, options, mcp_companion, event_sender)?;
                 let supports_steer = handle.supports_steer();
+                let db_path_for_loop = self.task_store.path().to_path_buf();
+                let driver_for_loop = handle.clone();
                 std::thread::Builder::new()
                     .name(format!("waku-daemon-events-{session_id}"))
                     .spawn(move || {
-                        while let Ok(event) = event_receiver.recv() {
-                            let wire = event_to_wire(event).unwrap_or_else(|error| {
-                                WireDriverEvent::new(
-                                    "error",
-                                    Value::String(format!(
-                                        "could not encode daemon event: {error}"
-                                    )),
-                                )
-                            });
-                            if events.send(wire).is_err() {
-                                break;
+                        loop {
+                            if let Ok(claimed) = crate::mcp_companion::claim_pending_questions(
+                                &db_path_for_loop,
+                                session_id,
+                            ) {
+                                for (qid, questions) in claimed {
+                                    if let Ok(wire) = event_to_wire(DriverEvent::UserInputRequested {
+                                        request_id: format!(
+                                            "{}{qid}",
+                                            crate::mcp_companion::AGENTOS_QUESTION_PREFIX
+                                        ),
+                                        questions,
+                                    }) && events.send(wire).is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                            match event_receiver.recv_timeout(std::time::Duration::from_millis(250))
+                            {
+                                Ok(event) => {
+                                    let turn_succeeded = matches!(
+                                        &event,
+                                        DriverEvent::TurnFinished { success: true, .. }
+                                    );
+                                    let wire = event_to_wire(event).unwrap_or_else(|error| {
+                                        WireDriverEvent::new(
+                                            "error",
+                                            Value::String(format!(
+                                                "could not encode daemon event: {error}"
+                                            )),
+                                        )
+                                    });
+                                    if events.send(wire).is_err() {
+                                        break;
+                                    }
+                                    if turn_succeeded
+                                        && let Ok(Some((goal, next_prompt))) =
+                                            crate::mcp_companion::take_pending_goal_continuation(
+                                                &db_path_for_loop,
+                                                session_id,
+                                            )
+                                    {
+                                        if let Ok(goal_wire) =
+                                            event_to_wire(DriverEvent::GoalUpdated(Some(goal)))
+                                        {
+                                            let _ = events.send(goal_wire);
+                                        }
+                                        let prompt_to_send = if let Ok(Some(rot_pkg)) =
+                                            crate::mcp_companion::take_pending_context_rotation(
+                                                &db_path_for_loop,
+                                                session_id,
+                                            ) {
+                                            format!("{rot_pkg}\n\n{next_prompt}")
+                                        } else {
+                                            next_prompt.clone()
+                                        };
+                                        if let Ok(submit_wire) =
+                                            event_to_wire(DriverEvent::PromptSubmitted {
+                                                message: next_prompt,
+                                                turn_id: Uuid::new_v4(),
+                                                message_id: Uuid::new_v4(),
+                                            })
+                                        {
+                                            let _ = events.send(submit_wire);
+                                        }
+                                        driver_for_loop.prompt(prompt_to_send);
+                                    }
+                                }
+                                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                             }
                         }
                     })
                     .context("could not start daemon event forwarding thread")?;
                 self.sessions
                     .lock()
-                    .insert(session_id, (runtime_id, handle));
+                    .insert(session_id, (runtime_id, provider, handle));
                 Ok(ResponsePayload::Started { supports_steer })
             }
             Command::CloseSession => {
+                let _ =
+                    crate::mcp_companion::cancel_pending_questions(self.task_store.path(), session_id);
+                let _ = crate::mcp_companion::pause_active_goal_on_cancel(
+                    self.task_store.path(),
+                    session_id,
+                );
                 let removed = {
                     let mut sessions = self.sessions.lock();
                     sessions
                         .get(&session_id)
-                        .is_some_and(|(active_runtime_id, _)| *active_runtime_id == runtime_id)
+                        .is_some_and(|(active_runtime_id, _, _)| *active_runtime_id == runtime_id)
                         .then(|| sessions.remove(&session_id))
                         .flatten()
                 };
@@ -899,9 +969,9 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::Ack)
             }
             command => {
-                let driver = {
+                let (provider, driver) = {
                     let sessions = self.sessions.lock();
-                    let (active_runtime_id, driver) = sessions
+                    let (active_runtime_id, active_provider, driver) = sessions
                         .get(&session_id)
                         .ok_or_else(|| anyhow!("daemon session {session_id} is not running"))?;
                     if *active_runtime_id != runtime_id {
@@ -909,9 +979,46 @@ impl Backend for WakuBackend {
                             "daemon session {session_id} belongs to runtime {active_runtime_id}, not {runtime_id}"
                         );
                     }
-                    driver.clone()
+                    (*active_provider, driver.clone())
                 };
                 let mut command = command;
+                match &command {
+                    Command::Cancel => {
+                        let _ = crate::mcp_companion::cancel_pending_questions(
+                            self.task_store.path(),
+                            session_id,
+                        );
+                        let _ = crate::mcp_companion::pause_active_goal_on_cancel(
+                            self.task_store.path(),
+                            session_id,
+                        );
+                    }
+                    Command::RespondUserInput {
+                        request_id,
+                        answers,
+                    } if request_id.starts_with(crate::mcp_companion::AGENTOS_QUESTION_PREFIX) => {
+                        if let Some(qid) =
+                            request_id.strip_prefix(crate::mcp_companion::AGENTOS_QUESTION_PREFIX)
+                        {
+                            crate::mcp_companion::resolve_pending_question(
+                                self.task_store.path(),
+                                qid,
+                                answers,
+                            )?;
+                        }
+                        return Ok(ResponsePayload::Ack);
+                    }
+                    Command::Goal { operation } if provider != ProviderKind::Codex => {
+                        let updated_goal = crate::mcp_companion::apply_host_goal_operation(
+                            self.task_store.path(),
+                            session_id,
+                            operation.clone(),
+                        )?;
+                        events.send(event_to_wire(DriverEvent::GoalUpdated(updated_goal))?)?;
+                        return Ok(ResponsePayload::Ack);
+                    }
+                    _ => {}
+                }
                 if let Command::Prompt {
                     prompt,
                     turn_id,
@@ -920,12 +1027,20 @@ impl Backend for WakuBackend {
                 {
                     // Publish the user's clean prompt into the runtime event
                     // stream before prepending any one-shot cross-agent handoff
-                    // digest for the underlying provider process.
+                    // digest or context-rotation restore package.
                     events.send(event_to_wire(DriverEvent::PromptSubmitted {
                         message: prompt.clone(),
                         turn_id: turn_id.unwrap_or_else(Uuid::new_v4),
                         message_id: message_id.unwrap_or_else(Uuid::new_v4),
                     })?)?;
+
+                    let mut prefix_blocks = Vec::new();
+                    if let Ok(Some(rot_pkg)) = crate::mcp_companion::take_pending_context_rotation(
+                        self.task_store.path(),
+                        session_id,
+                    ) {
+                        prefix_blocks.push(rot_pkg);
+                    }
 
                     let handoff_seed = {
                         let mut state = self.task_state.lock();
@@ -944,7 +1059,10 @@ impl Backend for WakuBackend {
                         }
                     };
                     if let Some(seed) = handoff_seed {
-                        *prompt = format!("{seed}\n\n{prompt}");
+                        prefix_blocks.push(seed);
+                    }
+                    if !prefix_blocks.is_empty() {
+                        *prompt = format!("{}\n\n{prompt}", prefix_blocks.join("\n\n"));
                     }
                 }
                 handle_driver_command(&driver, command)
@@ -1387,7 +1505,7 @@ impl WakuBackend {
             .sessions
             .lock()
             .get(&source.id)
-            .map(|(_, driver)| driver.clone())
+            .map(|(_, _, driver)| driver.clone())
         {
             return driver.fork(turns_to_remove);
         }
@@ -1498,7 +1616,7 @@ impl WakuBackend {
                     .sessions
                     .lock()
                     .get(&source.id)
-                    .map(|(_, driver)| driver.clone())
+                    .map(|(_, _, driver)| driver.clone())
                 {
                     driver
                         .rollback(rollback_turns)?
@@ -1589,7 +1707,7 @@ impl WakuBackend {
             .sessions
             .lock()
             .get(&source.id)
-            .map(|(_, driver)| driver.clone())
+            .map(|(_, _, driver)| driver.clone())
         {
             return driver.rollback(rollback_turns);
         }

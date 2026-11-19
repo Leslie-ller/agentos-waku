@@ -48,7 +48,18 @@ updated_at: number,
  * Activity time of the newest turn. Set as soon as the user submits it,
  * then refreshed when the turn settles, whatever its outcome.
  */
-last_reply_at?: number | null, provider_cursor: ProviderResumeCursor | null, parked_cursors?: Array<ParkedProviderCursor>, pending_handoff_seed?: string | null,
+last_reply_at?: number | null, provider_cursor: ProviderResumeCursor | null,
+/**
+ * Native provider cursors parked when the user switched this task to
+ * another agent in place (`Codex -> Antigravity -> Codex`), enabling warm
+ * delta resume instead of starting a blank native thread on return.
+ */
+parked_cursors?: Array<ParkedProviderCursor>,
+/**
+ * Context digest queued for the next outbound provider turn after an
+ * in-place agent switch; cleared once delivered to the target driver.
+ */
+pending_handoff_seed?: string | null,
 /**
  * Slash commands the provider reported for this session's live process,
  * kept so a resumed session still completes them before its next

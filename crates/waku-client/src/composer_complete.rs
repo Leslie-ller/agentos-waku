@@ -141,18 +141,15 @@ pub enum GoalCommand {
     Set(String),
 }
 
-/// Parse the submitted text as Codex's native `/goal` command, which Waku
-/// bridges to `thread/goal/*`. `None` when it is not one — wrong provider,
-/// other text, or a project/user command that deliberately owns `/goal`
-/// (resolution precedence stands).
+/// Parse the submitted text as `/goal`, bridged either to Codex's native
+/// `thread/goal/*` or to AgentOS's companion persistent goal store for all
+/// AgentOS-managed providers. Returns `None` when it is not `/goal` or when a
+/// project/user command deliberately overrides `/goal`.
 pub fn parse_goal_submission(
     provider: ProviderKind,
     prompt: &str,
     commands: &[SlashCommand],
 ) -> Option<GoalCommand> {
-    if provider != ProviderKind::Codex {
-        return None;
-    }
     let invocation = prompt.trim().strip_prefix('/')?;
     let (name, arguments) = invocation
         .split_once(char::is_whitespace)
@@ -162,12 +159,23 @@ pub fn parse_goal_submission(
     if name != "goal" {
         return None;
     }
-    let goal_is_codex_builtin = commands.iter().any(|command| {
+    let overridden = commands.iter().any(|command| {
         command.name == "goal"
-            && command.scope == CommandScope::Builtin
-            && command.template.is_none()
+            && (command.scope != CommandScope::Builtin || command.template.is_some())
     });
-    if !goal_is_codex_builtin {
+    if overridden {
+        return None;
+    }
+    if provider == ProviderKind::Codex {
+        let goal_is_codex_builtin = commands.iter().any(|command| {
+            command.name == "goal"
+                && command.scope == CommandScope::Builtin
+                && command.template.is_none()
+        });
+        if !goal_is_codex_builtin {
+            return None;
+        }
+    } else if !provider.supports_in_place_handoff() {
         return None;
     }
     Some(match arguments {
@@ -546,21 +554,37 @@ mod tests {
     }
 
     #[test]
-    fn goal_command_is_codex_only_and_respects_overrides() {
+    fn goal_command_supports_agentos_providers_and_respects_overrides() {
         let builtin = command("goal", CommandScope::Builtin);
         assert_eq!(
             parse_goal_submission(
-                ProviderKind::Claude,
+                ProviderKind::Antigravity,
+                "/goal finish migration",
+                &[],
+            ),
+            Some(GoalCommand::Set("finish migration".into()))
+        );
+        assert_eq!(
+            parse_goal_submission(
+                ProviderKind::Codex,
                 "/goal",
                 std::slice::from_ref(&builtin)
             ),
-            None
+            Some(GoalCommand::Show)
         );
         // A project command deliberately owning /goal wins the collision.
         let mut project = command("goal", CommandScope::Project);
         project.template = Some("do project things".into());
         assert_eq!(
             parse_goal_submission(ProviderKind::Codex, "/goal", std::slice::from_ref(&project)),
+            None
+        );
+        assert_eq!(
+            parse_goal_submission(
+                ProviderKind::Antigravity,
+                "/goal",
+                std::slice::from_ref(&project)
+            ),
             None
         );
     }

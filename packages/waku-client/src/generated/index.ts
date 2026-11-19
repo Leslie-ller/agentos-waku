@@ -5,6 +5,7 @@ export type { ActivityFileChangeStatus } from "./ActivityFileChangeStatus";
 export type { ActivityItem } from "./ActivityItem";
 export type { ActivityKind } from "./ActivityKind";
 export type { AgentInvocation } from "./AgentInvocation";
+export type { AgentOsMcpSettings } from "./AgentOsMcpSettings";
 export type { AgentSession } from "./AgentSession";
 export type { AgentTurn } from "./AgentTurn";
 export type { AttachmentUpload } from "./AttachmentUpload";

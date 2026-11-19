@@ -585,6 +585,349 @@ impl Waku {
                         .child(toggle),
                 )
             })
+            .child(self.render_agentos_mcp_settings_card(theme, cx))
+            .child(self.render_agentos_storage_card(theme, cx))
+            .into_any_element()
+    }
+
+    fn render_agentos_mcp_settings_card(
+        &self,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mcp = self.state.agentos_mcp.clone();
+        let make_row = |id: &'static str,
+                        title: &'static str,
+                        description: &'static str,
+                        toggle: AnyElement| {
+            div()
+                .w_full()
+                .py(px(10.0))
+                .flex()
+                .items_center()
+                .gap(px(20.0))
+                .border_t_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_size(sp(13.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .mt(px(3.0))
+                                .text_size(sp(12.0))
+                                .line_height(sp(17.0))
+                                .text_color(theme.text_secondary)
+                                .child(description),
+                        ),
+                )
+                .child(div().id(id).child(toggle))
+        };
+
+        let memory_toggle = toggle_switch(
+            "agentos-mcp-memory-toggle",
+            mcp.memory_enabled,
+            false,
+            theme,
+            cx,
+            {
+                let next = !mcp.memory_enabled;
+                move |this, _, cx| {
+                    this.state.agentos_mcp.memory_enabled = next;
+                    this.save();
+                    cx.notify();
+                }
+            },
+        )
+        .into_any_element();
+
+        let goal_toggle = toggle_switch(
+            "agentos-mcp-goal-toggle",
+            mcp.goal_enabled,
+            false,
+            theme,
+            cx,
+            {
+                let next = !mcp.goal_enabled;
+                move |this, _, cx| {
+                    this.state.agentos_mcp.goal_enabled = next;
+                    this.save();
+                    cx.notify();
+                }
+            },
+        )
+        .into_any_element();
+
+        let advisor_toggle = toggle_switch(
+            "agentos-mcp-advisor-toggle",
+            mcp.advisor_enabled,
+            false,
+            theme,
+            cx,
+            {
+                let next = !mcp.advisor_enabled;
+                move |this, _, cx| {
+                    this.state.agentos_mcp.advisor_enabled = next;
+                    this.save();
+                    cx.notify();
+                }
+            },
+        )
+        .into_any_element();
+
+        let ask_toggle = toggle_switch(
+            "agentos-mcp-ask-toggle",
+            mcp.ask_user_enabled,
+            false,
+            theme,
+            cx,
+            {
+                let next = !mcp.ask_user_enabled;
+                move |this, _, cx| {
+                    this.state.agentos_mcp.ask_user_enabled = next;
+                    this.save();
+                    cx.notify();
+                }
+            },
+        )
+        .into_any_element();
+
+        let delegation_toggle = toggle_switch(
+            "agentos-mcp-delegation-toggle",
+            mcp.delegation_enabled,
+            false,
+            theme,
+            cx,
+            {
+                let next = !mcp.delegation_enabled;
+                move |this, _, cx| {
+                    this.state.agentos_mcp.delegation_enabled = next;
+                    this.save();
+                    cx.notify();
+                }
+            },
+        )
+        .into_any_element();
+
+        let sessions_toggle = toggle_switch(
+            "agentos-mcp-sessions-toggle",
+            mcp.session_info_enabled,
+            false,
+            theme,
+            cx,
+            {
+                let next = !mcp.session_info_enabled;
+                move |this, _, cx| {
+                    this.state.agentos_mcp.session_info_enabled = next;
+                    this.save();
+                    cx.notify();
+                }
+            },
+        )
+        .into_any_element();
+
+        let current_advisor = mcp.advisor_provider.clone();
+        let mut advisor_pills = div().mt(px(8.0)).flex().items_center().gap(px(8.0));
+        for (value, label) in [
+            ("auto", "Auto (Heterogeneous)"),
+            ("codex", "Codex"),
+            ("antigravity", "Antigravity"),
+        ] {
+            let active = current_advisor.eq_ignore_ascii_case(value);
+            let value_owned = value.to_owned();
+            advisor_pills = advisor_pills.child(
+                div()
+                    .id(SharedString::from(format!("agentos-advisor-pill-{value}")))
+                    .px(px(10.0))
+                    .py(px(5.0))
+                    .rounded(px(8.0))
+                    .cursor_pointer()
+                    .text_size(sp(12.0))
+                    .font_weight(if active {
+                        FontWeight::MEDIUM
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .bg(if active {
+                        theme.overlay_strong
+                    } else {
+                        theme.surface
+                    })
+                    .text_color(if active {
+                        theme.text
+                    } else {
+                        theme.text_secondary
+                    })
+                    .border_1()
+                    .border_color(if active {
+                        theme.border_strong
+                    } else {
+                        theme.border
+                    })
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.state.agentos_mcp.advisor_provider = value_owned.clone();
+                        this.save();
+                        cx.notify();
+                    })),
+            );
+        }
+
+        div()
+            .mt(px(15.0))
+            .w_full()
+            .px(px(20.0))
+            .py(px(14.0))
+            .rounded(px(13.0))
+            .bg(theme.raised)
+            .child(
+                div()
+                    .text_size(sp(13.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child("AgentOS Companion MCP (agentos-mcp)"),
+            )
+            .child(
+                div()
+                    .mt(px(4.0))
+                    .mb(px(10.0))
+                    .text_size(sp(12.0))
+                    .line_height(sp(17.0))
+                    .text_color(theme.text_secondary)
+                    .child("Control built-in Memory, Autonomous Goal Loop, Read-Only Advisor, Interactive Questions, and Delegation tools exposed to all connected agents."),
+            )
+            .child(make_row(
+                "row-mcp-memory",
+                "Task Memory & Context Rotation",
+                "Working notes, checkpoints, project knowledge, and automatic context rotation restore packages.",
+                memory_toggle,
+            ))
+            .child(make_row(
+                "row-mcp-goal",
+                "Persistent Goal Loop (/goal)",
+                "Enable create_goal / report_goal with budget enforcement and automatic multi-turn continuation across all agents.",
+                goal_toggle,
+            ))
+            .child(make_row(
+                "row-mcp-advisor",
+                "Read-Only Cross-Model Advisor (consult_advisor)",
+                "Consult an isolated hard read-only heterogeneous model for code, architecture, or design critique.",
+                advisor_toggle,
+            ))
+            .when(mcp.advisor_enabled, |card| {
+                card.child(
+                    div()
+                        .pb(px(10.0))
+                        .child(
+                            div()
+                                .text_size(sp(11.5))
+                                .text_color(theme.text_tertiary)
+                                .child("Default Advisor Target"),
+                        )
+                        .child(advisor_pills),
+                )
+            })
+            .child(make_row(
+                "row-mcp-ask",
+                "Interactive Questions (ask_user_question)",
+                "Render structured multiple-choice question cards natively for any connected agent.",
+                ask_toggle,
+            ))
+            .child(make_row(
+                "row-mcp-delegation",
+                "Multi-Agent Delegation (delegate_to_agent)",
+                "Allow spawning isolated Codex or Antigravity child workers (disabled by default for safety).",
+                delegation_toggle,
+            ))
+            .child(make_row(
+                "row-mcp-sessions",
+                "Cross-Session Lookup (get_session_info)",
+                "Allow agents to inspect referenced past sessions by UUID or migrated legacy ID.",
+                sessions_toggle,
+            ))
+            .into_any_element()
+    }
+
+    fn render_agentos_storage_card(
+        &self,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let data_dir = waku_protocol::identity::default_release_data_dir();
+        let data_dir_label = data_dir.to_string_lossy().into_owned();
+        let profiles_dir = std::env::var_os("AGENTOS_AGENT_PROFILES_DIR")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("agent-profiles"));
+        let profiles_label = profiles_dir.to_string_lossy().into_owned();
+        let data_dir_for_open = data_dir.clone();
+
+        div()
+            .mt(px(15.0))
+            .w_full()
+            .px(px(20.0))
+            .py(px(14.0))
+            .rounded(px(13.0))
+            .bg(theme.raised)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .text_size(sp(13.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child("AgentOS Data & Isolated Profiles"),
+                    )
+                    .when(cfg!(target_os = "macos"), |row| {
+                        row.child(
+                            div()
+                                .id("agentos-reveal-data-dir")
+                                .px(px(10.0))
+                                .py(px(5.0))
+                                .rounded(px(7.0))
+                                .cursor_pointer()
+                                .bg(theme.surface)
+                                .border_1()
+                                .border_color(theme.border)
+                                .hover(|el| el.bg(theme.overlay))
+                                .text_size(sp(12.0))
+                                .text_color(theme.text_secondary)
+                                .child("Reveal in Finder")
+                                .on_click(cx.listener(move |_, _, _, _| {
+                                    let _ = std::process::Command::new("open")
+                                        .arg(&data_dir_for_open)
+                                        .spawn();
+                                })),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .mt(px(8.0))
+                    .text_size(sp(12.0))
+                    .text_color(theme.text_secondary)
+                    .child(format!("Data directory (AGENTOS_WAKU_DATA_DIR): {data_dir_label}")),
+            )
+            .child(
+                div()
+                    .mt(px(4.0))
+                    .text_size(sp(12.0))
+                    .text_color(theme.text_secondary)
+                    .child(format!(
+                        "Agent profiles (AGENTOS_AGENT_PROFILES_DIR): {profiles_label}"
+                    )),
+            )
             .into_any_element()
     }
 

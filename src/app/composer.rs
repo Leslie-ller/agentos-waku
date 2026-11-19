@@ -850,7 +850,9 @@ impl Waku {
         let selected_model = session.and_then(|session| self.catalog_model_id_for_session(session));
         let selected_model_name = self.model_display_name(provider, selected_model);
         let locked_provider = session
-            .filter(|session| !session.messages.is_empty())
+            .filter(|session| {
+                !session.messages.is_empty() && !session.provider.supports_in_place_handoff()
+            })
             .map(|session| session.provider);
         let picker_enabled = session.is_some_and(|session| session.can_choose_model(provider));
 
@@ -1402,7 +1404,9 @@ impl Waku {
         }
         let locked_provider = self
             .selected_session()
-            .filter(|session| !session.messages.is_empty())
+            .filter(|session| {
+                !session.messages.is_empty() && !session.provider.supports_in_place_handoff()
+            })
             .map(|session| session.provider);
         let tabs = visible_picker_tabs(
             &self.probes,
@@ -1429,7 +1433,9 @@ impl Waku {
         let provider = session.map(|session| session.provider).unwrap_or_default();
         let selected_model = session.and_then(|session| self.catalog_model_id_for_session(session));
         let locked_provider = session
-            .filter(|session| !session.messages.is_empty())
+            .filter(|session| {
+                !session.messages.is_empty() && !session.provider.supports_in_place_handoff()
+            })
             .map(|session| session.provider);
         let index = visible_picker_models(
             &self.probes,

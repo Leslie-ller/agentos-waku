@@ -69,6 +69,10 @@ impl DaemonSettingsStore {
         })
     }
 
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn get(&self) -> DaemonSettings {
         self.settings.lock().clone()
     }

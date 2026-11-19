@@ -34,11 +34,18 @@ fn main() -> anyhow::Result<()> {
             .map(std::path::PathBuf::from)
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
+        let caller_provider = arguments
+            .mcp_caller_provider
+            .as_deref()
+            .and_then(|raw| serde_json::from_value(serde_json::Value::String(raw.to_owned())).ok());
+        let settings_path = arguments.mcp_settings.map(std::path::PathBuf::from);
         return waku_core::mcp_companion::run_stdio_mcp_server(
             waku_core::mcp_companion::McpContext {
                 session_id,
                 db_path,
                 cwd,
+                caller_provider,
+                settings_path,
             },
         );
     }
@@ -160,6 +167,8 @@ struct Arguments {
     mcp_session_id: Option<String>,
     mcp_db: Option<String>,
     mcp_cwd: Option<String>,
+    mcp_caller_provider: Option<String>,
+    mcp_settings: Option<String>,
 }
 
 impl Arguments {
@@ -173,6 +182,8 @@ impl Arguments {
         let mut mcp_session_id = None;
         let mut mcp_db = None;
         let mut mcp_cwd = None;
+        let mut mcp_caller_provider = None;
+        let mut mcp_settings = None;
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
@@ -198,6 +209,20 @@ impl Arguments {
                         arguments
                             .next()
                             .ok_or_else(|| anyhow!("--cwd requires a path"))?,
+                    );
+                }
+                "--caller-provider" => {
+                    mcp_caller_provider = Some(
+                        arguments
+                            .next()
+                            .ok_or_else(|| anyhow!("--caller-provider requires a provider id"))?,
+                    );
+                }
+                "--settings" => {
+                    mcp_settings = Some(
+                        arguments
+                            .next()
+                            .ok_or_else(|| anyhow!("--settings requires a path"))?,
                     );
                 }
                 "--bind" => {
@@ -252,6 +277,8 @@ impl Arguments {
             mcp_session_id,
             mcp_db,
             mcp_cwd,
+            mcp_caller_provider,
+            mcp_settings,
         })
     }
 }

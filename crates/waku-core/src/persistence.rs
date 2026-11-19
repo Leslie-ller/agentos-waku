@@ -487,6 +487,7 @@ impl PersistedState {
             computer_use_allowed_apps: self.computer_use_allowed_apps.clone(),
             disabled_providers: self.disabled_providers.clone(),
             provider_binary_overrides: self.provider_binary_overrides.clone(),
+            agentos_mcp: Default::default(),
             extra: self.daemon_settings_extra.clone(),
         }
     }

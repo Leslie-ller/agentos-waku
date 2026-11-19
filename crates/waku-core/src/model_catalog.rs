@@ -816,6 +816,9 @@ fn parse_deepseek_model_catalog(catalog: &Value) -> Vec<ProviderModel> {
 }
 
 fn discover_antigravity_models(binary: &Path) -> Vec<ProviderModel> {
+    if !crate::agent_profiles::antigravity_has_stored_credentials() {
+        return Vec::new();
+    }
     let Ok(cwd) = crate::acp_session::catalog_working_directory() else {
         return Vec::new();
     };
