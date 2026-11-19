@@ -26,7 +26,7 @@ pub fn provider_probe(provider: ProviderKind, binary_override: Option<&str>) -> 
 /// a newer `codex-cli` binary than older standalone `~/.local/bin/codex`
 /// installs; preferring the higher version ensures newly released models (such
 /// as GPT-6.2) are visible out of the box without manual override.
-fn find_codex_binary() -> Option<std::path::PathBuf> {
+pub(crate) fn find_codex_binary() -> Option<std::path::PathBuf> {
     let mut candidates = Vec::new();
     if let Some(path) = crate::command_env::find_executable(ProviderKind::Codex.command()) {
         candidates.push(path);

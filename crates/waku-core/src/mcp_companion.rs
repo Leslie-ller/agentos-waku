@@ -31,6 +31,28 @@ pub const MCP_SERVER_NAME: &str = "agentos-mcp";
 pub const MCP_BIN_ENV: &str = "AGENTOS_WAKU_MCP_BIN";
 pub const DISABLE_MCP_ENV: &str = "AGENTOS_WAKU_DISABLE_MCP";
 pub const AGENTOS_QUESTION_PREFIX: &str = "agentos-q:";
+pub const CODEX_ADVISOR_MODEL: &str = "gpt-6.2-sol";
+pub const ANTIGRAVITY_ADVISOR_MODEL: &str = "claude-opus-5-5";
+pub const ADVISOR_SYSTEM_PROMPT: &str = "\
+You are a read-only senior advisor consulted by another agent inside AgentOS for an independent \
+second opinion. Adapt your lens to the question:\n\
+- For engineering, architecture, or debugging: inspect relevant code/files, diagnose root \
+  causes, subtle concurrency/boundary bugs, or architectural trade-offs, and cite exact \
+  file/line references.\n\
+- For creative direction, visual/aesthetic critique, storyboarding, or planning: act as a \
+  discerning creative/art director — inspect referenced local images/contact sheets or drafts \
+  directly when paths are provided, call out generic, flat, or cliché choices, analyze \
+  composition, depth, lighting, pacing, and narrative tension, and propose concrete, memorable \
+  alternatives.\n\
+STRICT RULES:\n\
+- You are running in a STRICTLY READ-ONLY session. Never attempt to create, edit, delete, or \
+  modify files, git state, or system state.\n\
+- Do NOT ask the user questions or request approvals — your output goes back to the calling \
+  agent, not directly to the end user.\n\
+- Verify claims against actual files or local images in the workspace when paths are involved, \
+  keep exploration focused (a few targeted reads/searches at most), and keep your final advice \
+  concise (aim for 400–800 tokens): state the verdict/diagnosis first, then concrete steps, \
+  trade-offs, or creative improvements.";
 pub const MEMORY_MCP_INSTRUCTIONS: &str = "Persistent cross-session memory is available via memory_search (default scope=\"project\") and memory_read. Whenever the user references past state or behavior (e.g. 'before', 'last time', 'previously', 'still connected', 'again', '以前', '上次', '之前', '还在吗', '又...了', '连过', '配过'), or when troubleshooting devices, local network/SSH/proxy topology, credentials, deployment setup, or unexpected environment discrepancies, call memory_search(scope=\"project\") with 1-3 focused keywords BEFORE guessing or running broad diagnostics. Whenever the user's message mentions a past session link such as [Session title](agentos://session/<id>) or [Session title](codeg://session/<id>), call get_session_info(session_id=\"<id>\") to inspect its title, workspace, and recent transcript.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1373,21 +1395,16 @@ fn call_mcp_tool(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(str::to_owned);
+                .map(str::to_owned)
+                .or_else(|| default_advisor_model(advisor_provider).map(str::to_owned));
 
-            let mut prompt = String::from(
-                "You are a read-only senior technical and design advisor consulted by another AI agent.\n\
-                 HARD RULES:\n\
-                 1. Do NOT modify files, run destructive commands, or ask the user questions.\n\
-                 2. You may inspect workspace files read-only to verify facts.\n\
-                 3. Return concise, concrete, high-signal diagnosis and recommendations (~400-800 tokens).\n\n",
-            );
+            let mut prompt = format!("{ADVISOR_SYSTEM_PROMPT}\n\n");
             prompt.push_str(&format!("Question:\n{question}\n"));
             if let Some(extra) = context {
                 prompt.push_str(&format!("\nContext & hypotheses:\n{extra}\n"));
             }
             if !files.is_empty() {
-                prompt.push_str("\nRelevant workspace paths to inspect:\n");
+                prompt.push_str("\nRelevant local workspace files / images to inspect:\n");
                 for f in &files {
                     prompt.push_str(&format!("- {f}\n"));
                 }
@@ -1668,6 +1685,14 @@ fn call_mcp_tool(
     }
 }
 
+pub(crate) fn default_advisor_model(provider: ProviderKind) -> Option<&'static str> {
+    match provider {
+        ProviderKind::Codex => Some(CODEX_ADVISOR_MODEL),
+        ProviderKind::Antigravity => Some(ANTIGRAVITY_ADVISOR_MODEL),
+        _ => None,
+    }
+}
+
 pub(crate) fn resolve_advisor_provider(
     requested: &str,
     caller: Option<ProviderKind>,
@@ -1678,8 +1703,7 @@ pub(crate) fn resolve_advisor_provider(
         "" | "auto" => {
             let agy_ready = crate::agent_profiles::find_antigravity_binary().is_some()
                 && crate::agent_profiles::antigravity_has_stored_credentials();
-            let codex_ready = crate::command_env::find_executable(ProviderKind::Codex.command())
-                .is_some();
+            let codex_ready = crate::model::find_codex_binary().is_some();
             match caller {
                 Some(ProviderKind::Codex) => {
                     if agy_ready {
@@ -1732,6 +1756,50 @@ fn run_isolated_oneshot_agent(
     }
 }
 
+fn build_codex_oneshot_args(cwd: &Path, model: Option<&str>, read_only: bool) -> Vec<String> {
+    let mut args = vec![
+        "-c".to_owned(),
+        "approval_policy=\"never\"".to_owned(),
+        "-c".to_owned(),
+        "cli_auth_credentials_store=\"file\"".to_owned(),
+    ];
+    if read_only {
+        args.extend([
+            "-c".to_owned(),
+            "features.view_image=true".to_owned(),
+            "-c".to_owned(),
+            "include_apply_patch_tool=false".to_owned(),
+            "-c".to_owned(),
+            "web_search=\"disabled\"".to_owned(),
+            "-c".to_owned(),
+            "features.hooks=false".to_owned(),
+            "-c".to_owned(),
+            "features.plugins=false".to_owned(),
+            "-c".to_owned(),
+            "features.apps=false".to_owned(),
+            "-c".to_owned(),
+            "features.multi_agent=false".to_owned(),
+        ]);
+    }
+    args.extend([
+        "exec".to_owned(),
+        "--json".to_owned(),
+        "--skip-git-repo-check".to_owned(),
+        "--sandbox".to_owned(),
+        if read_only {
+            "read-only".to_owned()
+        } else {
+            "workspace-write".to_owned()
+        },
+        "-C".to_owned(),
+        cwd.to_string_lossy().into_owned(),
+    ]);
+    if let Some(model) = model {
+        args.extend(["-m".to_owned(), model.to_owned()]);
+    }
+    args
+}
+
 fn run_isolated_codex_oneshot(
     cwd: &Path,
     prompt: &str,
@@ -1740,26 +1808,11 @@ fn run_isolated_codex_oneshot(
     timeout: Duration,
     on_pid: Option<Box<dyn FnOnce(u32) + Send>>,
 ) -> anyhow::Result<String> {
-    let binary = crate::command_env::find_executable(ProviderKind::Codex.command())
-        .ok_or_else(|| anyhow!("codex CLI not found in PATH"))?;
+    let binary = crate::model::find_codex_binary()
+        .ok_or_else(|| anyhow!("codex CLI not found in PATH or ChatGPT.app"))?;
     let mut cmd = ProcessCommand::new(&binary);
     crate::agent_profiles::apply_to_command(ProviderKind::Codex, &mut cmd)?;
-    cmd.args([
-        "-c",
-        "approval_policy=\"never\"",
-        "-c",
-        "cli_auth_credentials_store=\"file\"",
-        "exec",
-        "--json",
-        "--skip-git-repo-check",
-        "--sandbox",
-        if read_only { "read-only" } else { "workspace-write" },
-        "-C",
-    ])
-    .arg(cwd);
-    if let Some(model) = model {
-        cmd.args(["-m", model]);
-    }
+    cmd.args(build_codex_oneshot_args(cwd, model, read_only));
     cmd.arg(prompt)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1885,7 +1938,7 @@ fn run_isolated_antigravity_oneshot(
                     .pointer("/params/toolCall/kind")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let allow_read = read_only && matches!(kind, "read" | "search" | "fetch");
+                let allow_read = read_only && matches!(kind, "read" | "search");
                 let allow_any = !read_only;
                 let outcome = if allow_read || allow_any {
                     msg.pointer("/params/options")
@@ -3397,12 +3450,18 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
     if settings.advisor_enabled {
         tools.push(json!({
             "name": "consult_advisor",
-            "description": "Consult an isolated, hard read-only heterogeneous advisor model for diagnosis, architecture review, or creative critique without modifying workspace files.",
+            "description": "Consult a read-only senior advisor agent (defaulting to heterogeneous Codex gpt-6.2-sol <-> Antigravity claude-opus-5-5) for an independent second opinion on complex architecture, subtle multi-file bugs, repeated failures, or risky changes, AS WELL AS creative direction, visual/aesthetic critique (inspecting local contact sheets, screenshots, UI previews, or storyboards), and non-code planning. SYNCHRONOUS & STRICTLY READ-ONLY: the advisor can read/search local files and view local images directly, and cannot browse the web, edit files, run mutating commands, or talk to the user.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "question": { "type": "string" },
-                    "context": { "type": "string" },
+                    "question": {
+                        "type": "string",
+                        "description": "The specific architectural trade-off, debugging hypothesis, code-review question, or creative/aesthetic/planning critique to ask the advisor."
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Optional concise background: relevant file or local image/contact-sheet paths, user preferences/aesthetic criteria, approaches already tried, or short error snippets."
+                    },
                     "files": { "type": "array", "items": { "type": "string" } },
                     "advisor_provider": { "type": "string", "enum": ["auto", "codex", "antigravity"] },
                     "model": { "type": "string" },
@@ -4577,5 +4636,24 @@ mod tests {
         assert!(snap3.checkpoints.is_empty());
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn advisor_defaults_match_age180_creative_and_readonly_isolation() {
+        assert_eq!(default_advisor_model(ProviderKind::Codex), Some("gpt-6.2-sol"));
+        assert_eq!(
+            default_advisor_model(ProviderKind::Antigravity),
+            Some("claude-opus-5-5")
+        );
+        assert!(ADVISOR_SYSTEM_PROMPT.contains("creative/art director"));
+        assert!(ADVISOR_SYSTEM_PROMPT.contains("local images/contact sheets"));
+
+        let ro_args = build_codex_oneshot_args(Path::new("/tmp/ws"), Some("gpt-6.2-sol"), true);
+        assert!(ro_args.iter().any(|a| a == "features.view_image=true"));
+        assert!(ro_args.iter().any(|a| a == "include_apply_patch_tool=false"));
+        assert!(ro_args.iter().any(|a| a == "web_search=\"disabled\""));
+        assert!(ro_args.iter().any(|a| a == "features.multi_agent=false"));
+        assert!(ro_args.iter().any(|a| a == "read-only"));
+        assert!(ro_args.windows(2).any(|w| w == ["-m", "gpt-6.2-sol"]));
     }
 }
