@@ -73,14 +73,18 @@ struct AcpLaunch {
     env: Vec<(String, String)>,
 }
 
-fn launch_for(provider: ProviderKind, reasoning_effort: Option<&str>) -> anyhow::Result<AcpLaunch> {
+fn launch_for(
+    provider: ProviderKind,
+    binary: &Path,
+    mode: RuntimeMode,
+    reasoning_effort: Option<&str>,
+) -> anyhow::Result<AcpLaunch> {
     match provider {
         ProviderKind::Antigravity => {
-            let args = if cfg!(target_os = "linux") {
-                vec!["--uid=".into()]
-            } else {
-                Vec::new()
-            };
+            let args = crate::agent_profiles::antigravity_acp_launch_args(
+                binary,
+                mode == RuntimeMode::FullAccess,
+            )?;
             Ok(AcpLaunch {
                 args,
                 env: Vec::new(),
@@ -164,7 +168,7 @@ impl AcpDriver {
             None => None,
         };
 
-        let launch = launch_for(provider, reasoning_effort.as_deref())?;
+        let launch = launch_for(provider, &binary, mode, reasoning_effort.as_deref())?;
         let computer_use = (provider == ProviderKind::Grok && computer_use_enabled)
             .then(|| super::support::HeadlessComputerUseRuntime::start(provider, events.clone()))
             .transpose()?;
@@ -299,7 +303,7 @@ pub(crate) fn catalog_agent(
     binary: &Path,
     cwd: &Path,
 ) -> anyhow::Result<AcpAgent> {
-    let launch = launch_for(provider, None)?;
+    let launch = launch_for(provider, binary, RuntimeMode::Ask, None)?;
     sdk_agent(
         provider,
         binary,
@@ -823,8 +827,9 @@ fn desired_access_mode(
     let desired = if provider == ProviderKind::Antigravity {
         let candidates: &[&str] = match mode {
             RuntimeMode::Ask => &["default"],
-            RuntimeMode::AutoAcceptEdits => &["auto_edit", "default"],
-            RuntimeMode::Auto | RuntimeMode::FullAccess => &["yolo", "auto_edit", "default"],
+            RuntimeMode::AutoAcceptEdits => &["accept-edits", "auto_edit", "default"],
+            RuntimeMode::Auto => &["auto", "yolo", "accept-edits", "auto_edit", "default"],
+            RuntimeMode::FullAccess => &["yolo", "auto", "accept-edits", "auto_edit", "default"],
         };
         candidates
             .iter()
@@ -2426,7 +2431,7 @@ mod tests {
 
     #[test]
     fn fx_launches_its_documented_acp_subcommand() {
-        let launch = launch_for(ProviderKind::Fx, None).unwrap();
+        let launch = launch_for(ProviderKind::Fx, Path::new("fx"), RuntimeMode::Ask, None).unwrap();
         assert_eq!(launch.args, ["acp"]);
         assert!(launch.env.is_empty());
     }
@@ -2757,12 +2762,19 @@ mod tests {
 
     #[test]
     fn grok_launch_passes_reasoning_effort_before_stdio() {
-        let launch = launch_for(ProviderKind::Grok, Some("xhigh")).unwrap();
+        let launch = launch_for(
+            ProviderKind::Grok,
+            Path::new("grok"),
+            RuntimeMode::Ask,
+            Some("xhigh"),
+        )
+        .unwrap();
         assert_eq!(
             launch.args,
             ["agent", "--reasoning-effort", "xhigh", "stdio"]
         );
-        let bare = launch_for(ProviderKind::Grok, None).unwrap();
+        let bare =
+            launch_for(ProviderKind::Grok, Path::new("grok"), RuntimeMode::Ask, None).unwrap();
         assert_eq!(bare.args, ["agent", "stdio"]);
     }
 
@@ -2980,18 +2992,54 @@ mod tests {
 
     #[test]
     fn antigravity_launch_and_access_modes_follow_acp_contract() {
-        let launch = launch_for(ProviderKind::Antigravity, Some("low")).unwrap();
+        let legacy_launch = launch_for(
+            ProviderKind::Antigravity,
+            Path::new("/cache/agy_acp_server.par"),
+            RuntimeMode::FullAccess,
+            Some("low"),
+        )
+        .unwrap();
         if cfg!(target_os = "linux") {
-            assert_eq!(launch.args, ["--uid="]);
+            assert_eq!(legacy_launch.args, ["--uid="]);
         } else {
-            assert!(launch.args.is_empty());
+            assert!(legacy_launch.args.is_empty());
         }
+
+        let cli_ask = launch_for(
+            ProviderKind::Antigravity,
+            Path::new("/usr/local/bin/agy"),
+            RuntimeMode::Ask,
+            Some("low"),
+        )
+        .unwrap();
+        assert_eq!(cli_ask.args.first().map(String::as_str), Some("acp"));
+        assert!(cli_ask.args.iter().any(|arg| arg == "--process-per-session"));
+        assert!(cli_ask.args.iter().any(|arg| arg == "--gemini-dir"));
+        assert!(cli_ask.args.iter().any(|arg| arg == "--app-data-dir"));
+        assert!(!cli_ask
+            .args
+            .iter()
+            .any(|arg| arg == "--dangerously-skip-permissions"));
+
+        let cli_yolo = launch_for(
+            ProviderKind::Antigravity,
+            Path::new("/usr/local/bin/agy"),
+            RuntimeMode::FullAccess,
+            Some("low"),
+        )
+        .unwrap();
+        assert!(cli_yolo
+            .args
+            .iter()
+            .any(|arg| arg == "--dangerously-skip-permissions"));
+
         assert_eq!(
             reasoning_effort_config_id(ProviderKind::Antigravity),
             "thinking_level"
         );
 
-        let modes: SessionModeState = serde_json::from_value(json!({
+        // Legacy agy_acp_server.par mode set
+        let legacy_modes: SessionModeState = serde_json::from_value(json!({
             "currentModeId": "default",
             "availableModes": [
                 {"id": "default", "name": "Default"},
@@ -3001,13 +3049,17 @@ mod tests {
         }))
         .unwrap();
         assert!(
-            desired_access_mode(ProviderKind::Antigravity, Some(&modes), RuntimeMode::Ask)
-                .is_none()
+            desired_access_mode(
+                ProviderKind::Antigravity,
+                Some(&legacy_modes),
+                RuntimeMode::Ask
+            )
+            .is_none()
         );
         assert_eq!(
             desired_access_mode(
                 ProviderKind::Antigravity,
-                Some(&modes),
+                Some(&legacy_modes),
                 RuntimeMode::AutoAcceptEdits
             )
             .map(|id| id.to_string()),
@@ -3016,11 +3068,54 @@ mod tests {
         assert_eq!(
             desired_access_mode(
                 ProviderKind::Antigravity,
-                Some(&modes),
+                Some(&legacy_modes),
                 RuntimeMode::FullAccess
             )
             .map(|id| id.to_string()),
             Some("yolo".into())
+        );
+
+        // Official agy Go CLI 1.5.x mode set (yolo omitted; auto & accept-edits advertised)
+        let cli_modes: SessionModeState = serde_json::from_value(json!({
+            "currentModeId": "default",
+            "availableModes": [
+                {"id": "default", "name": "Default"},
+                {"id": "auto", "name": "Auto"},
+                {"id": "accept-edits", "name": "Accept Edits"},
+                {"id": "plan", "name": "Plan"}
+            ]
+        }))
+        .unwrap();
+        assert!(
+            desired_access_mode(ProviderKind::Antigravity, Some(&cli_modes), RuntimeMode::Ask)
+                .is_none()
+        );
+        assert_eq!(
+            desired_access_mode(
+                ProviderKind::Antigravity,
+                Some(&cli_modes),
+                RuntimeMode::AutoAcceptEdits
+            )
+            .map(|id| id.to_string()),
+            Some("accept-edits".into())
+        );
+        assert_eq!(
+            desired_access_mode(
+                ProviderKind::Antigravity,
+                Some(&cli_modes),
+                RuntimeMode::Auto
+            )
+            .map(|id| id.to_string()),
+            Some("auto".into())
+        );
+        assert_eq!(
+            desired_access_mode(
+                ProviderKind::Antigravity,
+                Some(&cli_modes),
+                RuntimeMode::FullAccess
+            )
+            .map(|id| id.to_string()),
+            Some("auto".into())
         );
     }
 

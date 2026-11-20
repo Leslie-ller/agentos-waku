@@ -1874,12 +1874,14 @@ fn run_isolated_antigravity_oneshot(
     on_pid: Option<Box<dyn FnOnce(u32) + Send>>,
 ) -> anyhow::Result<String> {
     let binary = crate::agent_profiles::find_antigravity_binary()
-        .ok_or_else(|| anyhow!("Antigravity ACP binary (agy_acp_server.par) not found"))?;
+        .ok_or_else(|| anyhow!("Antigravity ACP binary (agy / agy_acp_server.par) not found"))?;
     if !crate::agent_profiles::antigravity_has_stored_credentials() {
         anyhow::bail!("Antigravity isolated profile is not signed in (missing acp_token.json)");
     }
+    let launch_args = crate::agent_profiles::antigravity_acp_launch_args(&binary, !read_only)?;
     let mut cmd = ProcessCommand::new(&binary);
     crate::agent_profiles::apply_to_command(ProviderKind::Antigravity, &mut cmd)?;
+    cmd.args(launch_args);
     cmd.current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

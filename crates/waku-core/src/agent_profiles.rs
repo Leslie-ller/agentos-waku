@@ -440,9 +440,85 @@ fn antigravity_entry_and_sibling() -> (&'static str, &'static str) {
     }
 }
 
-/// Locates Google Antigravity's first-party ACP server (`agy_acp_server.par` /
-/// `agy_acp_server.exe`), checking explicit env overrides, `PATH`, and managed
-/// `acp-binaries/antigravity-acp/<version>/<platform>` caches.
+/// Returns `true` when `binary` points to Google's official Antigravity Go CLI
+/// (`agy` / `agy.exe`), as opposed to the legacy standalone `agy_acp_server.par`
+/// bundle or custom ACP stubs.
+pub fn is_antigravity_cli_binary(binary: &Path) -> bool {
+    binary
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("agy"))
+}
+
+/// Builds the ACP argv for Google's `agy` Go CLI given an absolute isolated
+/// profile directory (`--gemini-dir`).
+///
+/// The Go CLI ignores `GEMINI_HOME` and omits `yolo` from its ACP session mode
+/// list, so profile isolation (`--gemini-dir` + relative `--app-data-dir`) and
+/// native YOLO (`--dangerously-skip-permissions`) must be passed at launch.
+pub fn antigravity_cli_args_for_profile(
+    profile_dir: &Path,
+    yolo: bool,
+) -> anyhow::Result<Vec<String>> {
+    if !profile_dir.is_absolute() {
+        bail!(
+            "Antigravity CLI profile directory must be absolute (got {})",
+            profile_dir.display()
+        );
+    }
+    let mut args = vec![
+        "acp".to_owned(),
+        "--process-per-session".to_owned(),
+        "--gemini-dir".to_owned(),
+        profile_dir.to_string_lossy().into_owned(),
+        "--app-data-dir".to_owned(),
+        "antigravity-acp".to_owned(),
+    ];
+    if yolo {
+        args.push("--dangerously-skip-permissions".to_owned());
+    }
+    Ok(args)
+}
+
+/// Builds the ACP launch arguments for either the official `agy` Go CLI or the
+/// legacy standalone `agy_acp_server.par` binary.
+pub fn antigravity_acp_launch_args(binary: &Path, yolo: bool) -> anyhow::Result<Vec<String>> {
+    if is_antigravity_cli_binary(binary) {
+        let profile = resolve_isolated_profile(ProviderKind::Antigravity)?.ok_or_else(|| {
+            anyhow!("Antigravity CLI requires an isolated AgentOS profile directory")
+        })?;
+        return antigravity_cli_args_for_profile(&profile.directory, yolo);
+    }
+
+    if cfg!(target_os = "linux") {
+        Ok(vec!["--uid=".to_owned()])
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Locates Google Antigravity's ACP runtime, preferring explicit env overrides,
+/// then Google's official `agy` Go CLI (`agy` on `PATH` or standard user/brew
+/// install paths), then legacy `antigravity` / `antigravity-acp` binaries and
+/// managed `acp-binaries/antigravity-acp/<version>/<platform>` caches.
 pub fn find_antigravity_binary() -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os(ANTIGRAVITY_ACP_BIN_ENV)
         .map(|value| value.to_string_lossy().into_owned())
@@ -450,6 +526,34 @@ pub fn find_antigravity_binary() -> Option<PathBuf> {
         && let Some(resolved) = crate::command_env::resolve_binary_override(&explicit)
     {
         return Some(resolved);
+    }
+
+    if let Some(found) = crate::command_env::find_executable("agy") {
+        return Some(found);
+    }
+
+    #[cfg(unix)]
+    {
+        let mut cli_candidates = Vec::new();
+        if let Some(home) = dirs::home_dir() {
+            cli_candidates.push(home.join(".local/bin/agy"));
+        }
+        cli_candidates.push(PathBuf::from("/opt/homebrew/bin/agy"));
+        cli_candidates.push(PathBuf::from("/usr/local/bin/agy"));
+        for candidate in cli_candidates {
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(home) = dirs::home_dir() {
+            let candidate = home.join(".local").join("bin").join("agy.exe");
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
     }
 
     for cmd in [ProviderKind::Antigravity.command(), "antigravity-acp"] {
@@ -516,12 +620,26 @@ fn compare_version_tags(a: &str, b: &str) -> Ordering {
     parse_parts(a).cmp(&parse_parts(b)).then_with(|| a.cmp(b))
 }
 
-/// Probes Antigravity's version without invoking `--version` (which hangs
-/// because `agy_acp_server.par` speaks ACP JSON-RPC over stdio rather than CLI
-/// flags). Extracts the version from managed cache paths first and falls back
-/// to a bounded ACP `initialize` handshake.
+/// Probes Antigravity's version. Uses `agy --version` directly for the Go CLI,
+/// while avoiding `--version` on legacy `agy_acp_server.par` (which hangs on
+/// stdio) by checking managed cache paths first and falling back to a bounded
+/// ACP `initialize` handshake.
 pub fn probe_antigravity_version(binary: &Path) -> Option<String> {
-    if let Some(version_os) = binary.parent().and_then(Path::parent).and_then(Path::file_name) {
+    if is_antigravity_cli_binary(binary) {
+        if let Ok(output) = Command::new(binary).arg("--version").output()
+            && output.status.success()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some(parsed) = waku_protocol::model::parse_cli_version(text.trim()) {
+                return Some(parsed);
+            }
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_owned());
+            }
+        }
+    } else if let Some(version_os) = binary.parent().and_then(Path::parent).and_then(Path::file_name)
+    {
         let candidate = version_os.to_string_lossy();
         if let Some(parsed) = waku_protocol::model::parse_cli_version(&candidate) {
             return Some(parsed);
@@ -693,5 +811,39 @@ mod tests {
         assert_eq!(found, cache.join("1.4.5/darwin-aarch64").join(entry));
         assert_eq!(probe_antigravity_version(&found).as_deref(), Some("1.4.5"));
         let _ = fs::remove_dir_all(sandbox);
+    }
+
+    #[test]
+    fn antigravity_cli_args_require_absolute_profile_and_gate_yolo_flag() {
+        assert!(is_antigravity_cli_binary(Path::new("/Users/test/.local/bin/agy")));
+        assert!(is_antigravity_cli_binary(Path::new("C:\\bin\\agy.exe")));
+        assert!(!is_antigravity_cli_binary(Path::new("/cache/agy_acp_server.par")));
+        assert!(!is_antigravity_cli_binary(Path::new("/tmp/fake_agy_acp.py")));
+
+        assert!(antigravity_cli_args_for_profile(Path::new("relative/profile"), false).is_err());
+
+        let abs = if cfg!(windows) {
+            PathBuf::from(r"C:\agentos\profiles\antigravity")
+        } else {
+            PathBuf::from("/agentos/profiles/antigravity")
+        };
+        let non_yolo = antigravity_cli_args_for_profile(&abs, false).unwrap();
+        assert_eq!(
+            non_yolo,
+            vec![
+                "acp",
+                "--process-per-session",
+                "--gemini-dir",
+                abs.to_str().unwrap(),
+                "--app-data-dir",
+                "antigravity-acp",
+            ]
+        );
+        let yolo = antigravity_cli_args_for_profile(&abs, true).unwrap();
+        assert_eq!(
+            yolo.last().map(String::as_str),
+            Some("--dangerously-skip-permissions")
+        );
+        assert_eq!(yolo.len(), non_yolo.len() + 1);
     }
 }
