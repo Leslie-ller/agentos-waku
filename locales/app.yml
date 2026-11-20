@@ -2265,6 +2265,6 @@ daemon.copy_pairing_link:
 daemon.refresh_endpoints:
   en: Refresh IPs
 daemon.qr_hint:
-  en: Token is embedded in the URL fragment (#token=…) and cleared from the address bar immediately after pairing.
+  en: "Token is embedded in the URL fragment (#token=…) and cleared from the address bar immediately after pairing."
 web.pairing_tip:
-  en: Tip: Enable Daemon Exposure in desktop Settings → Daemon and scan the QR code to connect in one tap, then use "Add to Home Screen" for a full-screen app experience.
+  en: "Tip: Enable Daemon Exposure in desktop Settings → Daemon and scan the QR code to connect in one tap, then use \"Add to Home Screen\" for a full-screen app experience."
