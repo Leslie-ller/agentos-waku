@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::{
@@ -43,7 +44,7 @@ fn trim_resident_transcripts(state: &mut PersistedState, pinned: &HashSet<Uuid>)
 }
 
 pub struct WakuBackend {
-    sessions: Mutex<HashMap<Uuid, (Uuid, ProviderKind, DriverHandle)>>,
+    sessions: Mutex<HashMap<Uuid, (Uuid, ProviderKind, DriverHandle, Arc<AtomicBool>)>>,
     terminals: Mutex<HashMap<Uuid, (Uuid, crate::terminal::DaemonTerminal)>>,
     #[cfg(all(test, unix))]
     terminal_shell: Option<alacritty_terminal::tty::Shell>,
@@ -229,7 +230,7 @@ impl Backend for WakuBackend {
         match request.command {
             Command::AttachSession => {
                 let sessions = self.sessions.lock();
-                let Some((runtime_id, _, driver)) = sessions.get(&session_id) else {
+                let Some((runtime_id, _, driver, _)) = sessions.get(&session_id) else {
                     return Ok(ResponsePayload::SessionRuntime {
                         runtime_id: None,
                         supports_steer: false,
@@ -904,6 +905,8 @@ impl Backend for WakuBackend {
                 let supports_steer = handle.supports_steer();
                 let db_path_for_loop = self.task_store.path().to_path_buf();
                 let driver_for_loop = handle.clone();
+                let turn_active = Arc::new(AtomicBool::new(false));
+                let turn_active_for_loop = turn_active.clone();
                 std::thread::Builder::new()
                     .name(format!("waku-daemon-events-{session_id}"))
                     .spawn(move || {
@@ -928,6 +931,17 @@ impl Backend for WakuBackend {
                             match event_receiver.recv_timeout(std::time::Duration::from_millis(250))
                             {
                                 Ok(event) => {
+                                    match &event {
+                                        DriverEvent::TurnStarted => {
+                                            turn_active_for_loop.store(true, Ordering::Release);
+                                        }
+                                        DriverEvent::TurnFinished { .. } => {
+                                            turn_active_for_loop.store(false, Ordering::Release);
+                                        }
+                                        _ => {}
+                                    }
+                                    let turn_finished =
+                                        matches!(&event, DriverEvent::TurnFinished { .. });
                                     let turn_succeeded = matches!(
                                         &event,
                                         DriverEvent::TurnFinished { success: true, .. }
@@ -973,7 +987,19 @@ impl Backend for WakuBackend {
                                         {
                                             let _ = events.send(submit_wire);
                                         }
+                                        turn_active_for_loop.store(true, Ordering::Release);
                                         driver_for_loop.prompt(prompt_to_send);
+                                    } else if turn_finished && provider != ProviderKind::Codex {
+                                        if let Ok(Some(goal)) =
+                                            crate::mcp_companion::current_session_goal(
+                                                &db_path_for_loop,
+                                                session_id,
+                                            )
+                                            && let Ok(goal_wire) =
+                                                event_to_wire(DriverEvent::GoalUpdated(Some(goal)))
+                                        {
+                                            let _ = events.send(goal_wire);
+                                        }
                                     }
                                 }
                                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -984,7 +1010,7 @@ impl Backend for WakuBackend {
                     .context("could not start daemon event forwarding thread")?;
                 self.sessions
                     .lock()
-                    .insert(session_id, (runtime_id, provider, handle));
+                    .insert(session_id, (runtime_id, provider, handle, turn_active));
                 Ok(ResponsePayload::Started { supports_steer })
             }
             Command::CloseSession => {
@@ -998,7 +1024,9 @@ impl Backend for WakuBackend {
                     let mut sessions = self.sessions.lock();
                     sessions
                         .get(&session_id)
-                        .is_some_and(|(active_runtime_id, _, _)| *active_runtime_id == runtime_id)
+                        .is_some_and(|(active_runtime_id, _, _, _)| {
+                            *active_runtime_id == runtime_id
+                        })
                         .then(|| sessions.remove(&session_id))
                         .flatten()
                 };
@@ -1006,9 +1034,9 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::Ack)
             }
             command => {
-                let (provider, driver) = {
+                let (provider, driver, turn_active) = {
                     let sessions = self.sessions.lock();
-                    let (active_runtime_id, active_provider, driver) = sessions
+                    let (active_runtime_id, active_provider, driver, turn_active) = sessions
                         .get(&session_id)
                         .ok_or_else(|| anyhow!("daemon session {session_id} is not running"))?;
                     if *active_runtime_id != runtime_id {
@@ -1016,19 +1044,26 @@ impl Backend for WakuBackend {
                             "daemon session {session_id} belongs to runtime {active_runtime_id}, not {runtime_id}"
                         );
                     }
-                    (*active_provider, driver.clone())
+                    (*active_provider, driver.clone(), turn_active.clone())
                 };
                 let mut command = command;
                 match &command {
                     Command::Cancel => {
+                        turn_active.store(false, Ordering::Release);
                         let _ = crate::mcp_companion::cancel_pending_questions(
                             self.task_store.path(),
                             session_id,
                         );
-                        let _ = crate::mcp_companion::pause_active_goal_on_cancel(
-                            self.task_store.path(),
-                            session_id,
-                        );
+                        if let Ok(Some(paused_goal)) =
+                            crate::mcp_companion::pause_active_goal_on_cancel(
+                                self.task_store.path(),
+                                session_id,
+                            )
+                            && provider != ProviderKind::Codex
+                        {
+                            let _ = events
+                                .send(event_to_wire(DriverEvent::GoalUpdated(Some(paused_goal)))?);
+                        }
                     }
                     Command::RespondUserInput {
                         request_id,
@@ -1046,12 +1081,18 @@ impl Backend for WakuBackend {
                         return Ok(ResponsePayload::Ack);
                     }
                     Command::Goal { operation } if provider != ProviderKind::Codex => {
-                        let updated_goal = crate::mcp_companion::apply_host_goal_operation(
-                            self.task_store.path(),
-                            session_id,
-                            operation.clone(),
-                        )?;
+                        let (updated_goal, pursuit_prompt) =
+                            crate::mcp_companion::apply_host_goal_operation_with_prompt(
+                                self.task_store.path(),
+                                session_id,
+                                operation.clone(),
+                            )?;
                         events.send(event_to_wire(DriverEvent::GoalUpdated(updated_goal))?)?;
+                        if let Some(prompt_text) = pursuit_prompt
+                            && !turn_active.swap(true, Ordering::AcqRel)
+                        {
+                            driver.prompt(prompt_text);
+                        }
                         return Ok(ResponsePayload::Ack);
                     }
                     _ => {}
@@ -1062,6 +1103,7 @@ impl Backend for WakuBackend {
                     message_id,
                 } = &mut command
                 {
+                    turn_active.store(true, Ordering::Release);
                     // Publish the user's clean prompt into the runtime event
                     // stream before prepending any one-shot cross-agent handoff
                     // digest or context-rotation restore package.

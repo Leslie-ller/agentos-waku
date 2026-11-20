@@ -1039,7 +1039,7 @@ fn call_mcp_tool(
                     conn.execute(
                         "UPDATE agentos_goals
                          SET status = 'blocked',
-                             last_reported_status = 'blocked',
+                             last_reported_status = 'budget_exhausted',
                              last_reason = ?1,
                              updated_at = ?2
                          WHERE run_id = ?3 AND current_turn_id = ?4",
@@ -2526,7 +2526,7 @@ pub fn take_pending_goal_continuation(
         || max_seconds.is_some_and(|limit| elapsed >= limit)
     {
         let _ = conn.execute(
-            "UPDATE agentos_goals SET status = 'blocked', last_reported_status = 'blocked', updated_at = ?1 WHERE run_id = ?2",
+            "UPDATE agentos_goals SET status = 'blocked', last_reported_status = 'budget_exhausted', updated_at = ?1 WHERE run_id = ?2",
             params![now, run_id],
         );
         return Ok(None);
@@ -2558,24 +2558,119 @@ pub fn take_pending_goal_continuation(
     Ok(Some((goal, prompt)))
 }
 
-pub fn pause_active_goal_on_cancel(db_path: &Path, session_id: Uuid) -> anyhow::Result<()> {
+fn thread_goal_from_row(
+    objective: String,
+    status: &str,
+    last_reported_status: Option<&str>,
+    created_at: i64,
+    updated_at: i64,
+    now: i64,
+) -> Option<ThreadGoal> {
+    if matches!(last_reported_status, Some("cleared" | "replaced")) {
+        return None;
+    }
+    let goal_status = match status {
+        "complete" => ThreadGoalStatus::Complete,
+        "blocked" => match last_reported_status {
+            Some("budget_exhausted") => ThreadGoalStatus::BudgetLimited,
+            Some("paused" | "cancelled") => ThreadGoalStatus::Paused,
+            _ => ThreadGoalStatus::Blocked,
+        },
+        _ => ThreadGoalStatus::Active,
+    };
+    let elapsed_end = if goal_status == ThreadGoalStatus::Active {
+        now
+    } else {
+        updated_at
+    };
+    Some(ThreadGoal {
+        objective,
+        status: goal_status,
+        token_budget: None,
+        tokens_used: 0,
+        time_used_seconds: elapsed_end.saturating_sub(created_at),
+    })
+}
+
+/// Reads the latest visible goal state for a session from `agentos_goals`,
+/// including completed, paused, blocked, or budget-limited goals so the UI
+/// goal bar stays in sync after `report_goal` or `Cancel`.
+pub fn current_session_goal(
+    db_path: &Path,
+    session_id: Uuid,
+) -> anyhow::Result<Option<ThreadGoal>> {
     let conn = open_mcp_connection(db_path)?;
-    conn.execute(
+    let sid = session_id.to_string();
+    let now = unix_now();
+    let row: Option<(String, String, Option<String>, i64, i64)> = conn
+        .query_row(
+            "SELECT objective, status, last_reported_status, created_at, updated_at
+             FROM agentos_goals
+             WHERE session_id = ?1
+             ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+            params![sid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    Ok(row.and_then(|(objective, status, last_reported, created_at, updated_at)| {
+        thread_goal_from_row(
+            objective,
+            &status,
+            last_reported.as_deref(),
+            created_at,
+            updated_at,
+            now,
+        )
+    }))
+}
+
+pub fn pause_active_goal_on_cancel(
+    db_path: &Path,
+    session_id: Uuid,
+) -> anyhow::Result<Option<ThreadGoal>> {
+    let conn = open_mcp_connection(db_path)?;
+    let now = unix_now();
+    let updated = conn.execute(
         "UPDATE agentos_goals
          SET status = 'blocked', last_reported_status = 'cancelled', last_reason = 'Paused by user cancel', updated_at = ?1
          WHERE session_id = ?2 AND status = 'active'",
-        params![unix_now(), session_id.to_string()],
+        params![now, session_id.to_string()],
     )?;
-    Ok(())
+    if updated == 0 {
+        return Ok(None);
+    }
+    drop(conn);
+    current_session_goal(db_path, session_id)
+}
+
+fn format_host_goal_launch_prompt(
+    run_id: &str,
+    turn_id: &str,
+    turn_index: i64,
+    objective: &str,
+    resumed: bool,
+) -> String {
+    let action_line = if resumed {
+        "Resume executing this persistent goal from where it left off."
+    } else {
+        "Begin executing this persistent goal."
+    };
+    format!(
+        "[AgentOS Goal | runId={run_id} | turnId={turn_id} | turn={turn_index}]\n\
+         Objective: {objective}\n\n\
+         {action_line} When this turn finishes, call `report_goal` with runId=\"{run_id}\", turnId=\"{turn_id}\", status (\"complete\", \"continue\", or \"blocked\"), and a concrete reason."
+    )
 }
 
 /// Bridges Waku's `/goal` UI operations (`Refresh` / `Set` / `Clear`) to
-/// `agentos_goals` for non-Codex providers (Antigravity, OpenCode, Kimi, etc.).
-pub fn apply_host_goal_operation(
+/// `agentos_goals` for non-Codex providers (Antigravity, OpenCode, Kimi, etc.),
+/// returning the updated `ThreadGoal` and an optional pursuit prompt to start
+/// or resume execution immediately when the session is idle.
+pub fn apply_host_goal_operation_with_prompt(
     db_path: &Path,
     session_id: Uuid,
     operation: GoalOperation,
-) -> anyhow::Result<Option<ThreadGoal>> {
+) -> anyhow::Result<(Option<ThreadGoal>, Option<String>)> {
     let conn = open_mcp_connection(db_path)?;
     let sid = session_id.to_string();
     let now = unix_now();
@@ -2583,10 +2678,10 @@ pub fn apply_host_goal_operation(
         GoalOperation::Clear => {
             conn.execute(
                 "UPDATE agentos_goals SET status = 'complete', last_reported_status = 'cleared', updated_at = ?1
-                 WHERE session_id = ?2 AND status IN ('active', 'blocked')",
+                 WHERE session_id = ?2 AND COALESCE(last_reported_status, '') NOT IN ('cleared', 'replaced')",
                 params![now, sid],
             )?;
-            Ok(None)
+            Ok((None, None))
         }
         GoalOperation::Set {
             objective,
@@ -2600,40 +2695,104 @@ pub fn apply_host_goal_operation(
                     params![now, sid],
                 )?;
             }
-            let existing: Option<(String, String, String, i64)> = conn
+            let existing: Option<(String, String, String, String, i64, Option<String>, i64)> = conn
                 .query_row(
-                    "SELECT run_id, objective, status, created_at FROM agentos_goals
+                    "SELECT run_id, objective, status, current_turn_id, turn_index, last_reported_status, created_at
+                     FROM agentos_goals
                      WHERE session_id = ?1 AND status IN ('active', 'blocked')
-                     ORDER BY updated_at DESC LIMIT 1",
+                     ORDER BY updated_at DESC, rowid DESC LIMIT 1",
                     params![sid],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                        ))
+                    },
                 )
                 .optional()?;
-            if let Some((run_id, cur_obj, cur_status, created_at)) = existing {
+            if let Some((
+                run_id,
+                cur_obj,
+                cur_status,
+                cur_turn_id,
+                cur_turn_index,
+                cur_last_reported,
+                created_at,
+            )) = existing
+            {
+                let objective_changed = objective
+                    .as_deref()
+                    .is_some_and(|next| next.trim() != cur_obj.trim());
                 let next_obj = objective.unwrap_or(cur_obj);
                 let next_status_str = match status {
                     Some(ThreadGoalStatus::Active) => "active",
                     Some(_) => "blocked",
                     None => cur_status.as_str(),
                 };
+                let should_pursue = next_status_str == "active"
+                    && (cur_status != "active"
+                        || objective_changed
+                        || status == Some(ThreadGoalStatus::Active));
+                let (next_turn_id, next_turn_index) = if should_pursue && cur_status != "active" {
+                    (
+                        Uuid::new_v4().to_string(),
+                        if cur_last_reported.is_some() {
+                            cur_turn_index + 1
+                        } else {
+                            cur_turn_index
+                        },
+                    )
+                } else {
+                    (cur_turn_id, cur_turn_index)
+                };
+                let next_last_reported = if next_status_str == "blocked" {
+                    Some("paused")
+                } else if should_pursue {
+                    Some("dispatched")
+                } else {
+                    cur_last_reported.as_deref()
+                };
                 conn.execute(
-                    "UPDATE agentos_goals SET objective = ?1, status = ?2, updated_at = ?3 WHERE run_id = ?4",
-                    params![next_obj, next_status_str, now, run_id],
+                    "UPDATE agentos_goals
+                     SET objective = ?1, status = ?2, last_reported_status = ?3,
+                         current_turn_id = ?4, turn_index = ?5, updated_at = ?6
+                     WHERE run_id = ?7",
+                    params![
+                        next_obj,
+                        next_status_str,
+                        next_last_reported,
+                        next_turn_id,
+                        next_turn_index,
+                        now,
+                        run_id
+                    ],
                 )?;
-                Ok(Some(ThreadGoal {
-                    objective: next_obj,
-                    status: if next_status_str == "blocked" {
-                        ThreadGoalStatus::Paused
-                    } else {
-                        ThreadGoalStatus::Active
-                    },
-                    token_budget: None,
-                    tokens_used: 0,
-                    time_used_seconds: now.saturating_sub(created_at),
-                }))
+                let prompt = should_pursue.then(|| {
+                    format_host_goal_launch_prompt(
+                        &run_id,
+                        &next_turn_id,
+                        next_turn_index,
+                        &next_obj,
+                        cur_status != "active",
+                    )
+                });
+                let goal = thread_goal_from_row(
+                    next_obj,
+                    next_status_str,
+                    next_last_reported,
+                    created_at,
+                    now,
+                    now,
+                );
+                Ok((goal, prompt))
             } else {
                 let Some(obj) = objective.filter(|s| !s.trim().is_empty()) else {
-                    return Ok(None);
+                    return Ok((None, None));
                 };
                 let run_id = Uuid::new_v4().to_string();
                 let turn_id = Uuid::new_v4().to_string();
@@ -2641,47 +2800,45 @@ pub fn apply_host_goal_operation(
                     Some(ThreadGoalStatus::Paused) => "blocked",
                     _ => "active",
                 };
+                let next_last_reported = if next_status_str == "blocked" {
+                    Some("paused")
+                } else {
+                    Some("dispatched")
+                };
                 conn.execute(
-                    "INSERT INTO agentos_goals (run_id, session_id, objective, status, current_turn_id, turn_index, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)",
-                    params![run_id, sid, obj, next_status_str, turn_id, now],
+                    "INSERT INTO agentos_goals (run_id, session_id, objective, status, last_reported_status, current_turn_id, turn_index, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7)",
+                    params![run_id, sid, obj, next_status_str, next_last_reported, turn_id, now],
                 )?;
-                Ok(Some(ThreadGoal {
-                    objective: obj,
-                    status: if next_status_str == "blocked" {
-                        ThreadGoalStatus::Paused
-                    } else {
-                        ThreadGoalStatus::Active
-                    },
-                    token_budget: None,
-                    tokens_used: 0,
-                    time_used_seconds: 0,
-                }))
+                let prompt = (next_status_str == "active").then(|| {
+                    format_host_goal_launch_prompt(&run_id, &turn_id, 1, &obj, false)
+                });
+                let goal = thread_goal_from_row(
+                    obj,
+                    next_status_str,
+                    next_last_reported,
+                    now,
+                    now,
+                    now,
+                );
+                Ok((goal, prompt))
             }
         }
         GoalOperation::Refresh => {
-            let row: Option<(String, String, i64)> = conn
-                .query_row(
-                    "SELECT objective, status, created_at FROM agentos_goals
-                     WHERE session_id = ?1 AND status IN ('active', 'blocked')
-                     ORDER BY updated_at DESC LIMIT 1",
-                    params![sid],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()?;
-            Ok(row.map(|(objective, status, created_at)| ThreadGoal {
-                objective,
-                status: if status == "blocked" {
-                    ThreadGoalStatus::Paused
-                } else {
-                    ThreadGoalStatus::Active
-                },
-                token_budget: None,
-                tokens_used: 0,
-                time_used_seconds: now.saturating_sub(created_at),
-            }))
+            drop(conn);
+            Ok((current_session_goal(db_path, session_id)?, None))
         }
     }
+}
+
+/// Bridges Waku's `/goal` UI operations (`Refresh` / `Set` / `Clear`) to
+/// `agentos_goals` for non-Codex providers (Antigravity, OpenCode, Kimi, etc.).
+pub fn apply_host_goal_operation(
+    db_path: &Path,
+    session_id: Uuid,
+    operation: GoalOperation,
+) -> anyhow::Result<Option<ThreadGoal>> {
+    apply_host_goal_operation_with_prompt(db_path, session_id, operation).map(|(goal, _)| goal)
 }
 
 /// Host helper for the Memory Library UI: load knowledge items, working notes,
@@ -4444,7 +4601,7 @@ mod tests {
         };
 
         // 1. Host /goal Set + Refresh + agent report_goal(continue) -> take_pending_goal_continuation
-        let set_goal = apply_host_goal_operation(
+        let (set_goal, launch_prompt) = apply_host_goal_operation_with_prompt(
             &db,
             sid,
             GoalOperation::Set {
@@ -4453,9 +4610,13 @@ mod tests {
                 replace: true,
             },
         )
-        .unwrap()
         .unwrap();
+        let set_goal = set_goal.unwrap();
         assert_eq!(set_goal.objective, "Ship Mac daily driver");
+        assert_eq!(set_goal.status, ThreadGoalStatus::Active);
+        let launch_prompt = launch_prompt.expect("Set(Active) must return an initial pursuit prompt");
+        assert!(launch_prompt.contains("Ship Mac daily driver"));
+        assert!(launch_prompt.contains("report_goal"));
         let got = dispatch_mcp_request(
             &conn,
             &ctx,
@@ -4467,6 +4628,8 @@ mod tests {
         .unwrap();
         let run_id = got["result"]["structuredContent"]["runId"].as_str().unwrap().to_owned();
         let turn_id = got["result"]["structuredContent"]["turnId"].as_str().unwrap().to_owned();
+        assert!(launch_prompt.contains(&run_id));
+        assert!(launch_prompt.contains(&turn_id));
         dispatch_mcp_request(
             &conn,
             &ctx,
@@ -4490,6 +4653,67 @@ mod tests {
         assert!(next_prompt.contains("run final verification"));
         // Claiming a second time must return None (atomic dispatch).
         assert!(take_pending_goal_continuation(&db, sid).unwrap().is_none());
+
+        // 1b. Pause via cancel -> Paused; Resume via /goal resume -> Active + resume prompt;
+        //     Complete via report_goal -> current_session_goal reflects Complete; Clear -> None.
+        let paused = pause_active_goal_on_cancel(&db, sid).unwrap().unwrap();
+        assert_eq!(paused.status, ThreadGoalStatus::Paused);
+        assert_eq!(
+            current_session_goal(&db, sid).unwrap().unwrap().status,
+            ThreadGoalStatus::Paused
+        );
+        let (resumed_goal, resume_prompt) = apply_host_goal_operation_with_prompt(
+            &db,
+            sid,
+            GoalOperation::Set {
+                objective: None,
+                status: Some(ThreadGoalStatus::Active),
+                replace: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(resumed_goal.unwrap().status, ThreadGoalStatus::Active);
+        let resume_prompt = resume_prompt.expect("Resume must emit a follow-up pursuit prompt");
+        assert!(resume_prompt.contains("Resume executing this persistent goal"));
+        let got_resumed = dispatch_mcp_request(
+            &conn,
+            &ctx,
+            &json!({
+                "jsonrpc": "2.0", "id": 20, "method": "tools/call",
+                "params": { "name": "get_goal", "arguments": {} }
+            }),
+        )
+        .unwrap();
+        let resumed_turn_id = got_resumed["result"]["structuredContent"]["turnId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(resumed_turn_id, turn_id);
+        dispatch_mcp_request(
+            &conn,
+            &ctx,
+            &json!({
+                "jsonrpc": "2.0", "id": 21, "method": "tools/call",
+                "params": {
+                    "name": "report_goal",
+                    "arguments": {
+                        "runId": run_id,
+                        "turnId": resumed_turn_id,
+                        "status": "complete",
+                        "reason": "verified and shipped"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let completed = current_session_goal(&db, sid).unwrap().unwrap();
+        assert_eq!(completed.status, ThreadGoalStatus::Complete);
+        assert_eq!(completed.objective, "Ship Mac daily driver");
+        let (cleared_goal, cleared_prompt) =
+            apply_host_goal_operation_with_prompt(&db, sid, GoalOperation::Clear).unwrap();
+        assert!(cleared_goal.is_none());
+        assert!(cleared_prompt.is_none());
+        assert!(current_session_goal(&db, sid).unwrap().is_none());
 
         // 2. Context rotation builds host restore package and consumes rotation once.
         dispatch_mcp_request(
