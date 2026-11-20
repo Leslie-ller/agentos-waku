@@ -631,12 +631,12 @@ mod tests {
     #[test]
     fn reed_solomon_matches_iso_v1_m_example() {
         // Known-good check: 16 data codewords + 10 EC codewords for V1-M
-        let gen = rs_generator(10);
-        assert_eq!(gen.len(), 10);
+        let generator = rs_generator(10);
+        assert_eq!(generator.len(), 10);
         let spec = &VERSION_SPECS_M[0];
         let data = build_data_codewords(b"hello", spec);
         assert_eq!(data.len(), 16);
-        let rem = rs_remainder(&data, &gen);
+        let rem = rs_remainder(&data, &generator);
         assert_eq!(rem.len(), 10);
         // Verify remainder is non-zero and deterministic.
         assert!(rem.iter().any(|&b| b != 0));
