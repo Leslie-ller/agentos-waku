@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from itertools import groupby
 import json
 from pathlib import Path
+import re
 import sqlite3
 import sys
 import time
@@ -29,6 +30,23 @@ NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")  # NAMESPACE_DNS
 # and never truncated on disk — only outbound wire clones compact if over budget.
 WIRE_SOFT_BUDGET_BYTES = 40 * 1024 * 1024
 DEFAULT_MIGRATED_RUNTIME_MODE = "ask"
+HANDOFF_SEID_PREFIX_RE = re.compile(r"^handoff-\d+-")
+AGY_SHIFT_SEID_RE = re.compile(r"^agy-\d+$")
+
+
+def normalize_source_event_id(source_event_id: str | None) -> str:
+    if not source_event_id:
+        return ""
+    return HANDOFF_SEID_PREFIX_RE.sub("", source_event_id.strip())
+
+
+def is_uuid_v4(value: str | None) -> bool:
+    if not value:
+        return False
+    try:
+        return uuid.UUID(str(value)).version == 4
+    except Exception:
+        return False
 
 
 def uid(seed: str) -> str:
@@ -235,10 +253,17 @@ def convert_events(
     pending_by_call_id: dict[str, int] = {}
 
     ev_count = 0
+    deduplicated_events = 0
     truncated_arg_fields = 0
     truncated_out_fields = 0
     orig_tool_chars = 0
     kept_tool_chars = 0
+
+    seen_user_keys: set[tuple] = set()
+    seen_tool_keys: set[tuple] = set()
+    seen_assistant_seid_keys: set[tuple[str, str]] = set()
+    seen_assistant_payloads: set[str] = set()
+    in_replayed_turn = False
 
     def flush_activities() -> None:
         nonlocal pending_activities, pending_by_call_id
@@ -257,9 +282,60 @@ def convert_events(
         pending_activities = []
         pending_by_call_id = {}
 
-    for seq, (_task_ref, _task_seq, kind, _role, payload_str, call_id, ev_created) in enumerate(
-        ev_iter
-    ):
+    for seq, row in enumerate(ev_iter):
+        if len(row) == 9:
+            (
+                _task_ref,
+                _task_seq,
+                _source_session,
+                source_event_id,
+                kind,
+                _role,
+                payload_str,
+                call_id,
+                ev_created,
+            ) = row
+        else:
+            _task_ref, _task_seq, kind, _role, payload_str, call_id, ev_created = row
+            source_event_id = None
+
+        norm_seid = normalize_source_event_id(source_event_id)
+        payload_key = payload_str or ""
+
+        # Deduplicate repeated append-only ingest sweeps (e.g. Antigravity
+        # re-scans emitting the same `agy-<step>-user` / shifting `agy-<idx>`
+        # assistant blocks and cross-agent handoff archive + live duplicates).
+        if kind == "user_input":
+            user_key = (norm_seid, payload_key) if norm_seid else ("seq", seq, payload_key)
+            if user_key in seen_user_keys:
+                deduplicated_events += 1
+                in_replayed_turn = True
+                continue
+            seen_user_keys.add(user_key)
+            in_replayed_turn = False
+        elif kind in ("tool_call", "tool_result"):
+            tool_key = (
+                (kind, "call", call_id)
+                if call_id
+                else (kind, "seid", norm_seid, payload_key)
+            )
+            if tool_key in seen_tool_keys:
+                deduplicated_events += 1
+                continue
+            seen_tool_keys.add(tool_key)
+        elif kind == "assistant_message":
+            asst_seid_key = (norm_seid, payload_key)
+            is_unstable_agy = bool(AGY_SHIFT_SEID_RE.match(norm_seid))
+            if norm_seid and asst_seid_key in seen_assistant_seid_keys:
+                deduplicated_events += 1
+                continue
+            if (is_unstable_agy or in_replayed_turn) and payload_key in seen_assistant_payloads:
+                deduplicated_events += 1
+                continue
+            if norm_seid:
+                seen_assistant_seid_keys.add(asst_seid_key)
+            seen_assistant_payloads.add(payload_key)
+
         ev_count += 1
         ts = parse_ts(ev_created, base_created_at + seq)
         try:
@@ -424,6 +500,7 @@ def convert_events(
     flush_activities()
     stats = {
         "event_count": ev_count,
+        "deduplicated_events": deduplicated_events,
         "truncated_arg_fields": truncated_arg_fields,
         "truncated_out_fields": truncated_out_fields,
         "orig_tool_chars": orig_tool_chars,
@@ -560,6 +637,7 @@ def run_migration(
     active_only: bool = False,
     projectless_root: Path | None = None,
     exclude_paths: list[str] | None = None,
+    preserve_waku_tail: bool = False,
 ) -> dict:
     t0 = time.time()
     repo_root = Path(__file__).resolve().parent.parent
@@ -721,6 +799,9 @@ def run_migration(
     truncation_records: list[dict] = []
     total_truncated_arg_fields = 0
     total_truncated_out_fields = 0
+    total_deduplicated_events = 0
+    preserved_waku_tail_sessions = 0
+    preserved_waku_tail_messages = 0
 
     processed_conv_ids: set[int] = set()
     conv_id_to_sess_id: dict[int, str] = {}
@@ -739,6 +820,8 @@ def run_migration(
         nonlocal migrated_parked_cursors_total, archive_recovered_sessions
         nonlocal placeholder_empty_sessions, active_conversations, soft_deleted_conversations
         nonlocal total_truncated_arg_fields, total_truncated_out_fields
+        nonlocal total_deduplicated_events, preserved_waku_tail_sessions
+        nonlocal preserved_waku_tail_messages
 
         (
             cid,
@@ -829,6 +912,7 @@ def run_migration(
             ]
 
         ev_count = ev_stats["event_count"]
+        total_deduplicated_events += ev_stats.get("deduplicated_events", 0)
         trunc_args = ev_stats["truncated_arg_fields"]
         trunc_outs = ev_stats["truncated_out_fields"]
         total_truncated_arg_fields += trunc_args
@@ -850,30 +934,122 @@ def run_migration(
         for t in turns:
             t.setdefault("provider", provider)
 
-        act_count = sum(len(b["content"]["data"]) for b in blocks)
-        total_messages += len(msgs)
+        sess_title = "New task"
+        sess_auto_title = clean_title[:240]
+        sess_runtime_mode = DEFAULT_MIGRATED_RUNTIME_MODE
+        sess_model = model
+        sess_provider = provider
+        sess_cursor = native_cursor
+        sess_parked = parked_cursors
+        sess_updated_at = updated_ts
+        sess_last_reply_at = updated_ts
+        sess_context_usage = (
+            {"tokens": min(ev_count * 18, 250000), "window": 272000}
+            if ev_count > 0
+            else None
+        )
+        waku_tail_msg_rows: list[tuple] = []
+
+        if preserve_waku_tail:
+            existing_row = dst.execute(
+                "SELECT data FROM session_details WHERE session_id = ?", (sess_id,)
+            ).fetchone()
+            if existing_row is not None:
+                try:
+                    existing_obj = json.loads(existing_row[0])
+                except Exception:
+                    existing_obj = {}
+                existing_turns = existing_obj.get("turns") or []
+                v4_turns = [t for t in existing_turns if is_uuid_v4(t.get("id"))]
+                v4_turn_ids = {t["id"] for t in v4_turns}
+
+                existing_msg_rows = dst.execute(
+                    """SELECT id, turn_id, role, content, display_content,
+                              attachments, created_at, streaming, provider
+                       FROM messages
+                       WHERE session_id = ?
+                       ORDER BY position ASC""",
+                    (sess_id,),
+                ).fetchall()
+                v4_msg_rows = [
+                    r
+                    for r in existing_msg_rows
+                    if is_uuid_v4(r[0]) or (r[1] in v4_turn_ids)
+                ]
+                old_v5_msg_count = len(existing_msg_rows) - len(v4_msg_rows)
+
+                # Always preserve user-configured runtime_mode and manual title.
+                if existing_obj.get("runtime_mode"):
+                    sess_runtime_mode = existing_obj["runtime_mode"]
+                if existing_obj.get("title") and existing_obj["title"] != "New task":
+                    sess_title = existing_obj["title"]
+
+                if v4_turns or v4_msg_rows:
+                    preserved_waku_tail_sessions += 1
+                    preserved_waku_tail_messages += len(v4_msg_rows)
+                    delta = len(msgs) - old_v5_msg_count
+                    for blk in existing_obj.get("transcript_blocks") or []:
+                        if blk.get("turn_id") in v4_turn_ids:
+                            shifted = dict(blk)
+                            shifted["after_message"] = max(
+                                0, int(blk.get("after_message", 0)) + delta
+                            )
+                            blocks.append(shifted)
+                    # Keep Waku-native turns verbatim (preserving git_ref checkpoints).
+                    next_tc = len(turns)
+                    for t in v4_turns:
+                        t_copy = dict(t)
+                        if int(t_copy.get("turn_count") or 0) <= next_tc:
+                            next_tc += 1
+                            t_copy["turn_count"] = next_tc
+                        else:
+                            next_tc = int(t_copy["turn_count"])
+                        turns.append(t_copy)
+                    waku_tail_msg_rows = v4_msg_rows
+
+                    if existing_obj.get("auto_title"):
+                        sess_auto_title = existing_obj["auto_title"]
+                    if existing_obj.get("model"):
+                        sess_model = existing_obj["model"]
+                    if existing_obj.get("provider"):
+                        sess_provider = existing_obj["provider"]
+                    if existing_obj.get("provider_cursor") is not None:
+                        sess_cursor = existing_obj["provider_cursor"]
+                    if existing_obj.get("parked_cursors"):
+                        sess_parked = existing_obj["parked_cursors"]
+                    if existing_obj.get("context_usage") is not None:
+                        sess_context_usage = existing_obj["context_usage"]
+                    sess_updated_at = max(
+                        sess_updated_at, int(existing_obj.get("updated_at") or 0)
+                    )
+                    sess_last_reply_at = max(
+                        sess_last_reply_at, int(existing_obj.get("last_reply_at") or 0)
+                    )
+
+        act_count = sum(
+            len(b.get("content", {}).get("data", []))
+            for b in blocks
+            if isinstance(b.get("content", {}).get("data"), list)
+        )
+        total_messages += len(msgs) + len(waku_tail_msg_rows)
         total_activities += act_count
         total_turns += len(turns)
 
         sess_obj = {
             "id": sess_id,
-            "title": "New task",
-            "auto_title": clean_title[:240],
+            "title": sess_title,
+            "auto_title": sess_auto_title,
             "project_id": proj_id,
-            "provider": provider,
-            "model": model,
-            "runtime_mode": DEFAULT_MIGRATED_RUNTIME_MODE,
+            "provider": sess_provider,
+            "model": sess_model,
+            "runtime_mode": sess_runtime_mode,
             "status": "idle",
             "created_at": created_ts,
-            "updated_at": updated_ts,
-            "last_reply_at": updated_ts,
-            "provider_cursor": native_cursor,
-            "parked_cursors": parked_cursors,
-            "context_usage": (
-                {"tokens": min(ev_count * 18, 250000), "window": 272000}
-                if ev_count > 0
-                else None
-            ),
+            "updated_at": sess_updated_at,
+            "last_reply_at": sess_last_reply_at,
+            "provider_cursor": sess_cursor,
+            "parked_cursors": sess_parked,
+            "context_usage": sess_context_usage,
             "transcript_blocks": blocks,
             "turns": turns,
         }
@@ -911,14 +1087,14 @@ def run_migration(
             (
                 sess_id,
                 proj_id,
-                "New task",
-                sess_obj["auto_title"],
-                provider,
-                model,
+                sess_title,
+                sess_auto_title,
+                sess_provider,
+                sess_model,
                 "idle",
                 created_ts,
-                updated_ts,
-                updated_ts,
+                sess_updated_at,
+                sess_last_reply_at,
             ),
         )
         dst.execute(
@@ -927,7 +1103,7 @@ def run_migration(
             (sess_id, details_json),
         )
         dst.execute("DELETE FROM messages WHERE session_id = ?", (sess_id,))
-        if msgs:
+        if msgs or waku_tail_msg_rows:
             msg_tuples = []
             for pos, m in enumerate(msgs):
                 content_str = m["content"]
@@ -948,6 +1124,25 @@ def run_migration(
                         msg_provider,
                     )
                 )
+            base_pos = len(msgs)
+            for offset, row in enumerate(waku_tail_msg_rows):
+                m_id, m_tid, m_role, m_content, m_disp, m_att, m_cat, m_stream, m_prov = row
+                total_message_utf8_bytes += len((m_content or "").encode("utf-8"))
+                msg_tuples.append(
+                    (
+                        m_id,
+                        sess_id,
+                        m_tid,
+                        base_pos + offset,
+                        m_role,
+                        m_content,
+                        m_disp,
+                        m_att,
+                        m_cat,
+                        m_stream,
+                        m_prov,
+                    )
+                )
             dst.executemany(
                 """INSERT INTO messages(
                     id, session_id, turn_id, position, role, content,
@@ -964,7 +1159,8 @@ def run_migration(
 
     # 3. Stream all `memory_event` rows grouped by `task_ref` in a single ordered scan
     ev_cursor = src.execute(
-        """SELECT task_ref, task_seq, kind, role, payload, call_id, created_at
+        """SELECT task_ref, task_seq, source_session, source_event_id,
+                  kind, role, payload, call_id, created_at
            FROM memory_event
            WHERE task_ref LIKE 'conv:%'
            ORDER BY task_ref ASC, task_seq ASC"""
@@ -972,6 +1168,7 @@ def run_migration(
 
     empty_ev_stats = {
         "event_count": 0,
+        "deduplicated_events": 0,
         "truncated_arg_fields": 0,
         "truncated_out_fields": 0,
         "orig_tool_chars": 0,
@@ -1148,6 +1345,8 @@ def run_migration(
         ).fetchone()[0],
     }
 
+    if preserve_waku_tail and total_deduplicated_events > 0:
+        dst.execute("VACUUM;")
     dst.execute("PRAGMA wal_checkpoint(TRUNCATE);")
     dst.close()
     src.close()
@@ -1196,6 +1395,9 @@ def run_migration(
             "placeholder_metadata_only_sessions": placeholder_empty_sessions,
             "total_turns": total_turns,
             "total_tool_activities": total_activities,
+            "total_deduplicated_events": total_deduplicated_events,
+            "preserved_waku_tail_sessions": preserved_waku_tail_sessions,
+            "preserved_waku_tail_messages": preserved_waku_tail_messages,
             "total_message_utf8_bytes": total_message_utf8_bytes,
             "total_session_details_utf8_bytes": total_details_utf8_bytes,
             "messages_truncated_count": 0,
@@ -1262,6 +1464,11 @@ def main() -> int:
         default=[],
         help="Exclude folder path (exact match or subpath); repeatable",
     )
+    parser.add_argument(
+        "--preserve-waku-tail",
+        action="store_true",
+        help="When updating an existing Waku app.db, preserve Waku-native (UUIDv4) turns/messages/blocks/checkpoints, user runtime_mode, and custom titles while replacing deduplicated migrated history",
+    )
     args = parser.parse_args()
 
     report = run_migration(
@@ -1272,6 +1479,7 @@ def main() -> int:
         active_only=args.active_only,
         projectless_root=args.projectless_root,
         exclude_paths=args.exclude_path,
+        preserve_waku_tail=args.preserve_waku_tail,
     )
     print(
         json.dumps(
@@ -1281,6 +1489,15 @@ def main() -> int:
                 "target_db_mb": round(report["target_db_bytes"] / 1048576.0, 2),
                 "source_counts": report["source_counts"],
                 "target_counts": report["target_counts"],
+                "total_deduplicated_events": report["fidelity"][
+                    "total_deduplicated_events"
+                ],
+                "preserved_waku_tail_sessions": report["fidelity"][
+                    "preserved_waku_tail_sessions"
+                ],
+                "preserved_waku_tail_messages": report["fidelity"][
+                    "preserved_waku_tail_messages"
+                ],
                 "messages_truncated_count": report["fidelity"]["messages_truncated_count"],
                 "tool_arguments_truncated_count": report["fidelity"][
                     "tool_arguments_truncated_count"
