@@ -1148,3 +1148,14 @@ memory.cp_next_actions: 次のアクション
 memory.cp_open_questions: 未解決の質問
 memory.cp_constraints: 制約事項
 memory.cp_rejected: 却下した案
+daemon.mobile_pairing_title: モバイル・Web クイックペアリング
+daemon.mobile_pairing_description: 同じ Wi-Fi または Tailscale ネットワーク上のスマートフォンで QR コードを読み取ると、内蔵 Web/PWA が開いて自動接続します。ホーム画面に追加してアプリとして使えます。
+daemon.endpoint_lan: LAN
+daemon.endpoint_tailscale: Tailscale
+daemon.endpoint_hostname: ホスト名
+daemon.web_url: Web / PWA URL
+daemon.pairing_link: ペアリングリンク
+daemon.copy_pairing_link: リンクをコピー
+daemon.refresh_endpoints: IP を更新
+daemon.qr_hint: トークンは URL フラグメント（#token=…）でのみ渡され、ペアリング直後にアドレスバーから自動消去されます。
+web.pairing_tip: ヒント：デスクトップの「設定 → デーモン」で外部接続を有効にし、QR コードをスキャンするとワンタップで接続できます。「ホーム画面に追加」で全画面アプリとして利用可能です。

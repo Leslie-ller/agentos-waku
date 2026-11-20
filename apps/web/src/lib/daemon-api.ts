@@ -8,6 +8,8 @@ import type {
   ComposerDrafts,
   DaemonSettings,
   FileEntry,
+  MemoryEntryKind,
+  MemoryLibrarySnapshot,
   MessageAttachment,
   PlanUsage,
   Project,
@@ -48,6 +50,7 @@ export const daemonKeys = {
   planUsage: (address: string, provider: ProviderKind) =>
     ['daemon', address, 'plan-usage', provider] as const,
   skills: (address: string) => ['daemon', address, 'skills'] as const,
+  memoryLibrary: (address: string) => ['daemon', address, 'memory-library'] as const,
   usage: (address: string, window: UsageWindow) =>
     ['daemon', address, 'usage', JSON.stringify(window)] as const,
   workspace: (address: string, cwd: string) =>
@@ -219,6 +222,52 @@ export async function setSkillsEnabled(
 
 export async function trashSkills(client: WakuClient, dirs: string[]): Promise<void> {
   expectResponse(await client.request({ type: 'trashSkills', dirs }), 'ack')
+}
+
+export async function loadMemoryLibrary(
+  client: WakuClient,
+  projectPath?: string | null,
+  query?: string | null,
+): Promise<MemoryLibrarySnapshot> {
+  const response = expectResponse(
+    await client.request({
+      type: 'loadMemoryLibrary',
+      projectPath: projectPath ?? null,
+      query: query ?? null,
+    }),
+    'memoryLibrary',
+  )
+  return response.library
+}
+
+export async function updateMemoryKnowledgeStatus(
+  client: WakuClient,
+  knowledgeId: string,
+  status: string,
+): Promise<void> {
+  expectResponse(
+    await client.request({ type: 'updateMemoryKnowledgeStatus', knowledgeId, status }),
+    'ack',
+  )
+}
+
+export async function deleteMemoryEntry(
+  client: WakuClient,
+  kind: MemoryEntryKind,
+  id: string,
+  noteId?: string | null,
+  scope?: string | null,
+): Promise<void> {
+  expectResponse(
+    await client.request({
+      type: 'deleteMemoryEntry',
+      kind,
+      id,
+      noteId: noteId ?? null,
+      scope: scope ?? null,
+    }),
+    'ack',
+  )
 }
 
 export async function loadUsageHistory(

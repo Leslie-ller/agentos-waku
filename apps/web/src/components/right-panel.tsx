@@ -291,13 +291,22 @@ export function RightPanel({
   }, [])
 
   return (
-    <aside
-      className={cn(
-        'absolute inset-y-0 right-0 z-30 flex shrink-0 flex-col border-l bg-background shadow-2xl xl:relative xl:z-auto xl:shadow-none',
-        !open && 'hidden',
+    <>
+      {open && (
+        <button
+          aria-label={t('right_panel.hide')}
+          className="fixed inset-0 z-20 bg-black/25 xl:hidden"
+          type="button"
+          onClick={() => onOpenChange(false)}
+        />
       )}
-      style={{ width: `min(${fittedPanelWidth}px, 92vw)` }}
-    >
+      <aside
+        className={cn(
+          'fixed inset-y-0 right-0 z-30 flex shrink-0 flex-col border-l bg-background pt-[env(safe-area-inset-top)] shadow-2xl xl:relative xl:z-auto xl:pt-0 xl:shadow-none',
+          !open && 'hidden',
+        )}
+        style={{ width: `min(${fittedPanelWidth}px, 100vw)` }}
+      >
       <PanelResizeHandle
         edge="left"
         label={t('right_panel.resize')}
@@ -431,7 +440,8 @@ export function RightPanel({
           )}
         </div>
       ))}
-    </aside>
+      </aside>
+    </>
   )
 }
 

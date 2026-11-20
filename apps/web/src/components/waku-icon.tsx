@@ -346,7 +346,7 @@ export const PROVIDERS: Array<{
   command: string
 }> = [
   { id: 'amp', name: 'Amp', shortName: 'Amp', command: 'amp' },
-  { id: 'antigravity', name: 'Google Antigravity', shortName: 'Antigravity', command: 'agy_acp_server.par' },
+  { id: 'antigravity', name: 'Google Antigravity', shortName: 'Antigravity', command: 'agy' },
   { id: 'claude', name: 'Claude Code', shortName: 'Claude', command: 'claude' },
   { id: 'codex', name: 'Codex CLI', shortName: 'Codex', command: 'codex' },
   { id: 'cursor', name: 'Cursor CLI', shortName: 'Cursor', command: 'cursor-agent' },

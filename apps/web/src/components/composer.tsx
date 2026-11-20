@@ -29,7 +29,7 @@ import { PreviewableImage } from '@/components/image-preview'
 import { ModelPicker } from '@/components/model-picker'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
-import { FileTypeIcon, WakuIcon } from '@/components/waku-icon'
+import { FileTypeIcon, ProviderIcon, WakuIcon } from '@/components/waku-icon'
 import {
   useComposerCommands,
   useComposerFiles,
@@ -41,6 +41,7 @@ import { importDaemonPathAttachment, importFiles, readAttachmentImage } from '@/
 import {
   checkoutWorkspaceBranch,
   daemonKeys,
+  displayTitle,
   fetchPlanUsage,
   selectableProjects,
   sessionCwd,
@@ -82,6 +83,80 @@ import { cn } from '@/lib/utils'
 
 type Translator = (key: string, params?: Record<string, string | number>) => string
 
+type WebAutocompleteRow =
+  | ComposerAutocompleteRow
+  | {
+      kind: 'session'
+      session: AgentSession
+      title: string
+      projectName: string
+    }
+
+function stripSessionMentionPrefix(query: string): { sessionsOnly: boolean; query: string } {
+  const trimmed = query.trimStart()
+  for (const prefix of ['session:', 'sessions:', '会话:', '会话：']) {
+    if (trimmed.toLowerCase().startsWith(prefix)) {
+      return { sessionsOnly: true, query: trimmed.slice(prefix.length).trim() }
+    }
+  }
+  return { sessionsOnly: false, query: trimmed }
+}
+
+function filterSessionMentions(
+  sessions: AgentSession[],
+  projects: Project[],
+  currentSessionId: string,
+  currentProjectId: string,
+  rawQuery: string,
+  cap: number,
+): Array<Extract<WebAutocompleteRow, { kind: 'session' }>> {
+  const projectNames = new Map(projects.map((item) => [item.id, item.name]))
+  const q = rawQuery.trim().toLowerCase()
+  const candidates = sessions
+    .filter((candidate) => sessionHasStarted(candidate) && candidate.id !== currentSessionId)
+    .map((candidate) => ({
+      session: candidate,
+      title: displayTitle(candidate).trim(),
+      projectName: projectNames.get(candidate.project_id) ?? '',
+      sameProject: candidate.project_id === currentProjectId,
+      recency: candidate.last_reply_at ?? candidate.created_at,
+    }))
+    .filter((item) => Boolean(item.title))
+    .filter((item) => !q || `${item.title} ${item.projectName}`.toLowerCase().includes(q))
+    .sort((a, b) => {
+      if (a.sameProject !== b.sameProject) return a.sameProject ? -1 : 1
+      return b.recency - a.recency
+    })
+    .slice(0, cap)
+
+  return candidates.map((item) => ({
+    kind: 'session',
+    session: item.session,
+    title: item.title,
+    projectName: item.projectName,
+  }))
+}
+
+function replaceWebComposerTrigger(
+  text: string,
+  trigger: ReturnType<typeof detectComposerTrigger>,
+  row: WebAutocompleteRow,
+): { text: string; cursor: number } {
+  if (!trigger) return { text, cursor: text.length }
+  if (row.kind !== 'session') {
+    return replaceComposerTrigger(text, trigger, row)
+  }
+  const safeTitle = row.title
+    .replaceAll('[', '(')
+    .replaceAll(']', ')')
+    .replaceAll('\n', ' ')
+  const insertion = `[${safeTitle}](agentos://session/${row.session.id}) `
+  return {
+    text: `${text.slice(0, trigger.start)}${insertion}${text.slice(trigger.end)}`,
+    cursor: trigger.start + insertion.length,
+  }
+}
+
 function preserveComposerFocusOnMouseDown(event: ReactMouseEvent<HTMLElement>) {
   // Portal events still bubble through the React tree. Only cancel the native
   // focus transfer for controls physically inside this footer, not menu rows.
@@ -115,6 +190,7 @@ function modelOptionLabel(id: string, fallback: string, t: Translator) {
 
 export function Composer({
   session,
+  sessions = [],
   project,
   projects,
   draft = false,
@@ -137,6 +213,7 @@ export function Composer({
   onPrefillSignalHandled,
 }: {
   session: AgentSession
+  sessions?: AgentSession[]
   project: Project
   projects: Project[]
   draft?: boolean
@@ -232,13 +309,35 @@ export function Composer({
   const autocompleteKey = autocompleteTrigger
     ? `${autocompleteTrigger.kind}:${autocompleteTrigger.start}:${autocompleteTrigger.end}:${autocompleteTrigger.query}`
     : null
-  const autocompleteRows = autocompleteTrigger
-    ? composerAutocompleteRows(
+  const autocompleteRows: WebAutocompleteRow[] = (() => {
+    if (!autocompleteTrigger) return []
+    if (autocompleteTrigger.kind === 'command') {
+      return composerAutocompleteRows(
         autocompleteTrigger,
         availableCommands,
         composerFiles.data ?? [],
       )
-    : []
+    }
+    const { sessionsOnly, query: sessionQuery } = stripSessionMentionPrefix(autocompleteTrigger.query)
+    const sessionCap = sessionsOnly ? 20 : autocompleteTrigger.query.trim() ? 6 : 3
+    const sessionRows = filterSessionMentions(
+      sessions,
+      projects,
+      session.id,
+      session.project_id,
+      sessionQuery,
+      sessionCap,
+    )
+    if (sessionsOnly) return sessionRows
+    return [
+      ...sessionRows,
+      ...composerAutocompleteRows(
+        autocompleteTrigger,
+        availableCommands,
+        composerFiles.data ?? [],
+      ),
+    ]
+  })()
   const autocompleteLoading = autocompleteTrigger?.kind === 'command'
     ? composerCommands.isPending || composerCommands.isFetching
     : autocompleteTrigger?.kind === 'file'
@@ -570,7 +669,7 @@ export function Composer({
     if (!autocompleteTrigger) return
     const row = autocompleteRows[index]
     if (!row) return
-    const replacement = replaceComposerTrigger(prompt, autocompleteTrigger, row)
+    const replacement = replaceWebComposerTrigger(prompt, autocompleteTrigger, row)
     if (row.kind === 'command' && executeLocalComposerCommand(replacement.text)) return
     pendingCursor.current = replacement.cursor
     setPrompt(replacement.text)
@@ -633,7 +732,7 @@ export function Composer({
   }
 
   return (
-    <div className="shrink-0 px-3 pb-2 sm:px-5">
+    <div className="shrink-0 px-3 pb-[max(0.5rem,env(safe-area-inset-bottom))] sm:px-5">
       <div className="mx-auto w-full max-w-[720px]">
         {permission && !userInput && (
           <section className="mb-2 rounded-xl border border-[color:var(--warning)]/30 bg-card p-3 shadow-lg">
@@ -765,7 +864,7 @@ export function Composer({
               onSelect={(event) => setCursor(event.currentTarget.selectionStart)}
             />
           <div
-            className="mt-2 flex min-w-0 items-center gap-1 pb-px text-[11.5px] leading-[14px]"
+            className="mt-2 flex min-w-0 flex-wrap items-center gap-1 pb-px text-[11.5px] leading-[14px] sm:flex-nowrap"
             onMouseDown={preserveComposerFocusOnMouseDown}
           >
             <ModelPicker
@@ -905,7 +1004,7 @@ export function Composer({
         />
 
         <div
-          className="flex h-8 min-w-0 items-center gap-1 px-2 text-[11px] text-[var(--text-tertiary)]"
+          className="flex h-8 min-w-0 items-center gap-1 overflow-x-auto px-2 text-[11px] text-[var(--text-tertiary)]"
           onMouseDown={preserveComposerFocusOnMouseDown}
         >
           <ControlMenu
@@ -1154,7 +1253,7 @@ function ComposerAutocomplete({
   onAccept,
   onHighlight,
 }: {
-  rows: ComposerAutocompleteRow[]
+  rows: WebAutocompleteRow[]
   highlight: number
   listRef: RefObject<VirtuosoHandle | null>
   loading: boolean
@@ -1183,7 +1282,9 @@ function ComposerAutocomplete({
               className="size-full outline-none"
               computeItemKey={(_, row) => row.kind === 'command'
                 ? `command:${row.command.scope}:${row.command.name}`
-                : `file:${row.file.path}`}
+                : row.kind === 'session'
+                  ? `session:${row.session.id}`
+                  : `file:${row.file.path}`}
               data={rows}
               fixedItemHeight={30}
               increaseViewportBy={90}
@@ -1205,7 +1306,7 @@ function ComposerAutocomplete({
                   }}
                   onMouseEnter={() => onHighlight(index)}
                 >
-                  <AutocompleteRowContents row={row} />
+                  <AutocompleteRowContents row={row} t={t} />
                 </button>
               )}
             />
@@ -1214,7 +1315,26 @@ function ComposerAutocomplete({
   )
 }
 
-function AutocompleteRowContents({ row }: { row: ComposerAutocompleteRow }) {
+function AutocompleteRowContents({ row, t }: { row: WebAutocompleteRow; t: Translator }) {
+  if (row.kind === 'session') {
+    return (
+      <>
+        <ProviderIcon className="size-[13px]" provider={row.session.provider} />
+        <span className="max-w-[260px] shrink-0 truncate text-[12px] font-medium">
+          {row.title}
+        </span>
+        {row.projectName && (
+          <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--text-ghost)]">
+            {row.projectName}
+          </span>
+        )}
+        <span className="ml-auto flex h-4 shrink-0 items-center rounded border px-1.5 text-[9px] font-semibold text-[var(--text-tertiary)]">
+          {t('autocomplete.session_badge')}
+        </span>
+      </>
+    )
+  }
+
   if (row.kind === 'command') {
     const { command } = row
     return (

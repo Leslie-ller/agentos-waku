@@ -115,6 +115,25 @@ describe('promptSubmitted', () => {
   })
 })
 
+describe('antigravity autonomous wakeups', () => {
+  test('opens a new turn when antigravity wakes up out of turn from idle', () => {
+    const session: AgentSession = {
+      ...idleSession(),
+      provider: 'antigravity',
+    }
+    const started = apply(session, 'turnStarted', null)
+    expect(started.status).toBe('working')
+    expect(started.turns).toHaveLength(2)
+    expect(started.turns.at(-1)?.provider).toBe('antigravity')
+
+    const replied = apply(started, 'textDelta', 'Background timer completed.')
+    expect(replied.messages.at(-1)?.content).toBe('Background timer completed.')
+
+    const parked = apply(replied, 'turnParked', null)
+    expect(parked.status).toBe('background')
+  })
+})
+
 test('MCP tool identity survives partial updates and stays separate in expanded details', () => {
   const call = {
     id: 'tool-1', source_id: 'call-1', kind: 'tool' as const,

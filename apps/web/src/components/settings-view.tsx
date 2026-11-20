@@ -1,5 +1,6 @@
 import { useQueryClient } from '@tanstack/react-query'
 import type {
+  AgentOsMcpSettings,
   DaemonSettings,
   Project,
   ProviderKind,
@@ -7,6 +8,7 @@ import type {
 import { useEffect, useState, type ReactNode } from 'react'
 import { toast } from 'sonner'
 import { ControlMenu } from '@/components/control-menu'
+import { MemorySettings } from '@/components/memory-settings'
 import { SkillsSettings } from '@/components/skills-settings'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -39,6 +41,7 @@ export type SettingsPageId =
   | 'appearance'
   | 'providers'
   | 'skills'
+  | 'memory'
   | 'usage'
   | 'daemon'
 
@@ -50,10 +53,11 @@ export const SETTINGS_PAGES: Array<{
   keywords: string
   keywordsKey: string
 }> = [
-  { id: 'general', label: 'General', labelKey: 'settings.general', icon: 'settings', keywords: 'general local projects conversations privacy analytics telemetry anonymous sharing', keywordsKey: 'settings.general_keywords' },
+  { id: 'general', label: 'General', labelKey: 'settings.general', icon: 'settings', keywords: 'general local projects conversations privacy analytics telemetry anonymous sharing agentos mcp memory goal advisor delegation', keywordsKey: 'settings.general_keywords' },
   { id: 'appearance', label: 'Appearance', labelKey: 'settings.appearance', icon: 'appearance', keywords: 'appearance theme system light dark language', keywordsKey: 'settings.appearance_keywords' },
-  { id: 'providers', label: 'Providers', labelKey: 'settings.providers', icon: 'bot', keywords: 'providers agents models cli version install detect claude codex cursor opencode amp grok pi omp oh my pi kimi', keywordsKey: 'settings.providers_keywords' },
+  { id: 'providers', label: 'Providers', labelKey: 'settings.providers', icon: 'bot', keywords: 'providers agents models cli version install detect claude codex cursor opencode amp grok pi omp oh my pi kimi antigravity', keywordsKey: 'settings.providers_keywords' },
   { id: 'skills', label: 'Skills', labelKey: 'settings.skills', icon: 'package', keywords: 'skills library agent disable enable delete shared', keywordsKey: 'settings.skills_keywords' },
+  { id: 'memory', label: 'Memory', labelKey: 'settings.memory', icon: 'sparkle', keywords: 'memory library knowledge notes checkpoints agentos', keywordsKey: 'settings.memory_keywords' },
   { id: 'usage', label: 'Usage', labelKey: 'settings.usage', icon: 'chartColumn', keywords: 'usage tokens cost spend cache daily monthly project model history', keywordsKey: 'settings.usage_keywords' },
   { id: 'daemon', label: 'Daemon', labelKey: 'settings.daemon', icon: 'server', keywords: 'daemon server remote web network connection url token websocket', keywordsKey: 'settings.daemon_keywords' },
 ]
@@ -65,11 +69,13 @@ export function isSettingsPageId(value: string): value is SettingsPageId {
 export function SettingsView({
   page,
   projects,
+  currentProjectPath,
   onBack,
   onPageChange,
 }: {
   page: SettingsPageId
   projects: Project[]
+  currentProjectPath?: string | null
   onBack: () => void
   onPageChange: (page: SettingsPageId) => void
 }) {
@@ -94,8 +100,41 @@ export function SettingsView({
   }, [query])
 
   return (
-    <div className="flex h-dvh min-w-0 flex-1 bg-background">
-      <aside className="flex h-full w-[252px] shrink-0 flex-col bg-sidebar pt-3">
+    <div className="flex h-dvh min-w-0 flex-1 flex-col bg-background md:flex-row">
+      <header className="flex shrink-0 flex-col border-b bg-sidebar pt-[env(safe-area-inset-top)] md:hidden">
+        <div className="flex h-12 items-center gap-2 px-3">
+          <button
+            className="flex h-8 items-center gap-1.5 rounded-lg px-2 text-[13px] text-[var(--text-secondary)] outline-none hover:bg-sidebar-accent active:bg-accent focus-visible:ring-1 focus-visible:ring-ring"
+            type="button"
+            onClick={onBack}
+          >
+            <WakuIcon className="size-[15px] text-[var(--text-tertiary)]" name="arrowLeft" />
+            {t('settings.back')}
+          </button>
+          <span className="truncate text-[14px] font-medium">{t('common.settings')}</span>
+        </div>
+        <nav
+          aria-label={t('common.settings')}
+          className="flex items-center gap-1 overflow-x-auto px-3 pb-2.5"
+        >
+          {localizedPages.map((candidate) => (
+            <button
+              aria-current={page === candidate.id ? 'page' : undefined}
+              className={cn(
+                'flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-[12.5px] text-[var(--text-secondary)] outline-none hover:bg-sidebar-accent focus-visible:ring-1 focus-visible:ring-ring',
+                page === candidate.id && 'bg-sidebar-accent font-medium text-foreground',
+              )}
+              key={candidate.id}
+              type="button"
+              onClick={() => onPageChange(candidate.id)}
+            >
+              <WakuIcon className="size-[14px] text-[var(--text-tertiary)]" name={candidate.icon} />
+              {candidate.localizedLabel}
+            </button>
+          ))}
+        </nav>
+      </header>
+      <aside className="hidden h-full w-[252px] shrink-0 flex-col bg-sidebar pt-3 md:flex">
         <div className="px-3">
           <button
             className="flex h-[34px] w-full items-center gap-[9px] rounded-lg px-[9px] text-[13px] text-[var(--text-secondary)] outline-none hover:bg-sidebar-accent active:bg-accent focus-visible:ring-1 focus-visible:ring-ring"
@@ -144,8 +183,10 @@ export function SettingsView({
         </nav>
       </aside>
       <main className={cn(
-        'min-w-0 flex-1 border-l bg-background',
-        page === 'skills' ? 'overflow-hidden' : 'overflow-y-auto px-8 pb-12 pt-5',
+        'min-w-0 flex-1 bg-background md:border-l',
+        page === 'skills'
+          ? 'overflow-hidden'
+          : 'overflow-y-auto px-4 pb-[calc(3rem+env(safe-area-inset-bottom))] pt-5 sm:px-8',
       )}>
         {page === 'skills' ? (
           <SkillsSettings projects={projects} />
@@ -155,6 +196,7 @@ export function SettingsView({
             {page === 'general' && <GeneralSettings />}
             {page === 'appearance' && <AppearanceSettings />}
             {page === 'providers' && <ProvidersSettings />}
+            {page === 'memory' && <MemorySettings currentProjectPath={currentProjectPath} />}
             {page === 'usage' && <UsageSettings projects={projects} />}
             {page === 'daemon' && <DaemonSettings />}
           </div>
@@ -164,9 +206,43 @@ export function SettingsView({
   )
 }
 
+const DEFAULT_AGENTOS_MCP: AgentOsMcpSettings = {
+  memoryEnabled: true,
+  goalEnabled: true,
+  advisorEnabled: true,
+  advisorProvider: 'auto',
+  askUserEnabled: true,
+  delegationEnabled: true,
+  sessionInfoEnabled: true,
+}
+
 function GeneralSettings() {
   const { t } = useI18n()
+  const { client, config } = useDaemon()
+  const queryClient = useQueryClient()
+  const settings = useDaemonSettings()
+  const [savingMcp, setSavingMcp] = useState(false)
   const [analytics, setAnalytics] = useStoredBoolean('waku.analytics-enabled', true)
+  const mcp: AgentOsMcpSettings = settings.data?.agentos_mcp ?? DEFAULT_AGENTOS_MCP
+
+  async function patchMcp(patch: Partial<AgentOsMcpSettings>) {
+    if (!client || !config || !settings.data || savingMcp) return
+    const next: DaemonSettings = {
+      ...settings.data,
+      agentos_mcp: { ...mcp, ...patch },
+    }
+    setSavingMcp(true)
+    queryClient.setQueryData(daemonKeys.settings(config.address), next)
+    try {
+      await updateDaemonSettings(client, next)
+    } catch (error) {
+      queryClient.setQueryData(daemonKeys.settings(config.address), settings.data)
+      toast.error(errorMessage(error))
+    } finally {
+      setSavingMcp(false)
+    }
+  }
+
   return (
     <div>
       <SettingsCard>
@@ -174,6 +250,64 @@ function GeneralSettings() {
           title={t('settings.local_by_default')}
           description={t('settings.local_by_default_web_description')}
         />
+      </SettingsCard>
+      <SettingsCard>
+        <SettingText
+          title="AgentOS Companion MCP (agentos-mcp)"
+          description="Control built-in Memory, Autonomous Goal Loop, Read-Only Advisor, Interactive Questions, and Delegation tools exposed to all connected agents."
+        />
+        <div className="mt-3 divide-y">
+          {([
+            ['memoryEnabled', 'Persistent Memory Tools', 'memory_search / memory_read / memory_note_write / memory_checkpoint_prepare / memory_context_rotate / memory_knowledge_propose'],
+            ['goalEnabled', 'Autonomous Goal Loop', 'get_goal / create_goal / report_goal with host-enforced continuation, turn cap, and time budget'],
+            ['advisorEnabled', 'Read-Only Senior Advisor', 'consult_advisor invokes an isolated heterogeneous advisor agent for architecture review and debugging'],
+            ['askUserEnabled', 'Interactive User Questions', 'ask_user_question pauses the agent and presents structured multi-choice cards'],
+            ['delegationEnabled', 'Subagent Delegation', 'spawn_subagent / check_subagent / list_subagents for parallel isolated helper agents'],
+            ['sessionInfoEnabled', 'Cross-Session Context Lookup', 'get_session_info allows agents to inspect @-mentioned historical conversations'],
+          ] as const).map(([key, title, description]) => (
+            <div className="flex items-center gap-4 py-2.5" key={key}>
+              <div className="min-w-0 flex-1">
+                <div className="text-[13px] font-medium">{title}</div>
+                <p className="mt-0.5 text-[11.5px] leading-4 text-[var(--text-secondary)]">
+                  {description}
+                </p>
+              </div>
+              <Toggle
+                checked={mcp[key]}
+                label={title}
+                onChange={(checked) => void patchMcp({ [key]: checked })}
+              />
+            </div>
+          ))}
+          <div className="pt-3">
+            <div className="text-[13px] font-medium">Advisor Engine</div>
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {([
+                ['auto', 'Auto (Heterogeneous)'],
+                ['codex', 'Codex'],
+                ['antigravity', 'Antigravity'],
+              ] as const).map(([value, label]) => {
+                const active = mcp.advisorProvider.toLowerCase() === value
+                return (
+                  <button
+                    className={cn(
+                      'rounded-lg border px-2.5 py-1 text-[12px] transition-colors',
+                      active
+                        ? 'border-foreground/30 bg-accent font-medium text-foreground'
+                        : 'border-border bg-background/60 text-[var(--text-secondary)] hover:bg-accent/60',
+                    )}
+                    disabled={savingMcp}
+                    key={value}
+                    type="button"
+                    onClick={() => void patchMcp({ advisorProvider: value })}
+                  >
+                    {label}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        </div>
       </SettingsCard>
       <SettingsCard row>
         <SettingText
@@ -555,8 +689,8 @@ function DetailRow({
   const copyFeedback = useCopyFeedback()
   const [revealed, setRevealed] = useState(false)
   return (
-    <div className="flex min-h-12 items-center gap-4 text-[11.5px]">
-      <span className="w-28 shrink-0 text-[var(--text-tertiary)]">{label}</span>
+    <div className="flex min-h-12 flex-wrap items-center gap-x-4 gap-y-2 py-2.5 text-[11.5px] sm:flex-nowrap sm:py-0">
+      <span className="w-24 shrink-0 text-[var(--text-tertiary)] sm:w-28">{label}</span>
       <span className="min-w-0 flex-1 truncate font-mono">
         {secret && !revealed ? '••••••••••••••••••••••••' : value}
       </span>

@@ -15,6 +15,17 @@ describe('transcriptLinkRoute', () => {
     )).toEqual({ kind: 'projectFile', path: 'My File.rs' })
   })
 
+  test('routes agentos://session and codeg://session links directly to sessions', () => {
+    expect(transcriptLinkRoute(
+      'agentos://session/123e4567-e89b-12d3-a456-426614174000',
+      workspace,
+    )).toEqual({ kind: 'session', sessionId: '123e4567-e89b-12d3-a456-426614174000' })
+    expect(transcriptLinkRoute(
+      'codeg://session/1861',
+      workspace,
+    )).toEqual({ kind: 'session', sessionId: '1861' })
+  })
+
   test('does not reinterpret another daemon path or an external URL', () => {
     expect(transcriptLinkRoute(
       '/Users/egoist/dev/waku/../kero/src/app.rs:20',

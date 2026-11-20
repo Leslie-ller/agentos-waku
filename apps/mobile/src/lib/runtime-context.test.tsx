@@ -73,6 +73,11 @@ function fixture(options: { attached?: boolean } = {}) {
           return { type: 'settings', settings: {
             provider_binary_overrides: {}, disabled_providers: [],
             computer_use_enabled: false, computer_use_allowed_apps: [],
+            agentos_mcp: {
+              memoryEnabled: true, goalEnabled: true, advisorEnabled: true,
+              advisorProvider: 'auto', askUserEnabled: true,
+              delegationEnabled: true, sessionInfoEnabled: true,
+            },
           } };
         case 'loadTaskState':
           return {

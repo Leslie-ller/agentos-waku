@@ -1049,6 +1049,10 @@ pub struct Waku {
     /// Cached once at construction for the Daemon settings connection URL;
     /// rendering must not query account or network configuration.
     daemon_hostname: String,
+    /// Reachable LAN / Tailscale / hostname endpoints cached once at startup
+    /// for one-tap mobile Web/PWA QR pairing.
+    daemon_endpoints: Vec<crate::daemon::DaemonNetworkEndpoint>,
+    daemon_selected_endpoint: usize,
     /// Session details currently being fetched from the daemon. Sidebar rows
     /// stay usable while the selected transcript hydrates asynchronously.
     session_hydrations: HashSet<Uuid>,
@@ -1966,6 +1970,7 @@ impl Waku {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let store = StateStore::remote(daemon.clone());
         let daemon_hostname = crate::daemon::local_hostname().unwrap_or_else(|| "this-mac".into());
+        let daemon_endpoints = crate::daemon::local_network_endpoints(&daemon_hostname);
         let composer_draft_store = ComposerDraftStore::remote(daemon.clone());
         let composer_drafts = composer_draft_store.load().unwrap_or_default();
         let mut state = store.load_or_fresh(cwd);
@@ -2774,6 +2779,8 @@ impl Waku {
             Self {
                 daemon,
                 daemon_hostname,
+                daemon_endpoints,
+                daemon_selected_endpoint: 0,
                 session_hydrations: HashSet::new(),
                 pending_session_activation: None,
                 analytics,

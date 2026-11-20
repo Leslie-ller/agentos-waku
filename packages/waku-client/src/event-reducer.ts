@@ -111,7 +111,9 @@ export function reduceRuntimeEvent(
         turn.provider_turn_started = true
         session.status = 'working'
       } else if (
-        (session.provider === 'codex' || session.provider === 'claude')
+        (session.provider === 'codex'
+          || session.provider === 'claude'
+          || session.provider === 'antigravity')
         && !['connecting', 'working', 'waiting', 'background'].includes(session.status)
       ) {
         // Some providers start turns on their own: Codex goal continuation

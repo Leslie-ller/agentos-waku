@@ -546,6 +546,13 @@ export function WakuApp() {
       ? sessionCwd(activeSession, activeProject)
       : undefined
     const route = transcriptLinkRoute(target, workspace)
+    if (route.kind === 'session') {
+      if (taskState.data?.sessions.some((candidate) => candidate.id === route.sessionId)) {
+        selectSession(route.sessionId)
+        return true
+      }
+      return false
+    }
     if (route.kind === 'external') return false
     if (route.kind === 'remoteFile') {
       toast.error(t('errors.path_outside_workspace'))
@@ -1048,6 +1055,7 @@ export function WakuApp() {
                 project={activeProject}
                 projects={selectableProjects(taskState.data.projects, activeProject)}
                 session={activeSession}
+                sessions={taskState.data.sessions}
                 usagePanelSignal={usagePanelSignal}
                 onComposerDraftChange={(nextDraft) => updateStoredComposerDraft(
                   { type: 'newSession', projectId: activeProject.id },
@@ -1128,6 +1136,7 @@ export function WakuApp() {
                   project={currentProject}
                   projects={taskState.data.projects}
                   session={current}
+                  sessions={taskState.data.sessions}
                   usagePanelSignal={usagePanelSignal}
                   onComposerDraftChange={(nextDraft) => updateStoredComposerDraft(
                     { type: 'session', sessionId: current.id },
@@ -1278,7 +1287,7 @@ function TaskHeader({
     ? agentPresetIdLabel(session.agent_preset || 'standard', t)
     : null
   return (
-    <header className="flex h-12 shrink-0 items-center gap-2 px-3 lg:px-3.5">
+    <header className="flex min-h-12 shrink-0 items-center gap-2 px-3 pt-[env(safe-area-inset-top)] lg:px-3.5">
       <Button
         aria-label={t('sidebar.open')}
         className={sidebarVisible ? 'lg:hidden' : undefined}

@@ -1096,3 +1096,14 @@ memory.cp_next_actions: 下一步
 memory.cp_open_questions: 待确认问题
 memory.cp_constraints: 约束条件
 memory.cp_rejected: 已排除方案
+daemon.mobile_pairing_title: 手机与 Web 扫码配对
+daemon.mobile_pairing_description: 在同一 Wi-Fi 或 Tailscale 网络下用手机相机扫码，即可打开内置 Web/PWA 并自动完成配对；随后可“添加到主屏幕”当 App 使用。
+daemon.endpoint_lan: 局域网
+daemon.endpoint_tailscale: Tailscale
+daemon.endpoint_hostname: 主机名
+daemon.web_url: Web / PWA 地址
+daemon.pairing_link: 一键配对链接
+daemon.copy_pairing_link: 复制配对链接
+daemon.refresh_endpoints: 刷新网卡
+daemon.qr_hint: 令牌仅通过本地 URL 锚点（#token=…）传递，手机打开完成配对后会自动从地址栏抹除。
+web.pairing_tip: 提示：在桌面端「设置 → 守护进程」开启局域网访问后，用手机扫二维码即可一键直连，并可通过浏览器「添加到主屏幕」获得全屏 App 体验。

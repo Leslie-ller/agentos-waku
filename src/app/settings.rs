@@ -989,8 +989,25 @@ impl Waku {
         let pending = self.daemon_reconfigure_pending;
         let fields_dirty = self.daemon_exposure_fields_dirty(cx);
         let port = self.state.daemon_exposure.port;
-        let websocket_url = format!("ws://{}:{port}", self.daemon_hostname);
         let token = self.state.daemon_exposure.token.clone();
+        let selected_endpoint = self
+            .daemon_endpoints
+            .get(self.daemon_selected_endpoint)
+            .or_else(|| self.daemon_endpoints.first())
+            .cloned()
+            .unwrap_or_else(|| crate::daemon::DaemonNetworkEndpoint {
+                kind: crate::daemon::DaemonEndpointKind::Hostname,
+                host: self.daemon_hostname.clone(),
+                interface_name: None,
+            });
+        let websocket_url = selected_endpoint.websocket_url(port);
+        let web_url = selected_endpoint.web_url(port);
+        let pairing_url = selected_endpoint.pairing_url(port, &token);
+        let qr_matrix = if enabled {
+            crate::ui::qr::encode_qr(pairing_url.as_bytes())
+        } else {
+            None
+        };
 
         let exposure_toggle = toggle_switch(
             "daemon-exposure-toggle",
@@ -1041,7 +1058,9 @@ impl Waku {
 
         let copy_url_feedback_id = "daemon-url";
         let url_copied = self.control_was_copied(copy_url_feedback_id);
+        let ws_display_url = websocket_url.clone();
         let copy_url = websocket_url.clone();
+        let key_url = websocket_url;
         let copy_url_button = div()
             .id("copy-daemon-url")
             .tab_index(0)
@@ -1080,7 +1099,7 @@ impl Waku {
                 if !event.keystroke.modifiers.modified()
                     && matches!(event.keystroke.key.as_str(), "enter" | "space")
                 {
-                    cx.write_to_clipboard(ClipboardItem::new_string(websocket_url.clone()));
+                    cx.write_to_clipboard(ClipboardItem::new_string(key_url.clone()));
                     this.show_control_copied(copy_url_feedback_id, cx);
                     cx.stop_propagation();
                 }
@@ -1208,6 +1227,179 @@ impl Waku {
                     }))
             })
             .child(tr!("daemon.regenerate_token"));
+
+        let copy_web_feedback_id = "daemon-web-url";
+        let web_url_copied = self.control_was_copied(copy_web_feedback_id);
+        let click_web_url = web_url.clone();
+        let key_web_url = web_url.clone();
+        let copy_web_button = div()
+            .id("copy-daemon-web-url")
+            .tab_index(0)
+            .h(px(27.0))
+            .px(px(9.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .cursor_default()
+            .text_size(sp(12.5))
+            .text_color(theme.text_secondary)
+            .focus_visible(|style| style.border_color(theme.accent))
+            .hover(|element| element.bg(theme.overlay))
+            .child(icon(
+                if web_url_copied {
+                    "icons/check.svg"
+                } else {
+                    "icons/copy.svg"
+                },
+                11.0,
+                theme.text_tertiary,
+            ))
+            .child(if web_url_copied {
+                tr!("common.copied")
+            } else {
+                tr!("common.copy")
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(click_web_url.clone()));
+                this.show_control_copied(copy_web_feedback_id, cx);
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    cx.write_to_clipboard(ClipboardItem::new_string(key_web_url.clone()));
+                    this.show_control_copied(copy_web_feedback_id, cx);
+                    cx.stop_propagation();
+                }
+            }));
+
+        let copy_pairing_feedback_id = "daemon-pairing-url";
+        let pairing_copied = self.control_was_copied(copy_pairing_feedback_id);
+        let click_pairing_url = pairing_url.clone();
+        let key_pairing_url = pairing_url.clone();
+        let copy_pairing_button = div()
+            .id("copy-daemon-pairing-url")
+            .tab_index(0)
+            .h(px(27.0))
+            .px(px(9.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .cursor_default()
+            .text_size(sp(12.5))
+            .text_color(theme.text_secondary)
+            .focus_visible(|style| style.border_color(theme.accent))
+            .hover(|element| element.bg(theme.overlay))
+            .child(icon(
+                if pairing_copied {
+                    "icons/check.svg"
+                } else {
+                    "icons/copy.svg"
+                },
+                11.0,
+                theme.text_tertiary,
+            ))
+            .child(if pairing_copied {
+                tr!("common.copied")
+            } else {
+                tr!("daemon.copy_pairing_link")
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(click_pairing_url.clone()));
+                this.show_control_copied(copy_pairing_feedback_id, cx);
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    cx.write_to_clipboard(ClipboardItem::new_string(key_pairing_url.clone()));
+                    this.show_control_copied(copy_pairing_feedback_id, cx);
+                    cx.stop_propagation();
+                }
+            }));
+
+        let refresh_endpoints_button = div()
+            .id("refresh-daemon-endpoints")
+            .tab_index(0)
+            .h(px(26.0))
+            .px(px(9.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .cursor_default()
+            .text_size(sp(12.0))
+            .text_color(theme.text_secondary)
+            .focus_visible(|style| style.border_color(theme.accent))
+            .hover(|element| element.bg(theme.overlay))
+            .child(icon("icons/rotate-cw.svg", 11.0, theme.text_tertiary))
+            .child(tr!("daemon.refresh_endpoints"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                let prev_host = this
+                    .daemon_endpoints
+                    .get(this.daemon_selected_endpoint)
+                    .map(|ep| ep.host.clone());
+                this.daemon_endpoints =
+                    crate::daemon::local_network_endpoints(&this.daemon_hostname);
+                this.daemon_selected_endpoint = prev_host
+                    .and_then(|host| this.daemon_endpoints.iter().position(|ep| ep.host == host))
+                    .unwrap_or(0);
+                cx.notify();
+            }));
+
+        let mut endpoint_pills = div().flex().flex_wrap().items_center().gap(px(6.0));
+        for (idx, endpoint) in self.daemon_endpoints.iter().enumerate() {
+            let active = idx == self.daemon_selected_endpoint;
+            let badge = match endpoint.kind {
+                crate::daemon::DaemonEndpointKind::Lan => tr!("daemon.endpoint_lan"),
+                crate::daemon::DaemonEndpointKind::Tailscale => tr!("daemon.endpoint_tailscale"),
+                crate::daemon::DaemonEndpointKind::Hostname => tr!("daemon.endpoint_hostname"),
+            };
+            let label = format!("{badge} · {}", endpoint.host);
+            endpoint_pills = endpoint_pills.child(
+                div()
+                    .id(SharedString::from(format!("daemon-endpoint-pill-{idx}")))
+                    .px(px(9.0))
+                    .py(px(4.0))
+                    .rounded(px(7.0))
+                    .border_1()
+                    .border_color(if active {
+                        theme.border_strong
+                    } else {
+                        theme.border
+                    })
+                    .bg(if active {
+                        theme.overlay_strong
+                    } else {
+                        theme.surface
+                    })
+                    .text_size(sp(12.0))
+                    .font_weight(if active {
+                        FontWeight::MEDIUM
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .text_color(if active {
+                        theme.text
+                    } else {
+                        theme.text_secondary
+                    })
+                    .cursor_pointer()
+                    .child(SharedString::from(label))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.daemon_selected_endpoint = idx;
+                        cx.notify();
+                    })),
+            );
+        }
 
         div()
             .mt(px(15.0))
@@ -1386,6 +1578,130 @@ impl Waku {
                         .bg(theme.raised)
                         .child(
                             div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(12.0))
+                                .child(
+                                    div()
+                                        .text_size(sp(13.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme.text)
+                                        .child(tr!("daemon.mobile_pairing_title")),
+                                )
+                                .child(refresh_endpoints_button),
+                        )
+                        .child(
+                            div()
+                                .mt(px(4.0))
+                                .min_w_0()
+                                .whitespace_normal()
+                                .text_size(sp(12.5))
+                                .line_height(sp(17.0))
+                                .text_color(theme.text_secondary)
+                                .child(tr!("daemon.mobile_pairing_description")),
+                        )
+                        .child(div().mt(px(11.0)).child(endpoint_pills))
+                        .child(
+                            div()
+                                .mt(px(13.0))
+                                .flex()
+                                .items_start()
+                                .gap(px(18.0))
+                                .when_some(qr_matrix, |row, matrix| {
+                                    row.child(crate::ui::qr::qr_code_element(matrix, 168.0))
+                                })
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(8.0))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(10.0))
+                                                .child(
+                                                    div()
+                                                        .w(px(92.0))
+                                                        .flex_none()
+                                                        .text_size(sp(12.0))
+                                                        .text_color(theme.text_tertiary)
+                                                        .child(tr!("daemon.web_url")),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .font_family(".SystemUIFontMonospaced")
+                                                        .text_size(sp(12.5))
+                                                        .text_color(theme.text)
+                                                        .child(SharedString::from(web_url)),
+                                                )
+                                                .child(copy_web_button),
+                                        )
+                                        .child(
+                                            div()
+                                                .pt(px(8.0))
+                                                .border_t_1()
+                                                .border_color(theme.border)
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(10.0))
+                                                .child(
+                                                    div()
+                                                        .w(px(92.0))
+                                                        .flex_none()
+                                                        .text_size(sp(12.0))
+                                                        .text_color(theme.text_tertiary)
+                                                        .child(tr!("daemon.pairing_link")),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .font_family(".SystemUIFontMonospaced")
+                                                        .text_size(sp(12.5))
+                                                        .text_color(theme.text)
+                                                        .child(SharedString::from(
+                                                            if token_revealed {
+                                                                pairing_url
+                                                            } else {
+                                                                format!(
+                                                                    "http://{}:{port}/#token=••••••••",
+                                                                    selected_endpoint.host
+                                                                )
+                                                            },
+                                                        )),
+                                                )
+                                                .child(copy_pairing_button),
+                                        )
+                                        .child(
+                                            div()
+                                                .mt(px(4.0))
+                                                .text_size(sp(11.5))
+                                                .line_height(sp(16.0))
+                                                .whitespace_normal()
+                                                .text_color(theme.text_tertiary)
+                                                .child(tr!("daemon.qr_hint")),
+                                        ),
+                                ),
+                        ),
+                )
+            })
+            .when(enabled, |column| {
+                column.child(
+                    div()
+                        .px(px(20.0))
+                        .py(px(15.0))
+                        .rounded(px(13.0))
+                        .bg(theme.raised)
+                        .child(
+                            div()
                                 .text_size(sp(13.5))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.text)
@@ -1424,10 +1740,7 @@ impl Waku {
                                         .font_family(".SystemUIFontMonospaced")
                                         .text_size(sp(12.5))
                                         .text_color(theme.text)
-                                        .child(SharedString::from(format!(
-                                            "ws://{}:{port}",
-                                            self.daemon_hostname
-                                        ))),
+                                        .child(SharedString::from(ws_display_url)),
                                 )
                                 .child(copy_url_button),
                         )

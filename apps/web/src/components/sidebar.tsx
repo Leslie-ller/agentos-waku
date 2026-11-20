@@ -102,7 +102,7 @@ export function Sidebar({
       />
       <aside
         className={cn(
-          'pointer-events-none invisible fixed inset-y-0 left-0 z-40 flex shrink-0 -translate-x-full flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground transition-transform motion-reduce:transition-none lg:pointer-events-auto lg:visible lg:relative lg:z-auto lg:translate-x-0',
+          'pointer-events-none invisible fixed inset-y-0 left-0 z-40 flex shrink-0 -translate-x-full flex-col border-r border-sidebar-border bg-sidebar pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] text-sidebar-foreground transition-transform motion-reduce:transition-none lg:pointer-events-auto lg:visible lg:relative lg:z-auto lg:translate-x-0 lg:pt-0 lg:pb-0',
           mobileOpen && 'pointer-events-auto visible translate-x-0',
         )}
         style={{ width: `min(${liveWidth}px, 92vw)` }}

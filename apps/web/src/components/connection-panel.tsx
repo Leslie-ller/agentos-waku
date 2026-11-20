@@ -129,11 +129,15 @@ export function ConnectionPanel({ title }: { title?: string } = {}) {
           </form>
         </section>
 
-        <div className="mt-3 flex gap-2 rounded-lg bg-accent px-3 py-2 text-[10.5px] leading-4 text-[var(--text-tertiary)]">
-          <WakuIcon className="mt-0.5 size-3.5 shrink-0" name="lock" />
-          <p>
-            {t('web.security_warning')}
-          </p>
+        <div className="mt-3 space-y-2">
+          <div className="flex gap-2 rounded-lg bg-accent px-3 py-2 text-[10.5px] leading-4 text-[var(--text-tertiary)]">
+            <WakuIcon className="mt-0.5 size-3.5 shrink-0" name="sparkle" />
+            <p>{t('web.pairing_tip')}</p>
+          </div>
+          <div className="flex gap-2 rounded-lg bg-accent px-3 py-2 text-[10.5px] leading-4 text-[var(--text-tertiary)]">
+            <WakuIcon className="mt-0.5 size-3.5 shrink-0" name="lock" />
+            <p>{t('web.security_warning')}</p>
+          </div>
         </div>
       </div>
     </main>

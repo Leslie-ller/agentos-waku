@@ -10,6 +10,7 @@ export default defineConfig({
   },
   resolve: {
     tsconfigPaths: true,
+    dedupe: ['react', 'react-dom'],
   },
   optimizeDeps: {
     include: ['@pierre/diffs', '@pierre/diffs/edit', '@pierre/diffs/react'],

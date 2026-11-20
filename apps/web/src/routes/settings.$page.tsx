@@ -66,8 +66,16 @@ function ConnectedSettings({
     return <StartupScreen error={taskState.error ? errorMessage(taskState.error) : undefined} onRetry={() => void taskState.refetch()} />
   }
 
+  const activeSession = sessionId
+    ? taskState.data.sessions.find((candidate) => candidate.id === sessionId)
+    : undefined
+  const currentProjectPath = activeSession
+    ? taskState.data.projects.find((project) => project.id === activeSession.project_id)?.path
+    : undefined
+
   return (
     <SettingsView
+      currentProjectPath={currentProjectPath}
       page={page}
       projects={taskState.data.projects}
       onBack={() => void navigate({

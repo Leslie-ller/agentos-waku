@@ -1,10 +1,16 @@
 export type TranscriptLinkRoute =
+  | { kind: 'session'; sessionId: string }
   | { kind: 'projectFile'; path: string }
   | { kind: 'remoteFile'; path: string }
   | { kind: 'external' }
 
 export function transcriptLinkRoute(target: string, workspace?: string): TranscriptLinkRoute {
-  const path = markdownFilePath(target)
+  const trimmed = target.trim()
+  const sessionMatch = trimmed.match(/^(?:agentos|codeg):\/\/session\/([^/?#]+)$/i)
+  if (sessionMatch?.[1]) {
+    return { kind: 'session', sessionId: sessionMatch[1].trim() }
+  }
+  const path = markdownFilePath(trimmed)
   if (!path) return { kind: 'external' }
   const normalizedPath = normalizePath(path)
   const normalizedWorkspace = workspace ? normalizePath(workspace) : null

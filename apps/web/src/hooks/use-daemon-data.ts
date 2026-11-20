@@ -10,6 +10,7 @@ import {
   listSessionTurnRefs,
   listComposerFiles,
   loadComposerDrafts,
+  loadMemoryLibrary,
   loadSkills,
   loadDaemonSettings,
   loadTaskState,
@@ -220,6 +221,16 @@ export function useSkills(projects: Parameters<typeof loadSkills>[1]) {
     queryKey: daemonKeys.skills(config?.address ?? 'disconnected'),
     queryFn: () => loadSkills(requireClient(client), projects),
     enabled: phase === 'connected' && Boolean(client && config),
+  })
+}
+
+export function useMemoryLibrary() {
+  const { client, config, phase } = useDaemon()
+  return useQuery({
+    queryKey: daemonKeys.memoryLibrary(config?.address ?? 'disconnected'),
+    queryFn: () => loadMemoryLibrary(requireClient(client)),
+    enabled: phase === 'connected' && Boolean(client && config),
+    staleTime: 30_000,
   })
 }
 
