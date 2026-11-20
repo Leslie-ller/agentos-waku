@@ -7,7 +7,7 @@
  */
 export type AgentOsMcpSettings = { memoryEnabled: boolean, goalEnabled: boolean, advisorEnabled: boolean,
 /**
- * Target advisor provider: `"auto"` (heterogeneous opposite family),
- * `"codex"`, or `"antigravity"`.
+ * Target advisor provider: `"both"` (Codex + Antigravity in parallel),
+ * `"auto"` (heterogeneous opposite family), `"codex"`, or `"antigravity"`.
  */
 advisorProvider: string, askUserEnabled: boolean, delegationEnabled: boolean, sessionInfoEnabled: boolean, };
