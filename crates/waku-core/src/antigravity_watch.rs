@@ -20,7 +20,7 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -32,6 +32,7 @@ use crate::driver::DriverEventSender;
 
 const POLL_ACTIVE: Duration = Duration::from_secs(1);
 const POLL_IDLE: Duration = Duration::from_secs(3);
+const AUTONOMOUS_TOOL_GAP_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_STEP_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LOG_TAIL_BYTES: usize = 16 * 1024;
 
@@ -199,6 +200,7 @@ struct DecodedSubagent {
 struct DecodedPlanner {
     response: String,
     thinking: String,
+    has_tool_calls: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -453,6 +455,16 @@ fn decode_planner(bytes: &[u8]) -> DecodedPlanner {
             (3, 2) => {
                 if let Some(s) = r.read_string() {
                     out.thinking = s;
+                }
+            }
+            (7, 2) => {
+                // `PlannerResponse.tool_calls` (repeated ToolCall): when present,
+                // this planner step is mid-cascade and will be followed by tool
+                // execution + another PlannerResponse.
+                if let Some(bytes) = r.read_bytes()
+                    && !bytes.is_empty()
+                {
+                    out.has_tool_calls = true;
                 }
             }
             _ => {
@@ -1054,6 +1066,7 @@ struct WatcherShared {
     birth_step_idx: i64,
     synced_step_idx: i64,
     autonomous_turn_open: bool,
+    last_autonomous_progress_at: Option<Instant>,
     has_live_detached_work: bool,
     emitted_thinking_len: HashMap<i64, usize>,
     emitted_response_len: HashMap<i64, usize>,
@@ -1087,6 +1100,7 @@ impl AntigravityTrajectoryWatcher {
                 birth_step_idx: (initial_max + 1).max(0),
                 synced_step_idx: initial_max,
                 autonomous_turn_open: false,
+                last_autonomous_progress_at: None,
                 has_live_detached_work: false,
                 emitted_thinking_len: HashMap::new(),
                 emitted_response_len: HashMap::new(),
@@ -1129,6 +1143,7 @@ impl AntigravityTrajectoryWatcher {
             state.foreground_active = true;
             state.foreground_start_idx = cur_max;
             state.autonomous_turn_open = false;
+            state.last_autonomous_progress_at = None;
             state.force_poll = true;
             cvar.notify_one();
         }
@@ -1225,7 +1240,12 @@ fn watch_loop(
                 break;
             };
             let stamp = db_stat_stamp(db_path);
-            let should_scan = state.force_poll || (stamp.is_some() && stamp != state.last_stamp);
+            let gap_timed_out = state.autonomous_turn_open
+                && state
+                    .last_autonomous_progress_at
+                    .is_some_and(|t| t.elapsed() >= AUTONOMOUS_TOOL_GAP_TIMEOUT);
+            let should_scan =
+                state.force_poll || gap_timed_out || (stamp.is_some() && stamp != state.last_stamp);
             state.force_poll = false;
             if should_scan {
                 state.last_stamp = stamp;
@@ -1269,9 +1289,13 @@ fn drive_autonomous_wakeups(
         return;
     }
 
-    let has_wakeup_trigger = post_steps
-        .iter()
-        .any(|s| s.system_message.as_ref().is_some_and(is_wakeup_system_message));
+    let has_wakeup_trigger = post_steps.iter().any(|s| {
+        s.system_message
+            .as_ref()
+            .is_some_and(is_wakeup_system_message)
+            || s.planner.is_some()
+            || s.tool_call.is_some()
+    });
     if !state.autonomous_turn_open && !has_wakeup_trigger {
         return;
     }
@@ -1341,6 +1365,10 @@ fn drive_autonomous_wakeups(
         }
     }
 
+    if any_visible_work {
+        state.last_autonomous_progress_at = Some(Instant::now());
+    }
+
     if !state.autonomous_turn_open {
         return;
     }
@@ -1351,8 +1379,37 @@ fn drive_autonomous_wakeups(
     let foreground_step_still_running = post_steps.iter().any(|s| {
         s.task_details.is_none() && s.subagent.is_none() && is_step_in_progress(s.status)
     });
-    if !foreground_step_still_running && (any_visible_work || post_steps.iter().any(|s| s.planner.is_some())) {
+    if foreground_step_still_running {
+        return;
+    }
+
+    // Never close the autonomous turn immediately after a tool step (e.g.
+    // `read_file` -> DONE) or a tool-calling `PlannerResponse`: `agy --worker`
+    // is about to insert the follow-up `PlannerResponse` with the final answer
+    // on the next tick. Close immediately once the last non-background step is
+    // a terminal final `PlannerResponse` (no `tool_calls`) or terminal error/cancel,
+    // and fall back to `AUTONOMOUS_TOOL_GAP_TIMEOUT` only if the worker stalls.
+    let last_cascade_step = post_steps
+        .iter()
+        .rev()
+        .find(|s| s.task_details.is_none() && s.subagent.is_none());
+    let reached_terminal_reply = last_cascade_step.is_some_and(|s| {
+        s.error.is_some()
+            || matches!(
+                s.status,
+                STEP_STATUS_ERROR | STEP_STATUS_CANCELED | STEP_STATUS_INTERRUPTED
+            )
+            || s.planner
+                .as_ref()
+                .is_some_and(|p| !p.has_tool_calls && is_step_terminal(s.status))
+    });
+    let gap_timed_out = state
+        .last_autonomous_progress_at
+        .is_some_and(|t| t.elapsed() >= AUTONOMOUS_TOOL_GAP_TIMEOUT);
+
+    if reached_terminal_reply || gap_timed_out {
         state.autonomous_turn_open = false;
+        state.last_autonomous_progress_at = None;
         if let Some(max_idx) = post_steps.last().map(|s| s.idx) {
             state.synced_step_idx = state.synced_step_idx.max(max_idx);
         }
@@ -1518,6 +1575,148 @@ mod tests {
         assert!(saw_turn_finished);
 
         drop(watcher);
+        drop(conn);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn autonomous_wakeup_waits_for_final_planner_after_tool_step() {
+        let dir =
+            std::env::temp_dir().join(format!("waku-agy-watch-gap-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("sess-gap.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE steps (
+                idx INTEGER PRIMARY KEY,
+                step_type INTEGER NOT NULL DEFAULT 0,
+                status INTEGER NOT NULL DEFAULT 0,
+                task_details BLOB,
+                step_payload BLOB
+            );",
+        )
+        .unwrap();
+
+        // Step 0: background TaskDetails RUNNING
+        let mut td = Vec::new();
+        encode_field_str(1, "sess-gap/task-0", &mut td);
+        encode_field_str(7, "Build HTML", &mut td);
+        let mut step0 = Vec::new();
+        encode_field_varint(4, STEP_STATUS_RUNNING as u64, &mut step0);
+        encode_field_bytes(148, &td, &mut step0);
+        conn.execute(
+            "INSERT INTO steps (idx, status, task_details, step_payload) VALUES (0, ?1, ?2, ?3)",
+            rusqlite::params![STEP_STATUS_RUNNING, td, step0],
+        )
+        .unwrap();
+
+        let (events, rx) = crate::driver::test_event_channel();
+        let watcher = AntigravityTrajectoryWatcher::start(dir.clone(), "sess-gap", events);
+        watcher.shared.0.lock().unwrap().birth_step_idx = 0;
+        watcher.shared.0.lock().unwrap().synced_step_idx = -1;
+        let settlement = watcher.on_foreground_settled(true);
+        assert!(settlement.has_live_detached_work);
+        while rx.try_recv().is_ok() {}
+
+        // Phase 1: background finishes, <SYSTEM_MESSAGE> wakes worker, PlannerResponse calls read_file,
+        // read_file completes (DONE), BEFORE final PlannerResponse is written (1s real-world gap!).
+        conn.execute(
+            "UPDATE steps SET status = ?1 WHERE idx = 0",
+            rusqlite::params![STEP_STATUS_DONE],
+        )
+        .unwrap();
+
+        let mut sys_agent = Vec::new();
+        encode_field_str(3, "sess-gap/task-0", &mut sys_agent);
+        encode_field_str(4, "done", &mut sys_agent);
+        let mut sys_msg = Vec::new();
+        encode_field_str(3, "task_notification", &mut sys_msg);
+        encode_field_bytes(4, &sys_agent, &mut sys_msg);
+        let mut step1 = Vec::new();
+        encode_field_varint(4, STEP_STATUS_DONE as u64, &mut step1);
+        encode_field_bytes(114, &sys_msg, &mut step1);
+
+        // Step 2: PlannerResponse with tag 7 (tool_calls) and no final response text
+        let mut tc_blob = Vec::new();
+        encode_field_str(1, "call-read-1", &mut tc_blob);
+        encode_field_str(2, "read_file", &mut tc_blob);
+        let mut planner_tc = Vec::new();
+        encode_field_bytes(7, &tc_blob, &mut planner_tc);
+        let mut step2 = Vec::new();
+        encode_field_varint(4, STEP_STATUS_DONE as u64, &mut step2);
+        encode_field_bytes(20, &planner_tc, &mut step2);
+
+        // Step 3: Tool execution step (read_file -> DONE)
+        let mut metadata = Vec::new();
+        encode_field_bytes(4, &tc_blob, &mut metadata);
+        let mut step3 = Vec::new();
+        encode_field_varint(4, STEP_STATUS_DONE as u64, &mut step3);
+        encode_field_bytes(5, &metadata, &mut step3);
+
+        for (idx, payload) in [(1_i64, step1), (2, step2), (3, step3)] {
+            conn.execute(
+                "INSERT INTO steps (idx, status, step_payload) VALUES (?1, ?2, ?3)",
+                rusqlite::params![idx, STEP_STATUS_DONE, payload],
+            )
+            .unwrap();
+        }
+
+        watcher.refresh_now();
+        std::thread::sleep(Duration::from_millis(200));
+
+        let mut saw_started = false;
+        let mut saw_read_activity = false;
+        let mut saw_premature_finish = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                DriverEvent::TurnStarted => saw_started = true,
+                DriverEvent::Activity {
+                    kind: ActivityKind::FileRead,
+                    complete: true,
+                    ..
+                } => saw_read_activity = true,
+                DriverEvent::TurnFinished { .. } | DriverEvent::TurnParked => {
+                    saw_premature_finish = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_started, "expected TurnStarted on tool step");
+        assert!(saw_read_activity, "expected FileRead activity");
+        assert!(
+            !saw_premature_finish,
+            "must NOT prematurely close autonomous turn right after tool step finishes"
+        );
+
+        // Phase 2: 1s later agy writes step 4 (final PlannerResponse with no tool_calls)
+        let mut final_planner = Vec::new();
+        encode_field_str(1, "Final character analysis ready!", &mut final_planner);
+        let mut step4 = Vec::new();
+        encode_field_varint(4, STEP_STATUS_DONE as u64, &mut step4);
+        encode_field_bytes(20, &final_planner, &mut step4);
+        conn.execute(
+            "INSERT INTO steps (idx, status, step_payload) VALUES (4, ?1, ?2)",
+            rusqlite::params![STEP_STATUS_DONE, step4],
+        )
+        .unwrap();
+
+        watcher.refresh_now();
+        std::thread::sleep(Duration::from_millis(200));
+
+        let mut final_text = String::new();
+        let mut saw_finish = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                DriverEvent::TextDelta(t) => final_text.push_str(&t),
+                DriverEvent::TurnFinished { success: true, .. } => saw_finish = true,
+                _ => {}
+            }
+        }
+        assert_eq!(final_text, "Final character analysis ready!");
+        assert!(saw_finish, "expected TurnFinished after final PlannerResponse");
+
+        drop(watcher);
+        drop(conn);
         let _ = fs::remove_dir_all(dir);
     }
 }
