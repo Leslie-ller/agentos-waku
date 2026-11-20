@@ -47,6 +47,9 @@ second opinion. Adapt your lens to the question:\n\
 STRICT RULES:\n\
 - You are running in a STRICTLY READ-ONLY session. Never attempt to create, edit, delete, or \
   modify files, git state, or system state.\n\
+- NEVER invoke shell or terminal execution tools (such as run_command) when native file read or \
+  search tools (read_file, list_dir, grep_search, find_by_name, etc.) are available — shell \
+  commands are blocked in this read-only sandbox.\n\
 - Do NOT ask the user questions or request approvals — your output goes back to the calling \
   agent, not directly to the end user.\n\
 - Verify claims against actual files or local images in the workspace when paths are involved, \
@@ -2139,6 +2142,44 @@ fn run_isolated_codex_oneshot(
     }
 }
 
+fn select_advisor_permission_outcome(
+    read_only: bool,
+    kind: &str,
+    options: Option<&[Value]>,
+) -> (Value, bool) {
+    let allow_read = read_only && matches!(kind, "read" | "search");
+    let allow_any = !read_only;
+    if allow_read || allow_any {
+        let outcome = options
+            .and_then(|opts| {
+                opts.iter().find(|o| {
+                    matches!(
+                        o.get("kind").and_then(Value::as_str),
+                        Some("allow_once" | "allow_always")
+                    )
+                })
+            })
+            .and_then(|o| o.get("optionId").and_then(Value::as_str))
+            .map(|opt_id| json!({ "outcome": "selected", "optionId": opt_id }))
+            .unwrap_or_else(|| json!({ "outcome": "cancelled" }));
+        (outcome, false)
+    } else {
+        let outcome = options
+            .and_then(|opts| {
+                opts.iter().find(|o| {
+                    matches!(
+                        o.get("kind").and_then(Value::as_str),
+                        Some("reject_once" | "reject_always")
+                    )
+                })
+            })
+            .and_then(|o| o.get("optionId").and_then(Value::as_str))
+            .map(|opt_id| json!({ "outcome": "selected", "optionId": opt_id }))
+            .unwrap_or_else(|| json!({ "outcome": "cancelled" }));
+        (outcome, true)
+    }
+}
+
 fn run_isolated_antigravity_oneshot(
     cwd: &Path,
     prompt: &str,
@@ -2189,7 +2230,8 @@ fn run_isolated_antigravity_oneshot(
     let deadline = Instant::now() + timeout;
     let wait_for_id = |stdin: &mut std::process::ChildStdin,
                            target_id: i64,
-                           collected: &mut String|
+                           collected: &mut String,
+                           denied_any: &mut bool|
      -> anyhow::Result<Value> {
         loop {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -2215,25 +2257,15 @@ fn run_isolated_antigravity_oneshot(
                     .pointer("/params/toolCall/kind")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let allow_read = read_only && matches!(kind, "read" | "search");
-                let allow_any = !read_only;
-                let outcome = if allow_read || allow_any {
-                    msg.pointer("/params/options")
-                        .and_then(Value::as_array)
-                        .and_then(|opts| {
-                            opts.iter().find(|o| {
-                                matches!(
-                                    o.get("kind").and_then(Value::as_str),
-                                    Some("allow_once" | "allow_always")
-                                )
-                            })
-                        })
-                        .and_then(|o| o.get("optionId").and_then(Value::as_str))
-                        .map(|opt_id| json!({ "outcome": "selected", "optionId": opt_id }))
-                        .unwrap_or_else(|| json!({ "outcome": "cancelled" }))
-                } else {
-                    json!({ "outcome": "cancelled" })
-                };
+                let options = msg
+                    .pointer("/params/options")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice);
+                let (outcome, was_denied) =
+                    select_advisor_permission_outcome(read_only, kind, options);
+                if was_denied {
+                    *denied_any = true;
+                }
                 send_msg(
                     stdin,
                     json!({ "jsonrpc": "2.0", "id": req_id, "result": { "outcome": outcome } }),
@@ -2247,6 +2279,7 @@ fn run_isolated_antigravity_oneshot(
     };
 
     let mut output = String::new();
+    let mut denied_any = false;
     let result = (|| -> anyhow::Result<String> {
         send_msg(
             &mut stdin,
@@ -2261,7 +2294,7 @@ fn run_isolated_antigravity_oneshot(
                 }
             }),
         )?;
-        let init_resp = wait_for_id(&mut stdin, 1, &mut output)?;
+        let init_resp = wait_for_id(&mut stdin, 1, &mut output, &mut denied_any)?;
         if let Some(err) = init_resp.get("error") {
             anyhow::bail!("Antigravity advisor initialize failed: {err}");
         }
@@ -2275,7 +2308,7 @@ fn run_isolated_antigravity_oneshot(
                 "params": { "cwd": cwd.to_string_lossy(), "mcpServers": [] }
             }),
         )?;
-        let new_resp = wait_for_id(&mut stdin, 2, &mut output)?;
+        let new_resp = wait_for_id(&mut stdin, 2, &mut output, &mut denied_any)?;
         if let Some(err) = new_resp.get("error") {
             anyhow::bail!("Antigravity advisor session/new failed: {err}");
         }
@@ -2295,7 +2328,7 @@ fn run_isolated_antigravity_oneshot(
                     "params": { "sessionId": sid, "configId": "model", "value": model_id }
                 }),
             );
-            let _ = wait_for_id(&mut stdin, 3, &mut output);
+            let _ = wait_for_id(&mut stdin, 3, &mut output, &mut denied_any);
         }
 
         send_msg(
@@ -2310,9 +2343,35 @@ fn run_isolated_antigravity_oneshot(
                 }
             }),
         )?;
-        let prompt_resp = wait_for_id(&mut stdin, 4, &mut output)?;
+        let prompt_resp = wait_for_id(&mut stdin, 4, &mut output, &mut denied_any)?;
         if let Some(err) = prompt_resp.get("error") {
             anyhow::bail!("Antigravity advisor session/prompt failed: {err}");
+        }
+        if read_only && output.trim().is_empty() && denied_any {
+            // `agy acp` aborts the current turn with empty text when a blocked
+            // shell/write tool permission is rejected or cancelled. Send one
+            // automatic recovery prompt reminding the advisor to use only
+            // native read/search tools (e.g. `read_file`) and answer directly.
+            let mut recovery_denied = false;
+            send_msg(
+                &mut stdin,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": sid,
+                        "prompt": [{
+                            "type": "text",
+                            "text": "Your previous tool call was blocked because this advisor session is strictly read-only. Do NOT call run_command or any shell/write tool. Use ONLY native read/search tools (such as read_file) or answer directly from the context already provided, and return your concise final advice now."
+                        }]
+                    }
+                }),
+            )?;
+            let recovery_resp = wait_for_id(&mut stdin, 5, &mut output, &mut recovery_denied)?;
+            if let Some(err) = recovery_resp.get("error") {
+                anyhow::bail!("Antigravity advisor recovery session/prompt failed: {err}");
+            }
         }
         if output.trim().is_empty() {
             anyhow::bail!("Antigravity advisor returned empty response");
@@ -5190,6 +5249,25 @@ mod tests {
         );
         assert!(ADVISOR_SYSTEM_PROMPT.contains("creative/art director"));
         assert!(ADVISOR_SYSTEM_PROMPT.contains("local images/contact sheets"));
+        assert!(ADVISOR_SYSTEM_PROMPT.contains("run_command"));
+        assert!(ADVISOR_SYSTEM_PROMPT.contains("read_file"));
+
+        let opts = vec![
+            json!({ "kind": "allow_once", "optionId": "allow-1" }),
+            json!({ "kind": "reject_once", "optionId": "reject-1" }),
+        ];
+        assert_eq!(
+            select_advisor_permission_outcome(true, "read", Some(&opts)),
+            (json!({ "outcome": "selected", "optionId": "allow-1" }), false)
+        );
+        assert_eq!(
+            select_advisor_permission_outcome(true, "execute", Some(&opts)),
+            (json!({ "outcome": "selected", "optionId": "reject-1" }), true)
+        );
+        assert_eq!(
+            select_advisor_permission_outcome(true, "execute", Some(&opts[..1])),
+            (json!({ "outcome": "cancelled" }), true)
+        );
 
         let ro_args = build_codex_oneshot_args(Path::new("/tmp/ws"), Some("gpt-6.2-sol"), true);
         assert!(ro_args.iter().any(|a| a == "mcp_servers={}"));
