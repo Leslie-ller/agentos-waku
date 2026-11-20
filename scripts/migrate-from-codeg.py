@@ -541,6 +541,17 @@ def is_temp_fixture_path(path_str: str) -> bool:
     return False
 
 
+def is_excluded_path(path_str: str, exclude_paths: list[str]) -> bool:
+    clean = path_str.rstrip("/")
+    for raw in exclude_paths:
+        ex = raw.strip().rstrip("/")
+        if not ex:
+            continue
+        if clean == ex or clean.startswith(ex + "/"):
+            return True
+    return False
+
+
 def run_migration(
     source_db: Path,
     target_dir: Path,
@@ -548,6 +559,7 @@ def run_migration(
     require_static_source: bool = False,
     active_only: bool = False,
     projectless_root: Path | None = None,
+    exclude_paths: list[str] | None = None,
 ) -> dict:
     t0 = time.time()
     repo_root = Path(__file__).resolve().parent.parent
@@ -610,9 +622,12 @@ def run_migration(
             )
             next_position += 1
 
+        excluded = exclude_paths or []
         chat_folder_ids: list[int] = []
         for fid, fname, fpath, fcreated, _fdeleted, _sort_order, fkind, falias in folder_rows:
             clean_path = (fpath or f"/Volumes/data/Codex/AgentOS/legacy-folder-{fid}").strip()
+            if excluded and is_excluded_path(clean_path, excluded):
+                continue
             if active_only:
                 if (fkind or "").strip().lower() == "chat" or "/chat-sessions/" in clean_path:
                     chat_folder_ids.append(fid)
@@ -1241,6 +1256,12 @@ def main() -> int:
         default=None,
         help="Override Waku projectless workspace root (defaults to ~/.waku/projects)",
     )
+    parser.add_argument(
+        "--exclude-path",
+        action="append",
+        default=[],
+        help="Exclude folder path (exact match or subpath); repeatable",
+    )
     args = parser.parse_args()
 
     report = run_migration(
@@ -1250,6 +1271,7 @@ def main() -> int:
         require_static_source=args.require_static_source,
         active_only=args.active_only,
         projectless_root=args.projectless_root,
+        exclude_paths=args.exclude_path,
     )
     print(
         json.dumps(
