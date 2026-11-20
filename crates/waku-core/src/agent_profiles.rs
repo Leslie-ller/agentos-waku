@@ -816,7 +816,9 @@ mod tests {
     #[test]
     fn antigravity_cli_args_require_absolute_profile_and_gate_yolo_flag() {
         assert!(is_antigravity_cli_binary(Path::new("/Users/test/.local/bin/agy")));
-        assert!(is_antigravity_cli_binary(Path::new("C:\\bin\\agy.exe")));
+        assert!(is_antigravity_cli_binary(Path::new("agy.exe")));
+        #[cfg(windows)]
+        assert!(is_antigravity_cli_binary(Path::new(r"C:\bin\agy.exe")));
         assert!(!is_antigravity_cli_binary(Path::new("/cache/agy_acp_server.par")));
         assert!(!is_antigravity_cli_binary(Path::new("/tmp/fake_agy_acp.py")));
 
