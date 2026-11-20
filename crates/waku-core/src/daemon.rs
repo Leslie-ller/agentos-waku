@@ -397,7 +397,7 @@ impl Backend for WakuBackend {
                     .sessions
                     .lock()
                     .iter()
-                    .map(|(session_id, (runtime_id, _, _))| (*session_id, *runtime_id))
+                    .map(|(session_id, (runtime_id, _, _, _))| (*session_id, *runtime_id))
                     .collect::<HashMap<_, _>>();
                 let mut state = self.task_state.lock();
                 let removed_session_ids = self.removed_session_ids.lock();
@@ -1584,7 +1584,7 @@ impl WakuBackend {
             .sessions
             .lock()
             .get(&source.id)
-            .map(|(_, _, driver)| driver.clone())
+            .map(|(_, _, driver, _)| driver.clone())
         {
             return driver.fork(turns_to_remove);
         }
@@ -1695,7 +1695,7 @@ impl WakuBackend {
                     .sessions
                     .lock()
                     .get(&source.id)
-                    .map(|(_, _, driver)| driver.clone())
+                    .map(|(_, _, driver, _)| driver.clone())
                 {
                     driver
                         .rollback(rollback_turns)?
@@ -1786,7 +1786,7 @@ impl WakuBackend {
             .sessions
             .lock()
             .get(&source.id)
-            .map(|(_, _, driver)| driver.clone())
+            .map(|(_, _, driver, _)| driver.clone())
         {
             return driver.rollback(rollback_turns);
         }
