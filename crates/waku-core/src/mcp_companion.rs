@@ -5065,9 +5065,9 @@ mod tests {
         assert_eq!(both_ok["durationMs"], 4300);
         assert_eq!(both_ok["advisors"].as_array().unwrap().len(), 2);
         let combined = both_ok["advice"].as_str().unwrap();
-        assert!(combined.contains("## Advisor 1: Codex (`gpt-6.2-sol`)"));
+        assert!(combined.contains("## Advisor 1: Codex CLI (`gpt-6.2-sol`)"));
         assert!(combined.contains("Codex verdict: looks solid."));
-        assert!(combined.contains("## Advisor 2: Antigravity (`claude-opus-5-5`)"));
+        assert!(combined.contains("## Advisor 2: Google Antigravity (`claude-opus-5-5`)"));
         assert!(combined.contains("Opus verdict: tighten edge cases."));
 
         // Partial failure still preserves the surviving advisor's advice.
