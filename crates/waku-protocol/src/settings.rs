@@ -13,7 +13,7 @@ fn default_true() -> bool {
 }
 
 fn default_advisor_provider() -> String {
-    "auto".to_owned()
+    "both".to_owned()
 }
 
 /// Feature toggles and routing preferences for the built-in `agentos-mcp`
@@ -28,8 +28,8 @@ pub struct AgentOsMcpSettings {
     pub goal_enabled: bool,
     #[serde(default = "default_true")]
     pub advisor_enabled: bool,
-    /// Target advisor provider: `"auto"` (heterogeneous opposite family),
-    /// `"codex"`, or `"antigravity"`.
+    /// Target advisor provider: `"both"` (Codex + Antigravity in parallel),
+    /// `"auto"` (heterogeneous opposite family), `"codex"`, or `"antigravity"`.
     #[serde(default = "default_advisor_provider")]
     pub advisor_provider: String,
     #[serde(default = "default_true")]

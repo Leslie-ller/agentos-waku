@@ -54,6 +54,7 @@ STRICT RULES:\n\
   concise (aim for 400–800 tokens): state the verdict/diagnosis first, then concrete steps, \
   trade-offs, or creative improvements.";
 pub const MEMORY_MCP_INSTRUCTIONS: &str = "Persistent cross-session memory is available via memory_search (default scope=\"project\") and memory_read. Whenever the user references past state or behavior (e.g. 'before', 'last time', 'previously', 'still connected', 'again', '以前', '上次', '之前', '还在吗', '又...了', '连过', '配过'), or when troubleshooting devices, local network/SSH/proxy topology, credentials, deployment setup, or unexpected environment discrepancies, call memory_search(scope=\"project\") with 1-3 focused keywords BEFORE guessing or running broad diagnostics. Whenever the user's message mentions a past session link such as [Session title](agentos://session/<id>) or [Session title](codeg://session/<id>), call get_session_info(session_id=\"<id>\") to inspect its title, workspace, and recent transcript.";
+pub const ADVISOR_MCP_INSTRUCTIONS: &str = "Read-only cross-model peer review is available via consult_advisor (Codex gpt-6.2-sol + Antigravity claude-opus-5-5, supporting parallel dual-advisor mode via advisor_provider=\"both\" or the user's configured default). Before finalizing non-trivial architectural plans, risky multi-file changes, stubborn bugs, or creative/aesthetic/visual decisions (including reviewing local screenshots, contact sheets, or storyboards), proactively call consult_advisor with a concise question and relevant file paths for an independent second opinion.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpCompanionLaunch {
@@ -351,8 +352,16 @@ pub fn dispatch_mcp_request(conn: &Connection, ctx: &McpContext, req: &Value) ->
                     "version": env!("CARGO_PKG_VERSION"),
                 }
             });
-            if ctx.mcp_settings().memory_enabled {
-                init["instructions"] = json!(MEMORY_MCP_INSTRUCTIONS);
+            let mcp_settings = ctx.mcp_settings();
+            let mut instruction_parts: Vec<&str> = Vec::new();
+            if mcp_settings.memory_enabled {
+                instruction_parts.push(MEMORY_MCP_INSTRUCTIONS);
+            }
+            if mcp_settings.advisor_enabled {
+                instruction_parts.push(ADVISOR_MCP_INSTRUCTIONS);
+            }
+            if !instruction_parts.is_empty() {
+                init["instructions"] = json!(instruction_parts.join("\n\n"));
             }
             Ok(init)
         }
@@ -1389,14 +1398,14 @@ fn call_mcp_tool(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or(settings.advisor_provider.as_str());
-            let advisor_provider = resolve_advisor_provider(requested, ctx.caller_provider)?;
-            let model = args
+            let requested_both = is_parallel_advisor_request(requested);
+            let targets = resolve_advisor_providers(requested, ctx.caller_provider)?;
+            let model_override = args
                 .get("model")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .or_else(|| default_advisor_model(advisor_provider).map(str::to_owned));
+                .map(str::to_owned);
 
             let mut prompt = format!("{ADVISOR_SYSTEM_PROMPT}\n\n");
             prompt.push_str(&format!("Question:\n{question}\n"));
@@ -1410,57 +1419,172 @@ fn call_mcp_tool(
                 }
             }
 
-            let cid = Uuid::new_v4().to_string();
             let caller_name = ctx.caller_provider.map(|p| p.id().to_owned());
-            conn.execute(
-                "INSERT INTO agentos_advisor_consultations
-                 (consultation_id, session_id, caller_provider, advisor_provider, model, question, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7)",
-                params![
-                    cid,
-                    ctx.session_id,
-                    caller_name,
-                    advisor_provider.id(),
-                    model,
-                    question,
-                    now
-                ],
-            )?;
+            let wall_started = Instant::now();
 
-            match run_isolated_oneshot_agent(
-                advisor_provider,
-                &ctx.cwd,
-                &prompt,
-                model.as_deref(),
-                true,
-                Duration::from_secs(120),
-                None,
-            ) {
-                Ok(advice) => {
-                    let completed_at = unix_now();
-                    let _ = conn.execute(
-                        "UPDATE agentos_advisor_consultations
-                         SET status = 'completed', advice = ?1, completed_at = ?2
-                         WHERE consultation_id = ?3",
-                        params![advice, completed_at, cid],
-                    );
-                    Ok(json!({
-                        "consultationId": cid,
-                        "advisorProvider": advisor_provider.id(),
-                        "model": model,
-                        "readOnlyEnforced": true,
-                        "advice": advice,
-                    }))
+            if targets.len() == 1 {
+                let advisor_provider = targets[0];
+                let model = model_override
+                    .or_else(|| default_advisor_model(advisor_provider).map(str::to_owned));
+                let cid = Uuid::new_v4().to_string();
+                conn.execute(
+                    "INSERT INTO agentos_advisor_consultations
+                     (consultation_id, session_id, caller_provider, advisor_provider, model, question, status, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7)",
+                    params![
+                        cid,
+                        ctx.session_id,
+                        caller_name,
+                        advisor_provider.id(),
+                        model,
+                        question,
+                        now
+                    ],
+                )?;
+
+                match run_isolated_oneshot_agent(
+                    advisor_provider,
+                    &ctx.cwd,
+                    &prompt,
+                    model.as_deref(),
+                    true,
+                    Duration::from_secs(120),
+                    None,
+                ) {
+                    Ok(advice) => {
+                        let completed_at = unix_now();
+                        let _ = conn.execute(
+                            "UPDATE agentos_advisor_consultations
+                             SET status = 'completed', advice = ?1, completed_at = ?2
+                             WHERE consultation_id = ?3",
+                            params![advice, completed_at, cid],
+                        );
+                        let mut response = json!({
+                            "consultationId": cid,
+                            "mode": "single",
+                            "parallel": false,
+                            "advisorProvider": advisor_provider.id(),
+                            "model": model,
+                            "readOnlyEnforced": true,
+                            "durationMs": wall_started.elapsed().as_millis() as u64,
+                            "advice": advice,
+                        });
+                        if requested_both {
+                            response["requestedMode"] = json!("both");
+                            response["warning"] = json!(format!(
+                                "Parallel 'both' mode was requested, but only {} is currently installed/authenticated; ran single-advisor fallback.",
+                                advisor_provider.display_name()
+                            ));
+                        }
+                        Ok(response)
+                    }
+                    Err(error) => {
+                        let _ = conn.execute(
+                            "UPDATE agentos_advisor_consultations
+                             SET status = 'failed', advice = ?1, completed_at = ?2
+                             WHERE consultation_id = ?3",
+                            params![error.to_string(), unix_now(), cid],
+                        );
+                        Err(error)
+                    }
                 }
-                Err(error) => {
-                    let _ = conn.execute(
-                        "UPDATE agentos_advisor_consultations
-                         SET status = 'failed', advice = ?1, completed_at = ?2
-                         WHERE consultation_id = ?3",
-                        params![error.to_string(), unix_now(), cid],
-                    );
-                    Err(error)
+            } else {
+                // Parallel dual-advisor mode: pre-insert all running rows on the calling
+                // thread (rusqlite::Connection is !Sync), fan out via std::thread::scope,
+                // then persist every advisor's outcome on the calling thread.
+                let mut jobs: Vec<(String, ProviderKind, Option<String>)> =
+                    Vec::with_capacity(targets.len());
+                for advisor_provider in targets {
+                    let cid = Uuid::new_v4().to_string();
+                    let model = default_advisor_model(advisor_provider).map(str::to_owned);
+                    conn.execute(
+                        "INSERT INTO agentos_advisor_consultations
+                         (consultation_id, session_id, caller_provider, advisor_provider, model, question, status, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7)",
+                        params![
+                            cid,
+                            ctx.session_id,
+                            caller_name,
+                            advisor_provider.id(),
+                            model,
+                            question,
+                            now
+                        ],
+                    )?;
+                    jobs.push((cid, advisor_provider, model));
                 }
+
+                let outcomes: Vec<ParallelAdvisorOutcome> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = jobs
+                        .into_iter()
+                        .map(|(cid, provider, model)| {
+                            let cwd = &ctx.cwd;
+                            let prompt = &prompt;
+                            let cid_for_panic = cid.clone();
+                            let model_for_panic = model.clone();
+                            let handle = scope.spawn(move || {
+                                let started = Instant::now();
+                                let result = run_isolated_oneshot_agent(
+                                    provider,
+                                    cwd,
+                                    prompt,
+                                    model.as_deref(),
+                                    true,
+                                    Duration::from_secs(120),
+                                    None,
+                                );
+                                ParallelAdvisorOutcome {
+                                    consultation_id: cid,
+                                    provider,
+                                    model,
+                                    duration_ms: started.elapsed().as_millis() as u64,
+                                    result,
+                                }
+                            });
+                            (cid_for_panic, provider, model_for_panic, handle)
+                        })
+                        .collect();
+
+                    handles
+                        .into_iter()
+                        .map(|(cid, provider, model, handle)| {
+                            handle.join().unwrap_or_else(|_| ParallelAdvisorOutcome {
+                                consultation_id: cid,
+                                provider,
+                                model,
+                                duration_ms: wall_started.elapsed().as_millis() as u64,
+                                result: Err(anyhow!("advisor worker thread panicked")),
+                            })
+                        })
+                        .collect()
+                });
+
+                let completed_at = unix_now();
+                for outcome in &outcomes {
+                    match &outcome.result {
+                        Ok(advice) => {
+                            let _ = conn.execute(
+                                "UPDATE agentos_advisor_consultations
+                                 SET status = 'completed', advice = ?1, completed_at = ?2
+                                 WHERE consultation_id = ?3",
+                                params![advice, completed_at, outcome.consultation_id],
+                            );
+                        }
+                        Err(error) => {
+                            let _ = conn.execute(
+                                "UPDATE agentos_advisor_consultations
+                                 SET status = 'failed', advice = ?1, completed_at = ?2
+                                 WHERE consultation_id = ?3",
+                                params![error.to_string(), completed_at, outcome.consultation_id],
+                            );
+                        }
+                    }
+                }
+
+                build_parallel_advisor_response(
+                    &outcomes,
+                    wall_started.elapsed().as_millis() as u64,
+                )
             }
         }
 
@@ -1693,49 +1817,186 @@ pub(crate) fn default_advisor_model(provider: ProviderKind) -> Option<&'static s
     }
 }
 
+struct ParallelAdvisorOutcome {
+    consultation_id: String,
+    provider: ProviderKind,
+    model: Option<String>,
+    duration_ms: u64,
+    result: anyhow::Result<String>,
+}
+
+fn is_parallel_advisor_request(requested: &str) -> bool {
+    matches!(
+        requested.trim().to_ascii_lowercase().as_str(),
+        "both" | "all" | "parallel" | "dual"
+    )
+}
+
+fn build_parallel_advisor_response(
+    outcomes: &[ParallelAdvisorOutcome],
+    wall_duration_ms: u64,
+) -> anyhow::Result<Value> {
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    let mut advisor_items = Vec::with_capacity(outcomes.len());
+    let mut sections = Vec::with_capacity(outcomes.len());
+    let mut errors = Vec::new();
+
+    for (idx, outcome) in outcomes.iter().enumerate() {
+        let model_label = outcome.model.as_deref().unwrap_or("default");
+        let heading = format!(
+            "## Advisor {}: {} (`{model_label}`)",
+            idx + 1,
+            outcome.provider.display_name()
+        );
+        match &outcome.result {
+            Ok(advice) => {
+                succeeded += 1;
+                advisor_items.push(json!({
+                    "consultationId": outcome.consultation_id,
+                    "advisorProvider": outcome.provider.id(),
+                    "displayName": outcome.provider.display_name(),
+                    "model": outcome.model,
+                    "status": "completed",
+                    "durationMs": outcome.duration_ms,
+                    "advice": advice,
+                }));
+                sections.push(format!("{heading}\n\n{}", advice.trim()));
+            }
+            Err(error) => {
+                failed += 1;
+                let err_text = error.to_string();
+                errors.push(format!("{}: {err_text}", outcome.provider.display_name()));
+                advisor_items.push(json!({
+                    "consultationId": outcome.consultation_id,
+                    "advisorProvider": outcome.provider.id(),
+                    "displayName": outcome.provider.display_name(),
+                    "model": outcome.model,
+                    "status": "failed",
+                    "durationMs": outcome.duration_ms,
+                    "error": err_text,
+                }));
+                sections.push(format!("{heading}\n\n_[Advisor failed: {err_text}]_"));
+            }
+        }
+    }
+
+    if succeeded == 0 {
+        anyhow::bail!("all parallel advisors failed: {}", errors.join(" | "));
+    }
+
+    Ok(json!({
+        "mode": "both",
+        "parallel": true,
+        "readOnlyEnforced": true,
+        "durationMs": wall_duration_ms,
+        "succeededCount": succeeded,
+        "failedCount": failed,
+        "partialFailure": failed > 0,
+        "advisors": advisor_items,
+        "advice": sections.join("\n\n---\n\n"),
+    }))
+}
+
 pub(crate) fn resolve_advisor_provider(
     requested: &str,
     caller: Option<ProviderKind>,
 ) -> anyhow::Result<ProviderKind> {
+    let agy_ready = crate::agent_profiles::find_antigravity_binary().is_some()
+        && crate::agent_profiles::antigravity_has_stored_credentials();
+    let codex_ready = crate::model::find_codex_binary().is_some();
+    resolve_advisor_provider_with_availability(requested, caller, codex_ready, agy_ready)
+}
+
+pub(crate) fn resolve_advisor_providers(
+    requested: &str,
+    caller: Option<ProviderKind>,
+) -> anyhow::Result<Vec<ProviderKind>> {
+    let agy_ready = crate::agent_profiles::find_antigravity_binary().is_some()
+        && crate::agent_profiles::antigravity_has_stored_credentials();
+    let codex_ready = crate::model::find_codex_binary().is_some();
+    resolve_advisor_providers_with_availability(requested, caller, codex_ready, agy_ready)
+}
+
+fn resolve_advisor_provider_with_availability(
+    requested: &str,
+    caller: Option<ProviderKind>,
+    codex_ready: bool,
+    agy_ready: bool,
+) -> anyhow::Result<ProviderKind> {
     match requested.trim().to_ascii_lowercase().as_str() {
         "codex" => Ok(ProviderKind::Codex),
         "antigravity" | "agy" => Ok(ProviderKind::Antigravity),
-        "" | "auto" => {
-            let agy_ready = crate::agent_profiles::find_antigravity_binary().is_some()
-                && crate::agent_profiles::antigravity_has_stored_credentials();
-            let codex_ready = crate::model::find_codex_binary().is_some();
-            match caller {
-                Some(ProviderKind::Codex) => {
-                    if agy_ready {
-                        Ok(ProviderKind::Antigravity)
-                    } else if codex_ready {
-                        Ok(ProviderKind::Codex)
-                    } else {
-                        anyhow::bail!("no advisor provider binary available (codex/antigravity)")
-                    }
-                }
-                Some(ProviderKind::Antigravity) => {
-                    if codex_ready {
-                        Ok(ProviderKind::Codex)
-                    } else if agy_ready {
-                        Ok(ProviderKind::Antigravity)
-                    } else {
-                        anyhow::bail!("no advisor provider binary available (codex/antigravity)")
-                    }
-                }
-                _ => {
-                    if codex_ready {
-                        Ok(ProviderKind::Codex)
-                    } else if agy_ready {
-                        Ok(ProviderKind::Antigravity)
-                    } else {
-                        anyhow::bail!("no advisor provider binary available (codex/antigravity)")
-                    }
+        "" | "auto" => match caller {
+            Some(ProviderKind::Codex) => {
+                if agy_ready {
+                    Ok(ProviderKind::Antigravity)
+                } else if codex_ready {
+                    Ok(ProviderKind::Codex)
+                } else {
+                    anyhow::bail!("no advisor provider binary available (codex/antigravity)")
                 }
             }
-        }
+            Some(ProviderKind::Antigravity) => {
+                if codex_ready {
+                    Ok(ProviderKind::Codex)
+                } else if agy_ready {
+                    Ok(ProviderKind::Antigravity)
+                } else {
+                    anyhow::bail!("no advisor provider binary available (codex/antigravity)")
+                }
+            }
+            _ => {
+                if codex_ready {
+                    Ok(ProviderKind::Codex)
+                } else if agy_ready {
+                    Ok(ProviderKind::Antigravity)
+                } else {
+                    anyhow::bail!("no advisor provider binary available (codex/antigravity)")
+                }
+            }
+        },
         other => anyhow::bail!("unsupported advisor/delegation provider: {other}"),
     }
+}
+
+fn resolve_advisor_providers_with_availability(
+    requested: &str,
+    caller: Option<ProviderKind>,
+    codex_ready: bool,
+    agy_ready: bool,
+) -> anyhow::Result<Vec<ProviderKind>> {
+    if is_parallel_advisor_request(requested) {
+        let mut providers = Vec::with_capacity(2);
+        if codex_ready {
+            providers.push(ProviderKind::Codex);
+        }
+        if agy_ready {
+            providers.push(ProviderKind::Antigravity);
+        }
+        if providers.is_empty() {
+            anyhow::bail!("no advisor provider binary available (codex/antigravity)");
+        }
+        return Ok(providers);
+    }
+    Ok(vec![resolve_advisor_provider_with_availability(
+        requested,
+        caller,
+        codex_ready,
+        agy_ready,
+    )?])
+}
+
+fn spawn_bounded_stderr_reader(
+    mut stderr: std::process::ChildStderr,
+) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        let _ = (&mut stderr).take(16 * 1024).read_to_end(&mut buf);
+        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        String::from_utf8_lossy(&buf).trim().to_owned()
+    })
 }
 
 fn run_isolated_oneshot_agent(
@@ -1765,6 +2026,8 @@ fn build_codex_oneshot_args(cwd: &Path, model: Option<&str>, read_only: bool) ->
     ];
     if read_only {
         args.extend([
+            "-c".to_owned(),
+            "mcp_servers={}".to_owned(),
             "-c".to_owned(),
             "features.view_image=true".to_owned(),
             "-c".to_owned(),
@@ -1825,6 +2088,7 @@ fn run_isolated_codex_oneshot(
         cb(child.id());
     }
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("codex stdout missing"))?;
+    let stderr_handle = child.stderr.take().map(spawn_bounded_stderr_reader);
     let reader_handle = std::thread::spawn(move || {
         let mut last_message = String::new();
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -1848,11 +2112,21 @@ fn run_isolated_codex_oneshot(
     loop {
         if let Some(status) = child.try_wait()? {
             let text = reader_handle.join().unwrap_or_default();
+            let stderr_text = stderr_handle
+                .and_then(|h| h.join().ok())
+                .unwrap_or_default();
             if status.success() && !text.trim().is_empty() {
                 return Ok(text);
             }
+            if stderr_text.is_empty() {
+                anyhow::bail!(
+                    "isolated Codex one-shot exited with status {status} (output len={})",
+                    text.len()
+                );
+            }
+            let snippet: String = stderr_text.chars().take(400).collect();
             anyhow::bail!(
-                "isolated Codex one-shot exited with status {status} (output len={})",
+                "isolated Codex one-shot exited with status {status} (output len={}): {snippet}",
                 text.len()
             );
         }
@@ -1885,7 +2159,7 @@ fn run_isolated_antigravity_oneshot(
     cmd.current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn Antigravity ACP advisor ({})", binary.display()))?;
@@ -1894,6 +2168,7 @@ fn run_isolated_antigravity_oneshot(
     }
     let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("ACP stdin missing"))?;
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("ACP stdout missing"))?;
+    let stderr_handle = child.stderr.take().map(spawn_bounded_stderr_reader);
 
     let (tx, rx) = crossbeam_channel::unbounded::<Value>();
     std::thread::spawn(move || {
@@ -1986,7 +2261,10 @@ fn run_isolated_antigravity_oneshot(
                 }
             }),
         )?;
-        let _ = wait_for_id(&mut stdin, 1, &mut output)?;
+        let init_resp = wait_for_id(&mut stdin, 1, &mut output)?;
+        if let Some(err) = init_resp.get("error") {
+            anyhow::bail!("Antigravity advisor initialize failed: {err}");
+        }
 
         send_msg(
             &mut stdin,
@@ -1998,6 +2276,9 @@ fn run_isolated_antigravity_oneshot(
             }),
         )?;
         let new_resp = wait_for_id(&mut stdin, 2, &mut output)?;
+        if let Some(err) = new_resp.get("error") {
+            anyhow::bail!("Antigravity advisor session/new failed: {err}");
+        }
         let sid = new_resp
             .pointer("/result/sessionId")
             .and_then(Value::as_str)
@@ -2029,13 +2310,30 @@ fn run_isolated_antigravity_oneshot(
                 }
             }),
         )?;
-        let _ = wait_for_id(&mut stdin, 4, &mut output)?;
+        let prompt_resp = wait_for_id(&mut stdin, 4, &mut output)?;
+        if let Some(err) = prompt_resp.get("error") {
+            anyhow::bail!("Antigravity advisor session/prompt failed: {err}");
+        }
+        if output.trim().is_empty() {
+            anyhow::bail!("Antigravity advisor returned empty response");
+        }
         Ok(output)
     })();
 
+    drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
-    result
+    let stderr_text = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    result.map_err(|err| {
+        if stderr_text.is_empty() {
+            err
+        } else {
+            let snippet: String = stderr_text.chars().take(400).collect();
+            anyhow!("{err} (stderr: {snippet})")
+        }
+    })
 }
 
 // ── Host-side runtime loop helpers (called by waku-daemon) ──────────────────
@@ -3442,21 +3740,28 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
     if settings.advisor_enabled {
         tools.push(json!({
             "name": "consult_advisor",
-            "description": "Consult a read-only senior advisor agent (defaulting to heterogeneous Codex gpt-6.2-sol <-> Antigravity claude-opus-5-5) for an independent second opinion on complex architecture, subtle multi-file bugs, repeated failures, or risky changes, AS WELL AS creative direction, visual/aesthetic critique (inspecting local contact sheets, screenshots, UI previews, or storyboards), and non-code planning. SYNCHRONOUS & STRICTLY READ-ONLY: the advisor can read/search local files and view local images directly, and cannot browse the web, edit files, run mutating commands, or talk to the user.",
+            "description": "Consult read-only senior advisor agent(s) — Codex (gpt-6.2-sol) and/or Antigravity (claude-opus-5-5) — for an independent second opinion. Supports parallel dual-advisor mode ('both', running Codex and Antigravity concurrently in one call and returning both perspectives side by side) as well as single-advisor mode ('auto' heterogeneous opposite, 'codex', 'antigravity'). Use proactively for complex architecture/planning trade-offs, pre-finalization reviews, subtle multi-file bugs, repeated failures, or risky changes, AS WELL AS creative direction, visual/aesthetic critique (inspecting local contact sheets, screenshots, UI previews, or storyboards), and non-code planning. SYNCHRONOUS & STRICTLY READ-ONLY: advisors can read/search local files and view local images directly, and cannot browse the web, edit files, run mutating commands, or talk to the user. Omit advisor_provider to follow AgentOS settings (default: 'both').",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "question": {
                         "type": "string",
-                        "description": "The specific architectural trade-off, debugging hypothesis, code-review question, or creative/aesthetic/planning critique to ask the advisor."
+                        "description": "The specific architectural trade-off, debugging hypothesis, code-review question, or creative/aesthetic/planning critique to ask the advisor(s)."
                     },
                     "context": {
                         "type": "string",
                         "description": "Optional concise background: relevant file or local image/contact-sheet paths, user preferences/aesthetic criteria, approaches already tried, or short error snippets."
                     },
                     "files": { "type": "array", "items": { "type": "string" } },
-                    "advisor_provider": { "type": "string", "enum": ["auto", "codex", "antigravity"] },
-                    "model": { "type": "string" }
+                    "advisor_provider": {
+                        "type": "string",
+                        "enum": ["both", "auto", "codex", "antigravity"],
+                        "description": "Optional override: 'both' queries Codex (gpt-6.2-sol) and Antigravity (claude-opus-5-5) concurrently in parallel; 'auto' picks a single heterogeneous opposite advisor; 'codex' or 'antigravity' targets one advisor. Defaults to AgentOS settings."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional model override when targeting a single advisor (ignored in 'both' mode so each advisor uses its native frontier model)."
+                    }
                 },
                 "required": ["question"]
             }
@@ -4663,11 +4968,179 @@ mod tests {
         assert!(ADVISOR_SYSTEM_PROMPT.contains("local images/contact sheets"));
 
         let ro_args = build_codex_oneshot_args(Path::new("/tmp/ws"), Some("gpt-6.2-sol"), true);
+        assert!(ro_args.iter().any(|a| a == "mcp_servers={}"));
         assert!(ro_args.iter().any(|a| a == "features.view_image=true"));
         assert!(ro_args.iter().any(|a| a == "include_apply_patch_tool=false"));
         assert!(ro_args.iter().any(|a| a == "web_search=\"disabled\""));
         assert!(ro_args.iter().any(|a| a == "features.multi_agent=false"));
         assert!(ro_args.iter().any(|a| a == "read-only"));
         assert!(ro_args.windows(2).any(|w| w == ["-m", "gpt-6.2-sol"]));
+    }
+
+    #[test]
+    fn advisor_parallel_both_resolution_schema_and_response_aggregation() {
+        // Default AgentOsMcpSettings now defaults to parallel dual-advisor mode ("both").
+        let defaults = AgentOsMcpSettings::default();
+        assert_eq!(defaults.advisor_provider, "both");
+
+        // Schema advertises "both" alongside single-advisor modes and remains Gemini-compatible.
+        let tools = mcp_tool_definitions_for(&defaults);
+        let consult = tools
+            .iter()
+            .find(|t| t["name"] == "consult_advisor")
+            .expect("consult_advisor tool present");
+        let enum_vals: Vec<&str> = consult["inputSchema"]["properties"]["advisor_provider"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(enum_vals, vec!["both", "auto", "codex", "antigravity"]);
+        assert!(consult["inputSchema"]["properties"].get("toolSummary").is_none());
+
+        // Provider resolution matrix.
+        assert_eq!(
+            resolve_advisor_providers_with_availability("both", Some(ProviderKind::Codex), true, true)
+                .unwrap(),
+            vec![ProviderKind::Codex, ProviderKind::Antigravity]
+        );
+        assert_eq!(
+            resolve_advisor_providers_with_availability("both", Some(ProviderKind::Antigravity), true, false)
+                .unwrap(),
+            vec![ProviderKind::Codex]
+        );
+        assert_eq!(
+            resolve_advisor_providers_with_availability("both", None, false, true).unwrap(),
+            vec![ProviderKind::Antigravity]
+        );
+        assert!(
+            resolve_advisor_providers_with_availability("both", None, false, false).is_err()
+        );
+        assert_eq!(
+            resolve_advisor_providers_with_availability("auto", Some(ProviderKind::Codex), true, true)
+                .unwrap(),
+            vec![ProviderKind::Antigravity]
+        );
+        assert_eq!(
+            resolve_advisor_providers_with_availability("auto", Some(ProviderKind::Antigravity), true, true)
+                .unwrap(),
+            vec![ProviderKind::Codex]
+        );
+        assert_eq!(
+            resolve_advisor_providers_with_availability("codex", None, false, false).unwrap(),
+            vec![ProviderKind::Codex]
+        );
+        assert_eq!(
+            resolve_advisor_providers_with_availability("agy", None, false, false).unwrap(),
+            vec![ProviderKind::Antigravity]
+        );
+        assert!(resolve_advisor_providers_with_availability("unknown", None, true, true).is_err());
+
+        // Parallel aggregation: both succeed.
+        let both_ok = build_parallel_advisor_response(
+            &[
+                ParallelAdvisorOutcome {
+                    consultation_id: "c1".into(),
+                    provider: ProviderKind::Codex,
+                    model: Some("gpt-6.2-sol".into()),
+                    duration_ms: 4200,
+                    result: Ok("Codex verdict: looks solid.".into()),
+                },
+                ParallelAdvisorOutcome {
+                    consultation_id: "c2".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: Some("claude-opus-5-5".into()),
+                    duration_ms: 3900,
+                    result: Ok("Opus verdict: tighten edge cases.".into()),
+                },
+            ],
+            4300,
+        )
+        .unwrap();
+        assert_eq!(both_ok["mode"], "both");
+        assert_eq!(both_ok["parallel"], true);
+        assert_eq!(both_ok["succeededCount"], 2);
+        assert_eq!(both_ok["failedCount"], 0);
+        assert_eq!(both_ok["partialFailure"], false);
+        assert_eq!(both_ok["durationMs"], 4300);
+        assert_eq!(both_ok["advisors"].as_array().unwrap().len(), 2);
+        let combined = both_ok["advice"].as_str().unwrap();
+        assert!(combined.contains("## Advisor 1: Codex (`gpt-6.2-sol`)"));
+        assert!(combined.contains("Codex verdict: looks solid."));
+        assert!(combined.contains("## Advisor 2: Antigravity (`claude-opus-5-5`)"));
+        assert!(combined.contains("Opus verdict: tighten edge cases."));
+
+        // Partial failure still preserves the surviving advisor's advice.
+        let partial = build_parallel_advisor_response(
+            &[
+                ParallelAdvisorOutcome {
+                    consultation_id: "c1".into(),
+                    provider: ProviderKind::Codex,
+                    model: Some("gpt-6.2-sol".into()),
+                    duration_ms: 1500,
+                    result: Err(anyhow!("codex timed out")),
+                },
+                ParallelAdvisorOutcome {
+                    consultation_id: "c2".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: Some("claude-opus-5-5".into()),
+                    duration_ms: 2100,
+                    result: Ok("Opus surviving advice.".into()),
+                },
+            ],
+            2200,
+        )
+        .unwrap();
+        assert_eq!(partial["succeededCount"], 1);
+        assert_eq!(partial["failedCount"], 1);
+        assert_eq!(partial["partialFailure"], true);
+        assert!(partial["advice"].as_str().unwrap().contains("Opus surviving advice."));
+        assert!(partial["advice"].as_str().unwrap().contains("codex timed out"));
+
+        // Total failure returns Err.
+        let all_fail = build_parallel_advisor_response(
+            &[
+                ParallelAdvisorOutcome {
+                    consultation_id: "c1".into(),
+                    provider: ProviderKind::Codex,
+                    model: Some("gpt-6.2-sol".into()),
+                    duration_ms: 100,
+                    result: Err(anyhow!("codex down")),
+                },
+                ParallelAdvisorOutcome {
+                    consultation_id: "c2".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: Some("claude-opus-5-5".into()),
+                    duration_ms: 100,
+                    result: Err(anyhow!("agy down")),
+                },
+            ],
+            120,
+        );
+        assert!(all_fail.is_err());
+
+        // initialize instructions include proactive advisor guidance when advisor_enabled is true.
+        let dir = std::env::temp_dir().join(format!("waku-mcp-advisor-init-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("app.db");
+        let conn = open_mcp_connection(&db).unwrap();
+        let ctx = McpContext {
+            session_id: Uuid::new_v4().to_string(),
+            db_path: db,
+            cwd: dir.clone(),
+            caller_provider: Some(ProviderKind::Codex),
+            settings_path: Some(dir.join("settings.json")),
+        };
+        let init = dispatch_mcp_request(
+            &conn,
+            &ctx,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        )
+        .unwrap();
+        let instructions = init["result"]["instructions"].as_str().unwrap_or("");
+        assert!(instructions.contains("memory_search"));
+        assert!(instructions.contains("consult_advisor"));
+        assert!(instructions.contains("\"both\""));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

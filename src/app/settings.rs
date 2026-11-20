@@ -742,8 +742,9 @@ impl Waku {
         .into_any_element();
 
         let current_advisor = mcp.advisor_provider.clone();
-        let mut advisor_pills = div().mt(px(8.0)).flex().items_center().gap(px(8.0));
+        let mut advisor_pills = div().mt(px(8.0)).flex().flex_wrap().items_center().gap(px(8.0));
         for (value, label) in [
+            ("both", "Both (Codex + AGY)"),
             ("auto", "Auto (Heterogeneous)"),
             ("codex", "Codex"),
             ("antigravity", "Antigravity"),
@@ -826,7 +827,7 @@ impl Waku {
             .child(make_row(
                 "row-mcp-advisor",
                 "Read-Only Cross-Model Advisor (consult_advisor)",
-                "Consult an isolated hard read-only heterogeneous model for code, architecture, or design critique.",
+                "Consult isolated hard read-only Codex and/or Antigravity advisors (individually or in parallel) for code, architecture, or creative/visual critique.",
                 advisor_toggle,
             ))
             .when(mcp.advisor_enabled, |card| {

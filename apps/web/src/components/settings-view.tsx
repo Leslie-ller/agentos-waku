@@ -210,7 +210,7 @@ const DEFAULT_AGENTOS_MCP: AgentOsMcpSettings = {
   memoryEnabled: true,
   goalEnabled: true,
   advisorEnabled: true,
-  advisorProvider: 'auto',
+  advisorProvider: 'both',
   askUserEnabled: true,
   delegationEnabled: true,
   sessionInfoEnabled: true,
@@ -260,7 +260,7 @@ function GeneralSettings() {
           {([
             ['memoryEnabled', 'Persistent Memory Tools', 'memory_search / memory_read / memory_note_write / memory_checkpoint_prepare / memory_context_rotate / memory_knowledge_propose'],
             ['goalEnabled', 'Autonomous Goal Loop', 'get_goal / create_goal / report_goal with host-enforced continuation, turn cap, and time budget'],
-            ['advisorEnabled', 'Read-Only Senior Advisor', 'consult_advisor invokes an isolated heterogeneous advisor agent for architecture review and debugging'],
+            ['advisorEnabled', 'Read-Only Senior Advisor', 'consult_advisor invokes isolated read-only Codex and/or Antigravity advisors (individually or in parallel) for architecture, debugging, and creative critique'],
             ['askUserEnabled', 'Interactive User Questions', 'ask_user_question pauses the agent and presents structured multi-choice cards'],
             ['delegationEnabled', 'Subagent Delegation', 'spawn_subagent / check_subagent / list_subagents for parallel isolated helper agents'],
             ['sessionInfoEnabled', 'Cross-Session Context Lookup', 'get_session_info allows agents to inspect @-mentioned historical conversations'],
@@ -283,6 +283,7 @@ function GeneralSettings() {
             <div className="text-[13px] font-medium">Advisor Engine</div>
             <div className="mt-2 flex flex-wrap gap-1.5">
               {([
+                ['both', 'Both (Codex + AGY)'],
                 ['auto', 'Auto (Heterogeneous)'],
                 ['codex', 'Codex'],
                 ['antigravity', 'Antigravity'],
