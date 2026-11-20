@@ -3247,7 +3247,7 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
         tools.extend([
             json!({
                 "name": "memory_search",
-                "description": "Search persistent cross-session memory across this workspace (past sessions, device/network/SSH/proxy/env configs, prior fixes, working notes, checkpoints, and project knowledge). CALL THIS FIRST (default scope=\"project\") whenever the user refers to past behavior or prior setup ('before', 'last time', 'still connected', 'again', '以前', '上次', '之前', '还在吗', '连过', '配过'), or when live checks contradict expectations or involve environment/device/config troubleshooting. Use 1-3 focused keywords (e.g. 'AX3000T 192.168.1.1' or 'adb 无线') rather than long multi-topic strings; pass returned ids to memory_read for full text.",
+                "description": "Search persistent cross-session memory across this workspace (past sessions, device/network/SSH/proxy/env configs, prior fixes, working notes, checkpoints, and project knowledge). CALL THIS FIRST (default scope=\"project\") whenever the user refers to past behavior or prior setup ('before', 'last time', 'previously', 'still connected', 'again', '以前', '上次', '之前', '还在吗', '连过', '配过'), or when live checks contradict expectations or involve environment/device/config troubleshooting. Use 1-3 focused keywords (e.g. 'AX3000T 192.168.1.1' or 'adb 无线') rather than long multi-topic strings; pass returned ids to memory_read for full text.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -3268,10 +3268,9 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
                         "limit": {
                             "type": "integer",
                             "description": "Max hits (default 20, max 100)."
-                        },
-                        "toolSummary": { "type": "string" }
+                        }
                     },
-                    "required": ["toolSummary"]
+                    "required": []
                 }
             }),
             json!({
@@ -3281,10 +3280,9 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "ids": { "type": "array", "items": { "type": "string" } },
-                        "max_chars": { "type": "number" },
-                        "toolSummary": { "type": "string" }
+                        "max_chars": { "type": "number" }
                     },
-                    "required": ["ids", "toolSummary"]
+                    "required": ["ids"]
                 }
             }),
             json!({
@@ -3297,10 +3295,9 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
                         "body": { "type": "string" },
                         "expected_revision": { "type": "integer" },
                         "scope": { "type": "string", "enum": ["task_shared", "agent_private"] },
-                        "source_refs": { "type": "array", "items": { "type": "string" } },
-                        "toolSummary": { "type": "string" }
+                        "source_refs": { "type": "array", "items": { "type": "string" } }
                     },
-                    "required": ["note_id", "body", "toolSummary"]
+                    "required": ["note_id", "body"]
                 }
             }),
             json!({
@@ -3314,10 +3311,9 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
                         "next_actions": { "type": "array", "items": { "type": "string" } },
                         "open_questions": { "type": "array", "items": { "type": "string" } },
                         "constraints": { "type": "array", "items": { "type": "string" } },
-                        "rejected_approaches": { "type": "array", "items": { "type": "string" } },
-                        "toolSummary": { "type": "string" }
+                        "rejected_approaches": { "type": "array", "items": { "type": "string" } }
                     },
-                    "required": ["toolSummary"]
+                    "required": []
                 }
             }),
             json!({
@@ -3327,10 +3323,9 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "checkpoint_id": { "type": "string" },
-                        "reason": { "type": "string" },
-                        "toolSummary": { "type": "string" }
+                        "reason": { "type": "string" }
                     },
-                    "required": ["toolSummary"]
+                    "required": []
                 }
             }),
             json!({
@@ -3345,10 +3340,9 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
                             "type": "string",
                             "description": "Optional JSON object string specifying applicability rules, e.g. {\"paths\":[\"src/**\"]}."
                         },
-                        "evidence": { "type": "array", "items": { "type": "string" } },
-                        "toolSummary": { "type": "string" }
+                        "evidence": { "type": "array", "items": { "type": "string" } }
                     },
-                    "required": ["claim", "toolSummary"]
+                    "required": ["claim"]
                 }
             }),
         ]);
@@ -3360,8 +3354,8 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
                 "description": "Read the current persistent goal and its runId/turnId for this session.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "toolSummary": { "type": "string" } },
-                    "required": ["toolSummary"]
+                    "properties": {},
+                    "required": []
                 }
             }),
             json!({
@@ -3372,10 +3366,9 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
                     "properties": {
                         "objective": { "type": "string" },
                         "maxTurns": { "type": "integer" },
-                        "maxSeconds": { "type": "integer" },
-                        "toolSummary": { "type": "string" }
+                        "maxSeconds": { "type": "integer" }
                     },
-                    "required": ["objective", "toolSummary"]
+                    "required": ["objective"]
                 }
             }),
             json!({
@@ -3387,10 +3380,9 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
                         "runId": { "type": "string" },
                         "turnId": { "type": "string" },
                         "status": { "type": "string", "enum": ["complete", "continue", "blocked"] },
-                        "reason": { "type": "string" },
-                        "toolSummary": { "type": "string" }
+                        "reason": { "type": "string" }
                     },
-                    "required": ["runId", "turnId", "status", "reason", "toolSummary"]
+                    "required": ["runId", "turnId", "status", "reason"]
                 }
             }),
         ]);
@@ -3406,10 +3398,9 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
                         "type": "string",
                         "description": "Session UUID, agentos://session/<uuid> URL, or legacy numeric codeg conversation id."
                     },
-                    "max_messages": { "type": "integer" },
-                    "toolSummary": { "type": "string" }
+                    "max_messages": { "type": "integer" }
                 },
-                "required": ["session_id", "toolSummary"]
+                "required": ["session_id"]
             }
         }));
     }
@@ -3442,10 +3433,9 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
                             },
                             "required": ["header", "question", "multiSelect", "options"]
                         }
-                    },
-                    "toolSummary": { "type": "string" }
+                    }
                 },
-                "required": ["questions", "toolSummary"]
+                "required": ["questions"]
             }
         }));
     }
@@ -3466,10 +3456,9 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
                     },
                     "files": { "type": "array", "items": { "type": "string" } },
                     "advisor_provider": { "type": "string", "enum": ["auto", "codex", "antigravity"] },
-                    "model": { "type": "string" },
-                    "toolSummary": { "type": "string" }
+                    "model": { "type": "string" }
                 },
-                "required": ["question", "toolSummary"]
+                "required": ["question"]
             }
         }));
     }
@@ -3486,10 +3475,9 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
                         "read_only": { "type": "boolean" },
                         "wait": { "type": "boolean" },
                         "model": { "type": "string" },
-                        "timeout_seconds": { "type": "integer" },
-                        "toolSummary": { "type": "string" }
+                        "timeout_seconds": { "type": "integer" }
                     },
-                    "required": ["provider", "task", "toolSummary"]
+                    "required": ["provider", "task"]
                 }
             }),
             json!({
@@ -3498,10 +3486,9 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "delegation_id": { "type": "string" },
-                        "toolSummary": { "type": "string" }
+                        "delegation_id": { "type": "string" }
                     },
-                    "required": ["delegation_id", "toolSummary"]
+                    "required": ["delegation_id"]
                 }
             }),
             json!({
@@ -3510,10 +3497,9 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "delegation_id": { "type": "string" },
-                        "toolSummary": { "type": "string" }
+                        "delegation_id": { "type": "string" }
                     },
-                    "required": ["delegation_id", "toolSummary"]
+                    "required": ["delegation_id"]
                 }
             }),
         ]);
@@ -4018,10 +4004,36 @@ mod tests {
                 .get("properties")
                 .and_then(Value::as_object)
                 .unwrap_or_else(|| panic!("{tool_name}:{path} object schema missing `properties`"));
+            if path != "inputSchema" {
+                assert!(
+                    !props.is_empty(),
+                    "{tool_name}:{path} nested object schema must declare non-empty `properties`"
+                );
+            }
             assert!(
-                !props.is_empty(),
-                "{tool_name}:{path} object schema must declare non-empty `properties`"
+                !props.contains_key("toolSummary"),
+                "{tool_name}:{path} must not pre-declare `toolSummary` (agy CLI auto-injects it and rejects duplicate required items)"
             );
+            if let Some(req) = obj.get("required").and_then(Value::as_array) {
+                let mut seen = std::collections::HashSet::new();
+                for item in req {
+                    let key = item
+                        .as_str()
+                        .unwrap_or_else(|| panic!("{tool_name}:{path} required entry must be string"));
+                    assert_ne!(
+                        key, "toolSummary",
+                        "{tool_name}:{path} must not require `toolSummary`"
+                    );
+                    assert!(
+                        seen.insert(key),
+                        "{tool_name}:{path} duplicate entry `{key}` in `required`"
+                    );
+                    assert!(
+                        props.contains_key(key),
+                        "{tool_name}:{path} required key `{key}` missing from `properties`"
+                    );
+                }
+            }
             for (k, v) in props {
                 assert_gemini_compatible_schema(tool_name, &format!("{path}.{k}"), v);
             }
