@@ -20,6 +20,7 @@ macro_rules! tr {
 pub mod acp_session;
 pub mod agent_profiles;
 pub mod amp_session;
+pub(crate) mod antigravity_watch;
 pub mod attachments;
 pub mod blob_store;
 pub mod checkpoint;

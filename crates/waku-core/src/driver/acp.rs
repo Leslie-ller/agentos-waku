@@ -56,6 +56,7 @@ enum CommandMessage {
         answers: Vec<UserInputAnswer>,
     },
     Options(SessionOptions),
+    RefreshBackgroundWork,
     Shutdown,
 }
 
@@ -592,6 +593,19 @@ async fn run_sdk_connection(
             )
             .await;
             let mut fork_context = fork_context;
+            let agy_watcher = if provider == ProviderKind::Antigravity {
+                crate::antigravity_watch::antigravity_conversations_dir().map(|dir| {
+                    Arc::new(
+                        crate::antigravity_watch::AntigravityTrajectoryWatcher::start(
+                            dir,
+                            &native_session_id,
+                            events.clone(),
+                        ),
+                    )
+                })
+            } else {
+                None
+            };
 
             while let Ok(command) = commands.recv().await {
                 match command {
@@ -602,6 +616,9 @@ async fn run_sdk_connection(
                                 crate::cursor_session::prompt_with_fork_context(&context, &text)
                             })
                             .unwrap_or(text);
+                        if let Some(watcher) = agy_watcher.as_ref() {
+                            watcher.mark_foreground_start();
+                        }
                         let _ = events.send(DriverEvent::TurnStarted);
                         if let Err(error) = send_prompt(
                             &connection,
@@ -614,6 +631,7 @@ async fn run_sdk_connection(
                             grok_title_home.clone(),
                             title_refresh.clone(),
                             stream_state.clone(),
+                            agy_watcher.clone(),
                         ) {
                             let _ = events.send(DriverEvent::Error(error.to_string()));
                             let _ = events.send(DriverEvent::TurnFinished {
@@ -623,7 +641,10 @@ async fn run_sdk_connection(
                         }
                     }
                     CommandMessage::Steer(text) => {
-                        if prompt_requests.lock().is_empty() {
+                        let parked_bg = agy_watcher
+                            .as_ref()
+                            .is_some_and(|watcher| watcher.has_live_detached_work());
+                        if prompt_requests.lock().is_empty() && !parked_bg {
                             let _ = events.send(DriverEvent::SteerRejected {
                                 message: text,
                                 reason: format!(
@@ -632,6 +653,9 @@ async fn run_sdk_connection(
                                 ),
                             });
                             continue;
+                        }
+                        if let Some(watcher) = agy_watcher.as_ref() {
+                            watcher.mark_foreground_start();
                         }
                         match send_prompt(
                             &connection,
@@ -644,6 +668,7 @@ async fn run_sdk_connection(
                             grok_title_home.clone(),
                             title_refresh.clone(),
                             stream_state.clone(),
+                            agy_watcher.clone(),
                         ) {
                             Ok(()) => {
                                 let _ = events.send(DriverEvent::SteerAccepted { message: text });
@@ -654,6 +679,11 @@ async fn run_sdk_connection(
                                     reason: error.to_string(),
                                 });
                             }
+                        }
+                    }
+                    CommandMessage::RefreshBackgroundWork => {
+                        if let Some(watcher) = agy_watcher.as_ref() {
+                            watcher.refresh_now();
                         }
                     }
                     CommandMessage::Cancel => {
@@ -1410,6 +1440,7 @@ fn send_prompt(
     grok_title_home: Option<std::path::PathBuf>,
     title_refresh: super::title_refresh::NativeTitleRefresh,
     stream_state: Arc<Mutex<AcpStreamState>>,
+    agy_watcher: Option<Arc<crate::antigravity_watch::AntigravityTrajectoryWatcher>>,
 ) -> agent_client_protocol::Result<()> {
     stream_state.lock().produced_content = false;
     // Read before the turn runs, so the failure lookup cannot mistake an
@@ -1441,12 +1472,25 @@ fn send_prompt(
     let native_session_id = native_session_id.to_owned();
     let registered = sent.on_receiving_result(async move |result| {
         if settle_prompt_request(&callback_requests, &callback_request_id) {
+            let produced = stream_state.lock().produced_content;
+            let agy_settlement = agy_watcher
+                .as_ref()
+                .map(|watcher| watcher.on_foreground_settled(produced));
             // Only an empty turn pays for this lookup, so a healthy turn never
             // waits on Kimi's records.
             let native_failure = wire_offset
-                .filter(|_| !stream_state.lock().produced_content)
-                .and_then(|offset| crate::kimi_session::turn_failure(&native_session_id, offset));
-            let success = finish_prompt(result, native_failure, &callback_events);
+                .filter(|_| !produced)
+                .and_then(|offset| crate::kimi_session::turn_failure(&native_session_id, offset))
+                .or_else(|| {
+                    agy_settlement
+                        .as_ref()
+                        .and_then(|s| s.native_failure.clone())
+                });
+            let park_on_background = agy_settlement
+                .as_ref()
+                .is_some_and(|s| s.has_live_detached_work);
+            let success =
+                finish_prompt_with_park(result, native_failure, park_on_background, &callback_events);
             if provider == ProviderKind::Grok && success {
                 start_grok_title_refresh(
                     grok_title_home.as_deref(),
@@ -1527,6 +1571,15 @@ fn finish_prompt(
     native_failure: Option<String>,
     events: &impl DriverEventSink,
 ) -> bool {
+    finish_prompt_with_park(result, native_failure, false, events)
+}
+
+fn finish_prompt_with_park(
+    result: agent_client_protocol::Result<PromptResponse>,
+    native_failure: Option<String>,
+    park_on_background: bool,
+    events: &impl DriverEventSink,
+) -> bool {
     let response = match result {
         Ok(response) => response,
         Err(error) => {
@@ -1566,7 +1619,11 @@ fn finish_prompt(
             Some(tr!("session.agent_stopped_reason", reason = "unknown")),
         ),
     };
-    let _ = events.send(DriverEvent::TurnFinished { success, summary });
+    if success && park_on_background && response.stop_reason == StopReason::EndTurn {
+        let _ = events.send(DriverEvent::TurnParked);
+    } else {
+        let _ = events.send(DriverEvent::TurnFinished { success, summary });
+    }
     success
 }
 
@@ -2150,6 +2207,12 @@ impl DriverControl for AcpDriver {
 
     fn cancel(&self) {
         let _ = self.commands.try_send(CommandMessage::Cancel);
+    }
+
+    fn refresh_background_work(&self) {
+        let _ = self
+            .commands
+            .try_send(CommandMessage::RefreshBackgroundWork);
     }
 
     fn cancel_computer_use(&self) {
