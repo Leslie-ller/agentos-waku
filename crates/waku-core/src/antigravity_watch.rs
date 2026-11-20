@@ -1371,10 +1371,11 @@ fn classify_agy_tool_kind(name: &str) -> ActivityKind {
     match name.trim() {
         "run_command" | "manage_task" => ActivityKind::Command,
         "edit_file" | "write_file" => ActivityKind::FileChange,
-        "read_file" => ActivityKind::Read,
-        "grep_search" | "find_by_name" | "list_dir" => ActivityKind::Search,
-        "search_web" => ActivityKind::WebSearch,
-        _ => ActivityKind::Tool,
+        "read_file" => ActivityKind::FileRead,
+        "grep_search" | "find_by_name" => ActivityKind::FileSearch,
+        "list_dir" => ActivityKind::FileList,
+        "search_web" => ActivityKind::Search,
+        other => ActivityKind::from_tool_name(other),
     }
 }
 
