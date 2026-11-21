@@ -20,6 +20,7 @@ pub(super) struct WorkingTreeEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TranscriptLinkRoute {
     ProjectFile(String),
+    SystemDefault(PathBuf),
     Finder(PathBuf),
     External,
 }
@@ -138,11 +139,23 @@ fn workspace_relative_file_path(workspace: &Path, target: &Path) -> Option<Strin
     relative(&workspace, &target)
 }
 
+fn should_open_link_with_system_default(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    ext.eq_ignore_ascii_case("html")
+        || ext.eq_ignore_ascii_case("htm")
+        || ext.eq_ignore_ascii_case("pdf")
+}
+
 fn transcript_link_route(target: &str, workspace: Option<&Path>) -> TranscriptLinkRoute {
     let Some(path) = markdown_file_link_path(target) else {
         return TranscriptLinkRoute::External;
     };
     let path = normalized_path(&path);
+    if should_open_link_with_system_default(&path) {
+        return TranscriptLinkRoute::SystemDefault(path);
+    }
     if let Some(relative_path) =
         workspace.and_then(|workspace| workspace_relative_file_path(workspace, &path))
     {
@@ -1106,6 +1119,21 @@ mod tests {
             TranscriptLinkRoute::ProjectFile("My File.rs".into())
         );
 
+        let html_file_url = url::Url::from_file_path(workspace.join("projects/walkthrough.html"))
+            .expect("absolute html file path");
+        assert_eq!(
+            transcript_link_route(html_file_url.as_str(), Some(workspace)),
+            TranscriptLinkRoute::SystemDefault(normalized_path(
+                &workspace.join("projects/walkthrough.html")
+            ))
+        );
+        let pdf_file_url = url::Url::from_file_path(workspace.join("report.PDF"))
+            .expect("absolute pdf file path");
+        assert_eq!(
+            transcript_link_route(pdf_file_url.as_str(), Some(workspace)),
+            TranscriptLinkRoute::SystemDefault(normalized_path(&workspace.join("report.PDF")))
+        );
+
         let outside_file = workspace.join("../kero/src/app.rs");
         let outside_file_with_line = format!("{}:20", outside_file.display());
         assert_eq!(
@@ -1754,6 +1782,14 @@ impl Waku {
             TranscriptLinkRoute::ProjectFile(relative_path) => {
                 self.open_right_panel_surface(RightPanelSurface::Files, cx);
                 self.open_right_panel_file(relative_path, cx);
+            }
+            TranscriptLinkRoute::SystemDefault(path) => {
+                if self.daemon.is_remote() {
+                    self.show_toast(tr!("errors.remote_host_path"));
+                    cx.notify();
+                } else {
+                    crate::platform::open_with_default_app(&path, cx);
+                }
             }
             TranscriptLinkRoute::Finder(path) => {
                 if self.daemon.is_remote() {

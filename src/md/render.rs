@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Font, FontStyle,
-    FontWeight, Hsla, InteractiveText, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    FontWeight, HitboxBehavior, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, SharedString, StrikethroughStyle,
     StyledText, TextLayout, TextRun, UnderlineStyle, Window, canvas, div, font, img, point,
     prelude::*, px, quad, relative, size,
@@ -722,6 +722,25 @@ impl<'a> Ctx<'a> {
 /// it first — underneath the glyphs — while the text's prepaint has already
 /// filled in the shared [`TextLayout`]. That ordering is what lets a pure-paint
 /// pass read real glyph geometry without a second layout pass.
+fn link_index_at_position(
+    layout: &TextLayout,
+    links: &[(Range<usize>, String)],
+    position: Point<Pixels>,
+) -> Option<usize> {
+    if layout_missing(layout) || !layout.bounds().contains(&position) {
+        return None;
+    }
+    let index = match layout.index_for_position(position) {
+        Ok(index) | Err(index) => index,
+    };
+    links.iter().position(|(range, _)| {
+        range.contains(&index)
+            && range_rects(layout, range, 0.0, 0.0)
+                .iter()
+                .any(|rect| rect.contains(&position))
+    })
+}
+
 fn text_element_with_selection(
     flat: &FlatText,
     runs: Vec<TextRun>,
@@ -737,30 +756,14 @@ fn text_element_with_selection(
 ) -> AnyElement {
     let styled = StyledText::new(flat.text.clone()).with_runs(runs);
     let layout = styled.layout().clone();
-
-    let body: AnyElement = if flat.links.is_empty() {
-        styled.into_any_element()
-    } else {
-        let (ranges, urls): (Vec<_>, Vec<_>) = flat.links.iter().cloned().unzip();
-        let id = SharedString::from(format!("{}-t{}", key.row, key.index));
-        InteractiveText::new(id, styled)
-            .on_click(ranges, move |clicked, window, cx| {
-                if let Some(url) = urls.get(clicked) {
-                    if let Some(handler) = &link_handler {
-                        handler(url, window, cx);
-                    } else {
-                        cx.open_url(url);
-                    }
-                }
-            })
-            .into_any_element()
-    };
+    let links = flat.links.clone();
 
     let underlay = canvas(|_, _, _| (), {
         let text = flat.text.clone();
         let code_ranges = flat.code_ranges.clone();
         let layout = layout.clone();
         let key = key.clone();
+        let selection = selection.clone();
         move |_, _, window, _| {
             for range in &code_ranges {
                 for rect in range_rects(&layout, range, CODE_WASH_PAD_X, CODE_WASH_INSET_Y) {
@@ -824,14 +827,54 @@ fn text_element_with_selection(
     .absolute()
     .size_full();
 
-    div()
+    let mut wrapper = div()
         .relative()
         .w_full()
         .min_w_0()
         .cursor(CursorStyle::IBeam)
         .child(underlay)
-        .child(body)
-        .into_any_element()
+        .child(styled);
+
+    if !links.is_empty() {
+        // Handle link clicks in the same frame via `on_mouse_up` instead of
+        // GPUI's `InteractiveText::on_click`, which only installs its
+        // `MouseUpEvent` listener on the frame after `MouseDownEvent` and drops
+        // trackpad taps / fast clicks (< 16 ms).
+        let cursor_layout = layout.clone();
+        let cursor_links = links.clone();
+        let link_cursor_overlay = canvas(
+            |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+            move |_, hitbox, window, _| {
+                if link_index_at_position(&cursor_layout, &cursor_links, window.mouse_position())
+                    .is_some()
+                {
+                    window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
+                }
+            },
+        )
+        .absolute()
+        .size_full();
+
+        wrapper = wrapper.child(link_cursor_overlay).on_mouse_up(
+            MouseButton::Left,
+            move |event, window, cx| {
+                if !selection.selection.borrow().is_empty() {
+                    return;
+                }
+                if let Some(clicked) = link_index_at_position(&layout, &links, event.position)
+                    && let Some((_, url)) = links.get(clicked)
+                {
+                    if let Some(handler) = &link_handler {
+                        handler(url, window, cx);
+                    } else {
+                        cx.open_url(url);
+                    }
+                }
+            },
+        );
+    }
+
+    wrapper.into_any_element()
 }
 
 fn text_element(flat: &Rc<FlatText>, key: TextKey, ctx: &Ctx) -> AnyElement {
