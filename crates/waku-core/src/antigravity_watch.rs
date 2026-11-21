@@ -1314,7 +1314,11 @@ fn watch_loop(
                     drive_autonomous_wakeups(&steps, any_live_detached, events, &mut state);
                 }
             }
-            if state.has_live_detached_work || state.autonomous_turn_open || state.foreground_active
+            if state.terminal_reply_seen_at.is_some() {
+                Duration::from_millis(200)
+            } else if state.has_live_detached_work
+                || state.autonomous_turn_open
+                || state.foreground_active
             {
                 POLL_ACTIVE
             } else {
@@ -1864,19 +1868,23 @@ mod tests {
         .unwrap();
 
         watcher.refresh_now();
-        std::thread::sleep(Duration::from_millis(900));
-
+        let deadline = Instant::now() + Duration::from_secs(3);
         let mut started_count = 0usize;
         let mut text_deltas = Vec::new();
         let mut reasoning_deltas = Vec::new();
         let mut finished = false;
-        while let Ok(ev) = rx.try_recv() {
-            match ev {
-                DriverEvent::TurnStarted => started_count += 1,
-                DriverEvent::TextDelta(t) => text_deltas.push(t),
-                DriverEvent::ReasoningDelta(t) => reasoning_deltas.push(t),
-                DriverEvent::TurnFinished { success: true, .. } => finished = true,
-                _ => {}
+        while Instant::now() < deadline && !finished {
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    DriverEvent::TurnStarted => started_count += 1,
+                    DriverEvent::TextDelta(t) => text_deltas.push(t),
+                    DriverEvent::ReasoningDelta(t) => reasoning_deltas.push(t),
+                    DriverEvent::TurnFinished { success: true, .. } => finished = true,
+                    _ => {}
+                }
+            }
+            if !finished {
+                std::thread::sleep(Duration::from_millis(50));
             }
         }
         assert_eq!(started_count, 1, "TurnStarted must be emitted exactly once");
