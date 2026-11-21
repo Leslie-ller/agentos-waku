@@ -168,6 +168,8 @@ impl AcpDriver {
             None => None,
         };
 
+        let agy_native_acp_streams_wakeups = provider == ProviderKind::Antigravity
+            && crate::agent_profiles::is_antigravity_cli_binary(&binary);
         let launch = launch_for(provider, &binary, mode, reasoning_effort.as_deref())?;
         let computer_use = (provider == ProviderKind::Grok && computer_use_enabled)
             .then(|| super::support::HeadlessComputerUseRuntime::start(provider, events.clone()))
@@ -212,6 +214,7 @@ impl AcpDriver {
                     fork_context,
                     mcp_companion,
                     grok_title_home,
+                    agy_native_acp_streams_wakeups,
                     command_rx,
                     thread_events.clone(),
                 ));
@@ -394,6 +397,7 @@ async fn run_sdk_connection(
     fork_context: Option<String>,
     mcp_companion: Option<crate::mcp_companion::McpCompanionLaunch>,
     grok_title_home: Option<std::path::PathBuf>,
+    agy_native_acp_streams_wakeups: bool,
     commands: smol::channel::Receiver<CommandMessage>,
     events: DriverEventSender,
 ) -> agent_client_protocol::Result<()> {
@@ -402,6 +406,9 @@ async fn run_sdk_connection(
     let pending_permissions: PendingPermissions = Arc::new(Mutex::new(HashMap::new()));
     let pending_user_inputs: PendingAcpUserInputs = Arc::new(Mutex::new(HashMap::new()));
     let prompt_requests = Arc::new(Mutex::new(PendingPrompts::default()));
+    let agy_watcher_slot: Arc<
+        Mutex<Option<Arc<crate::antigravity_watch::AntigravityTrajectoryWatcher>>>,
+    > = Arc::new(Mutex::new(None));
     let title_refresh = super::title_refresh::NativeTitleRefresh::default();
     let auto_approve = mode != RuntimeMode::Ask;
 
@@ -413,8 +420,28 @@ async fn run_sdk_connection(
                 let events = events.clone();
                 let suppress_session_updates = suppress_session_updates.clone();
                 let stream_state = stream_state.clone();
+                let agy_watcher_slot = agy_watcher_slot.clone();
                 async move |notification: SessionNotification, _connection| {
                     if !suppress_session_updates.load(Ordering::Acquire) {
+                        if provider == ProviderKind::Antigravity
+                            && let Some(watcher) = agy_watcher_slot.lock().clone()
+                            && let Ok(update) = serde_json::to_value(&notification.update)
+                        {
+                            let kind = update.get("sessionUpdate").and_then(Value::as_str);
+                            if matches!(
+                                kind,
+                                Some(
+                                    "agent_message_chunk"
+                                        | "agent_thought_chunk"
+                                        | "tool_call"
+                                        | "plan"
+                                )
+                            ) {
+                                watcher.note_acp_autonomous_update(true);
+                            } else if kind == Some("tool_call_update") {
+                                watcher.note_acp_autonomous_update(false);
+                            }
+                        }
                         handle_session_update(
                             provider,
                             notification,
@@ -599,13 +626,16 @@ async fn run_sdk_connection(
             let mut fork_context = fork_context;
             let agy_watcher = if provider == ProviderKind::Antigravity {
                 crate::antigravity_watch::antigravity_conversations_dir().map(|dir| {
-                    Arc::new(
-                        crate::antigravity_watch::AntigravityTrajectoryWatcher::start(
+                    let watcher = Arc::new(
+                        crate::antigravity_watch::AntigravityTrajectoryWatcher::start_with_mode(
                             dir,
                             &native_session_id,
                             events.clone(),
+                            agy_native_acp_streams_wakeups,
                         ),
-                    )
+                    );
+                    agy_watcher_slot.lock().replace(watcher.clone());
+                    watcher
                 })
             } else {
                 None

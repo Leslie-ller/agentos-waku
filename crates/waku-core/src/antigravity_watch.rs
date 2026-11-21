@@ -1054,6 +1054,12 @@ fn extract_turn_failure(steps: &[DecodedStep], after_idx: i64) -> Option<String>
 // Live Background Watcher Thread
 // ---------------------------------------------------------------------------
 
+/// After SQLite records a terminal final `PlannerResponse` in native ACP
+/// streaming mode (`agy 1.5.x`), wait briefly for any trailing stdout
+/// `agent_message_chunk` frames to drain through `acp.rs` before closing the
+/// autonomous turn.
+const ACP_STREAM_DRAIN_GRACE: Duration = Duration::from_millis(450);
+
 #[derive(Debug)]
 pub struct ForegroundSettlement {
     pub has_live_detached_work: bool,
@@ -1065,8 +1071,11 @@ struct WatcherShared {
     foreground_start_idx: i64,
     birth_step_idx: i64,
     synced_step_idx: i64,
+    native_acp_streams_wakeups: bool,
     autonomous_turn_open: bool,
     last_autonomous_progress_at: Option<Instant>,
+    acp_last_activity_at: Option<Instant>,
+    terminal_reply_seen_at: Option<Instant>,
     has_live_detached_work: bool,
     emitted_thinking_len: HashMap<i64, usize>,
     emitted_response_len: HashMap<i64, usize>,
@@ -1091,6 +1100,15 @@ impl AntigravityTrajectoryWatcher {
         native_session_id: &str,
         events: DriverEventSender,
     ) -> Self {
+        Self::start_with_mode(conversations_dir, native_session_id, events, false)
+    }
+
+    pub fn start_with_mode(
+        conversations_dir: PathBuf,
+        native_session_id: &str,
+        events: DriverEventSender,
+        native_acp_streams_wakeups: bool,
+    ) -> Self {
         let db_path = conversations_dir.join(format!("{native_session_id}.db"));
         let initial_max = max_step_idx(&db_path);
         let shared = Arc::new((
@@ -1099,8 +1117,11 @@ impl AntigravityTrajectoryWatcher {
                 foreground_start_idx: initial_max,
                 birth_step_idx: (initial_max + 1).max(0),
                 synced_step_idx: initial_max,
+                native_acp_streams_wakeups,
                 autonomous_turn_open: false,
                 last_autonomous_progress_at: None,
+                acp_last_activity_at: None,
+                terminal_reply_seen_at: None,
                 has_live_detached_work: false,
                 emitted_thinking_len: HashMap::new(),
                 emitted_response_len: HashMap::new(),
@@ -1136,6 +1157,36 @@ impl AntigravityTrajectoryWatcher {
         }
     }
 
+    /// Called by `acp.rs` whenever an unsolicited `session/update` arrives
+    /// from `agy 1.5.x` while no foreground `session/prompt` is active.
+    /// Ensures `TurnStarted` is emitted before the first ACP delta and keeps
+    /// the drain grace timer fresh while stdout chunks are still arriving.
+    pub fn note_acp_autonomous_update(&self, opens_turn: bool) {
+        let (lock, cvar) = &*self.shared;
+        let Ok(mut state) = lock.lock() else {
+            return;
+        };
+        if state.foreground_active {
+            return;
+        }
+        let now = Instant::now();
+        state.acp_last_activity_at = Some(now);
+        if opens_turn {
+            if !state.autonomous_turn_open {
+                state.autonomous_turn_open = true;
+                state.terminal_reply_seen_at = None;
+                state.last_autonomous_progress_at = Some(now);
+                let _ = self.events.send(DriverEvent::TurnStarted);
+                state.force_poll = true;
+                cvar.notify_one();
+            } else {
+                state.last_autonomous_progress_at = Some(now);
+            }
+        } else if state.autonomous_turn_open {
+            state.last_autonomous_progress_at = Some(now);
+        }
+    }
+
     pub fn mark_foreground_start(&self) {
         let cur_max = max_step_idx(&self.db_path);
         let (lock, cvar) = &*self.shared;
@@ -1144,6 +1195,8 @@ impl AntigravityTrajectoryWatcher {
             state.foreground_start_idx = cur_max;
             state.autonomous_turn_open = false;
             state.last_autonomous_progress_at = None;
+            state.acp_last_activity_at = None;
+            state.terminal_reply_seen_at = None;
             state.force_poll = true;
             cvar.notify_one();
         }
@@ -1244,8 +1297,11 @@ fn watch_loop(
                 && state
                     .last_autonomous_progress_at
                     .is_some_and(|t| t.elapsed() >= AUTONOMOUS_TOOL_GAP_TIMEOUT);
-            let should_scan =
-                state.force_poll || gap_timed_out || (stamp.is_some() && stamp != state.last_stamp);
+            let drain_pending = state.autonomous_turn_open && state.terminal_reply_seen_at.is_some();
+            let should_scan = state.force_poll
+                || gap_timed_out
+                || drain_pending
+                || (stamp.is_some() && stamp != state.last_stamp);
             state.force_poll = false;
             if should_scan {
                 state.last_stamp = stamp;
@@ -1300,6 +1356,7 @@ fn drive_autonomous_wakeups(
         return;
     }
 
+    let emit_sqlite_content = !state.native_acp_streams_wakeups;
     let mut any_visible_work = false;
     for step in &post_steps {
         if let Some(planner) = step.planner.as_ref() {
@@ -1317,7 +1374,9 @@ fn drive_autonomous_wakeups(
                 state
                     .emitted_thinking_len
                     .insert(step.idx, planner.thinking.len());
-                let _ = events.send(DriverEvent::ReasoningDelta(delta));
+                if emit_sqlite_content {
+                    let _ = events.send(DriverEvent::ReasoningDelta(delta));
+                }
                 any_visible_work = true;
             }
             let prev_r = state
@@ -1334,7 +1393,9 @@ fn drive_autonomous_wakeups(
                 state
                     .emitted_response_len
                     .insert(step.idx, planner.response.len());
-                let _ = events.send(DriverEvent::TextDelta(delta));
+                if emit_sqlite_content {
+                    let _ = events.send(DriverEvent::TextDelta(delta));
+                }
                 any_visible_work = true;
             }
         }
@@ -1347,19 +1408,24 @@ fn drive_autonomous_wakeups(
                     state.autonomous_turn_open = true;
                     let _ = events.send(DriverEvent::TurnStarted);
                 }
-                let kind = classify_agy_tool_kind(&tc.name);
-                let id = if tc.id.trim().is_empty() {
-                    format!("agy-auto-step-{}", step.idx)
-                } else {
-                    tc.id.trim().to_owned()
-                };
-                let _ = events.send(DriverEvent::Activity {
-                    id: Some(id),
-                    kind,
-                    title: tc.name.trim().to_owned(),
-                    detail: step.generic_result.as_deref().map(|s| s.chars().take(240).collect()),
-                    complete,
-                });
+                if emit_sqlite_content {
+                    let kind = classify_agy_tool_kind(&tc.name);
+                    let id = if tc.id.trim().is_empty() {
+                        format!("agy-auto-step-{}", step.idx)
+                    } else {
+                        tc.id.trim().to_owned()
+                    };
+                    let _ = events.send(DriverEvent::Activity {
+                        id: Some(id),
+                        kind,
+                        title: tc.name.trim().to_owned(),
+                        detail: step
+                            .generic_result
+                            .as_deref()
+                            .map(|s| s.chars().take(240).collect()),
+                        complete,
+                    });
+                }
                 any_visible_work = true;
             }
         }
@@ -1367,6 +1433,7 @@ fn drive_autonomous_wakeups(
 
     if any_visible_work {
         state.last_autonomous_progress_at = Some(Instant::now());
+        state.terminal_reply_seen_at = None;
     }
 
     if !state.autonomous_turn_open {
@@ -1380,6 +1447,7 @@ fn drive_autonomous_wakeups(
         s.task_details.is_none() && s.subagent.is_none() && is_step_in_progress(s.status)
     });
     if foreground_step_still_running {
+        state.terminal_reply_seen_at = None;
         return;
     }
 
@@ -1403,13 +1471,29 @@ fn drive_autonomous_wakeups(
                 .as_ref()
                 .is_some_and(|p| !p.has_tool_calls && is_step_terminal(s.status))
     });
+    let ready_to_close_terminal = if reached_terminal_reply {
+        if state.native_acp_streams_wakeups {
+            let seen_at = *state.terminal_reply_seen_at.get_or_insert_with(Instant::now);
+            seen_at.elapsed() >= ACP_STREAM_DRAIN_GRACE
+                && state
+                    .acp_last_activity_at
+                    .is_none_or(|t| t.elapsed() >= ACP_STREAM_DRAIN_GRACE)
+        } else {
+            true
+        }
+    } else {
+        state.terminal_reply_seen_at = None;
+        false
+    };
     let gap_timed_out = state
         .last_autonomous_progress_at
         .is_some_and(|t| t.elapsed() >= AUTONOMOUS_TOOL_GAP_TIMEOUT);
 
-    if reached_terminal_reply || gap_timed_out {
+    if ready_to_close_terminal || gap_timed_out {
         state.autonomous_turn_open = false;
         state.last_autonomous_progress_at = None;
+        state.terminal_reply_seen_at = None;
+        state.acp_last_activity_at = None;
         if let Some(max_idx) = post_steps.last().map(|s| s.idx) {
             state.synced_step_idx = state.synced_step_idx.max(max_idx);
         }
@@ -1714,6 +1798,96 @@ mod tests {
         }
         assert_eq!(final_text, "Final character analysis ready!");
         assert!(saw_finish, "expected TurnFinished after final PlannerResponse");
+
+        drop(watcher);
+        drop(conn);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn native_acp_mode_skips_duplicate_text_and_closes_after_drain_grace() {
+        let dir = std::env::temp_dir().join(format!(
+            "waku-agy-watch-native-acp-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("sess-native.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, status INTEGER, task_details BLOB, step_payload BLOB)",
+            [],
+        )
+        .unwrap();
+
+        let mut td = Vec::new();
+        encode_field_str(1, "sess-native/task-0", &mut td);
+        encode_field_str(7, "USB transfer", &mut td);
+        conn.execute(
+            "INSERT INTO steps (idx, status, task_details, step_payload) VALUES (0, ?1, ?2, ?3)",
+            rusqlite::params![STEP_STATUS_RUNNING, td, Vec::<u8>::new()],
+        )
+        .unwrap();
+
+        let (tx, rx) = crate::driver::test_event_channel();
+        let watcher = AntigravityTrajectoryWatcher::start_with_mode(
+            dir.clone(),
+            "sess-native",
+            tx,
+            true,
+        );
+        watcher.mark_foreground_start();
+        let settlement = watcher.on_foreground_settled(true);
+        assert!(settlement.has_live_detached_work);
+        while rx.try_recv().is_ok() {}
+
+        // Background finishes and agy 1.5.x streams chunks over ACP first.
+        conn.execute(
+            "UPDATE steps SET status = ?1 WHERE idx = 0",
+            rusqlite::params![STEP_STATUS_DONE],
+        )
+        .unwrap();
+        watcher.note_acp_autonomous_update(true);
+        watcher.note_acp_autonomous_update(true);
+
+        // Simultaneously SQLite receives the final PlannerResponse step.
+        let mut final_planner = Vec::new();
+        encode_field_str(1, "You can unplug the phone now!", &mut final_planner);
+        encode_field_str(3, "Internal thought", &mut final_planner);
+        let mut step1 = Vec::new();
+        encode_field_varint(4, STEP_STATUS_DONE as u64, &mut step1);
+        encode_field_bytes(20, &final_planner, &mut step1);
+        conn.execute(
+            "INSERT INTO steps (idx, status, step_payload) VALUES (1, ?1, ?2)",
+            rusqlite::params![STEP_STATUS_DONE, step1],
+        )
+        .unwrap();
+
+        watcher.refresh_now();
+        std::thread::sleep(Duration::from_millis(900));
+
+        let mut started_count = 0usize;
+        let mut text_deltas = Vec::new();
+        let mut reasoning_deltas = Vec::new();
+        let mut finished = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                DriverEvent::TurnStarted => started_count += 1,
+                DriverEvent::TextDelta(t) => text_deltas.push(t),
+                DriverEvent::ReasoningDelta(t) => reasoning_deltas.push(t),
+                DriverEvent::TurnFinished { success: true, .. } => finished = true,
+                _ => {}
+            }
+        }
+        assert_eq!(started_count, 1, "TurnStarted must be emitted exactly once");
+        assert!(
+            text_deltas.is_empty(),
+            "watcher must NOT emit duplicate TextDelta when native ACP streams wakeups: {text_deltas:?}"
+        );
+        assert!(
+            reasoning_deltas.is_empty(),
+            "watcher must NOT emit duplicate ReasoningDelta when native ACP streams wakeups: {reasoning_deltas:?}"
+        );
+        assert!(finished, "expected TurnFinished after ACP drain grace");
 
         drop(watcher);
         drop(conn);
