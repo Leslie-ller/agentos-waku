@@ -1497,24 +1497,28 @@ fn call_mcp_tool(
                 // then persist every advisor's outcome on the calling thread.
                 let mut jobs: Vec<(String, ProviderKind, Option<String>)> =
                     Vec::with_capacity(targets.len());
-                for advisor_provider in targets {
-                    let cid = Uuid::new_v4().to_string();
-                    let model = default_advisor_model(advisor_provider).map(str::to_owned);
-                    conn.execute(
-                        "INSERT INTO agentos_advisor_consultations
-                         (consultation_id, session_id, caller_provider, advisor_provider, model, question, status, created_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7)",
-                        params![
-                            cid,
-                            ctx.session_id,
-                            caller_name,
-                            advisor_provider.id(),
-                            model,
-                            question,
-                            now
-                        ],
-                    )?;
-                    jobs.push((cid, advisor_provider, model));
+                {
+                    let tx = conn.unchecked_transaction()?;
+                    for advisor_provider in targets {
+                        let cid = Uuid::new_v4().to_string();
+                        let model = default_advisor_model(advisor_provider).map(str::to_owned);
+                        tx.execute(
+                            "INSERT INTO agentos_advisor_consultations
+                             (consultation_id, session_id, caller_provider, advisor_provider, model, question, status, created_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7)",
+                            params![
+                                cid,
+                                ctx.session_id,
+                                caller_name,
+                                advisor_provider.id(),
+                                model,
+                                question,
+                                now
+                            ],
+                        )?;
+                        jobs.push((cid, advisor_provider, model));
+                    }
+                    tx.commit()?;
                 }
 
                 let outcomes: Vec<ParallelAdvisorOutcome> = std::thread::scope(|scope| {
@@ -1990,16 +1994,52 @@ fn resolve_advisor_providers_with_availability(
     )?])
 }
 
+fn configure_isolated_process_group(cmd: &mut ProcessCommand) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = cmd;
+}
+
+fn terminate_child_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pgid = child.id() as libc::pid_t;
+        if pgid > 0 {
+            // Terminate the entire isolated process group so spawned worker
+            // descendants cannot leak or keep stdout/stderr pipes open.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn spawn_bounded_stderr_reader(
     mut stderr: std::process::ChildStderr,
-) -> std::thread::JoinHandle<String> {
+) -> crossbeam_channel::Receiver<String> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
     std::thread::spawn(move || {
         use std::io::Read as _;
         let mut buf = Vec::new();
         let _ = (&mut stderr).take(16 * 1024).read_to_end(&mut buf);
         let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-        String::from_utf8_lossy(&buf).trim().to_owned()
-    })
+        let _ = tx.send(String::from_utf8_lossy(&buf).trim().to_owned());
+    });
+    rx
+}
+
+fn collect_bounded_pipe(
+    rx: Option<crossbeam_channel::Receiver<String>>,
+    wait: Duration,
+) -> String {
+    rx.and_then(|r| r.recv_timeout(wait).ok())
+        .unwrap_or_default()
 }
 
 fn run_isolated_oneshot_agent(
@@ -2083,6 +2123,7 @@ fn run_isolated_codex_oneshot(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_isolated_process_group(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -2091,8 +2132,9 @@ fn run_isolated_codex_oneshot(
         cb(child.id());
     }
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("codex stdout missing"))?;
-    let stderr_handle = child.stderr.take().map(spawn_bounded_stderr_reader);
-    let reader_handle = std::thread::spawn(move || {
+    let stderr_rx = child.stderr.take().map(spawn_bounded_stderr_reader);
+    let (stdout_tx, stdout_rx) = crossbeam_channel::bounded(1);
+    std::thread::spawn(move || {
         let mut last_message = String::new();
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             if let Ok(event) = serde_json::from_str::<Value>(&line) {
@@ -2108,16 +2150,14 @@ fn run_isolated_codex_oneshot(
                 }
             }
         }
-        last_message
+        let _ = stdout_tx.send(last_message);
     });
 
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
-            let text = reader_handle.join().unwrap_or_default();
-            let stderr_text = stderr_handle
-                .and_then(|h| h.join().ok())
-                .unwrap_or_default();
+            let text = collect_bounded_pipe(Some(stdout_rx), Duration::from_secs(3));
+            let stderr_text = collect_bounded_pipe(stderr_rx, Duration::from_secs(2));
             if status.success() && !text.trim().is_empty() {
                 return Ok(text);
             }
@@ -2134,12 +2174,25 @@ fn run_isolated_codex_oneshot(
             );
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_child_process_tree(&mut child);
             anyhow::bail!("isolated Codex one-shot timed out after {}s", timeout.as_secs());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn find_permission_option_id<'a>(options: Option<&'a [Value]>, preferred_kinds: &[&str]) -> Option<&'a str> {
+    let opts = options?;
+    for wanted in preferred_kinds {
+        if let Some(opt_id) = opts
+            .iter()
+            .find(|o| o.get("kind").and_then(Value::as_str) == Some(*wanted))
+            .and_then(|o| o.get("optionId").and_then(Value::as_str))
+        {
+            return Some(opt_id);
+        }
+    }
+    None
 }
 
 fn select_advisor_permission_outcome(
@@ -2150,34 +2203,40 @@ fn select_advisor_permission_outcome(
     let allow_read = read_only && matches!(kind, "read" | "search");
     let allow_any = !read_only;
     if allow_read || allow_any {
-        let outcome = options
-            .and_then(|opts| {
-                opts.iter().find(|o| {
-                    matches!(
-                        o.get("kind").and_then(Value::as_str),
-                        Some("allow_once" | "allow_always")
-                    )
-                })
-            })
-            .and_then(|o| o.get("optionId").and_then(Value::as_str))
+        let outcome = find_permission_option_id(options, &["allow_once", "allow_always"])
             .map(|opt_id| json!({ "outcome": "selected", "optionId": opt_id }))
             .unwrap_or_else(|| json!({ "outcome": "cancelled" }));
         (outcome, false)
     } else {
-        let outcome = options
-            .and_then(|opts| {
-                opts.iter().find(|o| {
-                    matches!(
-                        o.get("kind").and_then(Value::as_str),
-                        Some("reject_once" | "reject_always")
-                    )
-                })
-            })
-            .and_then(|o| o.get("optionId").and_then(Value::as_str))
+        let outcome = find_permission_option_id(options, &["reject_once", "reject_always"])
             .map(|opt_id| json!({ "outcome": "selected", "optionId": opt_id }))
             .unwrap_or_else(|| json!({ "outcome": "cancelled" }));
         (outcome, true)
     }
+}
+
+fn validate_acp_model_selection(resp: &Value, requested_model: &str) -> anyhow::Result<()> {
+    if let Some(err) = resp.get("error") {
+        anyhow::bail!("Antigravity advisor failed to select model `{requested_model}`: {err}");
+    }
+    if let Some(options) = resp.pointer("/result/configOptions").and_then(Value::as_array)
+        && let Some(model_opt) = options.iter().find(|opt| {
+            opt.get("id").and_then(Value::as_str) == Some("model")
+                || opt.get("category").and_then(Value::as_str) == Some("model")
+        })
+        && let Some(current) = model_opt.get("currentValue").and_then(Value::as_str)
+    {
+        let current_lower = current.trim().to_ascii_lowercase();
+        let req_lower = requested_model.trim().to_ascii_lowercase();
+        let matches = current_lower == req_lower
+            || current_lower.starts_with(&format!("{req_lower}-"));
+        if !matches {
+            anyhow::bail!(
+                "Antigravity advisor remained on model `{current}` instead of requested `{requested_model}`"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn run_isolated_antigravity_oneshot(
@@ -2201,6 +2260,7 @@ fn run_isolated_antigravity_oneshot(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_isolated_process_group(&mut cmd);
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn Antigravity ACP advisor ({})", binary.display()))?;
@@ -2209,7 +2269,7 @@ fn run_isolated_antigravity_oneshot(
     }
     let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("ACP stdin missing"))?;
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("ACP stdout missing"))?;
-    let stderr_handle = child.stderr.take().map(spawn_bounded_stderr_reader);
+    let stderr_rx = child.stderr.take().map(spawn_bounded_stderr_reader);
 
     let (tx, rx) = crossbeam_channel::unbounded::<Value>();
     std::thread::spawn(move || {
@@ -2231,15 +2291,22 @@ fn run_isolated_antigravity_oneshot(
     let wait_for_id = |stdin: &mut std::process::ChildStdin,
                            target_id: i64,
                            collected: &mut String,
-                           denied_any: &mut bool|
+                           denied_any: &mut bool,
+                           output_after_last_denial: &mut bool|
      -> anyhow::Result<Value> {
         loop {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 anyhow::bail!("isolated Antigravity ACP timed out after {}s", timeout.as_secs());
             };
-            let msg = rx
-                .recv_timeout(remaining)
-                .map_err(|_| anyhow!("isolated Antigravity ACP closed unexpectedly"))?;
+            let msg = match rx.recv_timeout(remaining) {
+                Ok(msg) => msg,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    anyhow::bail!("isolated Antigravity ACP timed out after {}s", timeout.as_secs());
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("isolated Antigravity ACP closed unexpectedly");
+                }
+            };
             if msg.get("method").and_then(Value::as_str) == Some("session/update") {
                 if let Some(update) = msg.pointer("/params/update")
                     && update.get("sessionUpdate").and_then(Value::as_str)
@@ -2247,6 +2314,9 @@ fn run_isolated_antigravity_oneshot(
                     && let Some(text) = update.pointer("/content/text").and_then(Value::as_str)
                 {
                     collected.push_str(text);
+                    if !text.trim().is_empty() {
+                        *output_after_last_denial = true;
+                    }
                 }
                 continue;
             }
@@ -2265,6 +2335,7 @@ fn run_isolated_antigravity_oneshot(
                     select_advisor_permission_outcome(read_only, kind, options);
                 if was_denied {
                     *denied_any = true;
+                    *output_after_last_denial = false;
                 }
                 send_msg(
                     stdin,
@@ -2280,6 +2351,7 @@ fn run_isolated_antigravity_oneshot(
 
     let mut output = String::new();
     let mut denied_any = false;
+    let mut output_after_last_denial = false;
     let result = (|| -> anyhow::Result<String> {
         send_msg(
             &mut stdin,
@@ -2294,7 +2366,13 @@ fn run_isolated_antigravity_oneshot(
                 }
             }),
         )?;
-        let init_resp = wait_for_id(&mut stdin, 1, &mut output, &mut denied_any)?;
+        let init_resp = wait_for_id(
+            &mut stdin,
+            1,
+            &mut output,
+            &mut denied_any,
+            &mut output_after_last_denial,
+        )?;
         if let Some(err) = init_resp.get("error") {
             anyhow::bail!("Antigravity advisor initialize failed: {err}");
         }
@@ -2308,7 +2386,13 @@ fn run_isolated_antigravity_oneshot(
                 "params": { "cwd": cwd.to_string_lossy(), "mcpServers": [] }
             }),
         )?;
-        let new_resp = wait_for_id(&mut stdin, 2, &mut output, &mut denied_any)?;
+        let new_resp = wait_for_id(
+            &mut stdin,
+            2,
+            &mut output,
+            &mut denied_any,
+            &mut output_after_last_denial,
+        )?;
         if let Some(err) = new_resp.get("error") {
             anyhow::bail!("Antigravity advisor session/new failed: {err}");
         }
@@ -2319,7 +2403,7 @@ fn run_isolated_antigravity_oneshot(
             .to_owned();
 
         if let Some(model_id) = model {
-            let _ = send_msg(
+            send_msg(
                 &mut stdin,
                 json!({
                     "jsonrpc": "2.0",
@@ -2327,8 +2411,15 @@ fn run_isolated_antigravity_oneshot(
                     "method": "session/set_config_option",
                     "params": { "sessionId": sid, "configId": "model", "value": model_id }
                 }),
-            );
-            let _ = wait_for_id(&mut stdin, 3, &mut output, &mut denied_any);
+            )?;
+            let set_resp = wait_for_id(
+                &mut stdin,
+                3,
+                &mut output,
+                &mut denied_any,
+                &mut output_after_last_denial,
+            )?;
+            validate_acp_model_selection(&set_resp, model_id)?;
         }
 
         send_msg(
@@ -2343,16 +2434,24 @@ fn run_isolated_antigravity_oneshot(
                 }
             }),
         )?;
-        let prompt_resp = wait_for_id(&mut stdin, 4, &mut output, &mut denied_any)?;
-        if let Some(err) = prompt_resp.get("error") {
-            anyhow::bail!("Antigravity advisor session/prompt failed: {err}");
-        }
-        if read_only && output.trim().is_empty() && denied_any {
-            // `agy acp` aborts the current turn with empty text when a blocked
-            // shell/write tool permission is rejected or cancelled. Send one
-            // automatic recovery prompt reminding the advisor to use only
-            // native read/search tools (e.g. `read_file`) and answer directly.
+        let prompt_resp = wait_for_id(
+            &mut stdin,
+            4,
+            &mut output,
+            &mut denied_any,
+            &mut output_after_last_denial,
+        )?;
+        let needs_recovery =
+            read_only && denied_any && (prompt_resp.get("error").is_some() || !output_after_last_denial);
+        if needs_recovery {
+            // `agy acp` aborts the current turn when a blocked shell/write tool
+            // permission is denied — either with empty text or after streaming
+            // only a short pre-tool preamble. Discard any stale preamble and
+            // send one recovery prompt reminding the advisor to use only native
+            // read/search tools (e.g. `read_file`) and answer directly.
+            output.clear();
             let mut recovery_denied = false;
+            let mut recovery_output_after_denial = false;
             send_msg(
                 &mut stdin,
                 json!({
@@ -2368,10 +2467,18 @@ fn run_isolated_antigravity_oneshot(
                     }
                 }),
             )?;
-            let recovery_resp = wait_for_id(&mut stdin, 5, &mut output, &mut recovery_denied)?;
+            let recovery_resp = wait_for_id(
+                &mut stdin,
+                5,
+                &mut output,
+                &mut recovery_denied,
+                &mut recovery_output_after_denial,
+            )?;
             if let Some(err) = recovery_resp.get("error") {
                 anyhow::bail!("Antigravity advisor recovery session/prompt failed: {err}");
             }
+        } else if let Some(err) = prompt_resp.get("error") {
+            anyhow::bail!("Antigravity advisor session/prompt failed: {err}");
         }
         if output.trim().is_empty() {
             anyhow::bail!("Antigravity advisor returned empty response");
@@ -2380,11 +2487,8 @@ fn run_isolated_antigravity_oneshot(
     })();
 
     drop(stdin);
-    let _ = child.kill();
-    let _ = child.wait();
-    let stderr_text = stderr_handle
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
+    terminate_child_process_tree(&mut child);
+    let stderr_text = collect_bounded_pipe(stderr_rx, Duration::from_secs(2));
     result.map_err(|err| {
         if stderr_text.is_empty() {
             err
@@ -5444,5 +5548,78 @@ mod tests {
         assert!(instructions.contains("consult_advisor"));
         assert!(instructions.contains("\"both\""));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn advisor_hardening_validates_acp_model_prefers_oneshot_permissions_and_bounds_pipes() {
+        // 1. Permission selector prefers one-shot decisions over *_always even when *_always is listed first.
+        let opts_allow = vec![
+            json!({ "optionId": "always", "kind": "allow_always" }),
+            json!({ "optionId": "once", "kind": "allow_once" }),
+        ];
+        let (outcome, denied) = select_advisor_permission_outcome(true, "read", Some(&opts_allow));
+        assert!(!denied);
+        assert_eq!(outcome, json!({ "outcome": "selected", "optionId": "once" }));
+
+        let opts_reject = vec![
+            json!({ "optionId": "never", "kind": "reject_always" }),
+            json!({ "optionId": "deny", "kind": "reject_once" }),
+        ];
+        let (outcome, denied) =
+            select_advisor_permission_outcome(true, "execute", Some(&opts_reject));
+        assert!(denied);
+        assert_eq!(outcome, json!({ "outcome": "selected", "optionId": "deny" }));
+
+        // 2. ACP model selection validation catches errors and silent fallbacks.
+        assert!(
+            validate_acp_model_selection(
+                &json!({
+                    "result": {
+                        "configOptions": [{ "id": "model", "currentValue": "claude-opus-5-5" }]
+                    }
+                }),
+                "claude-opus-5-5"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_acp_model_selection(
+                &json!({
+                    "result": {
+                        "configOptions": [{ "id": "model", "currentValue": "claude-opus-5-5-high" }]
+                    }
+                }),
+                "claude-opus-5-5"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_acp_model_selection(
+                &json!({
+                    "result": {
+                        "configOptions": [{ "id": "model", "currentValue": "gemini-4-neon" }]
+                    }
+                }),
+                "claude-opus-5-5"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_acp_model_selection(
+                &json!({ "error": { "code": -32602, "message": "unknown model" } }),
+                "claude-opus-5-5"
+            )
+            .is_err()
+        );
+
+        // 3. Bounded pipe collector returns promptly on timeout without hanging.
+        let (_tx, rx) = crossbeam_channel::bounded::<String>(1);
+        assert_eq!(collect_bounded_pipe(Some(rx), Duration::from_millis(20)), "");
+        let (tx2, rx2) = crossbeam_channel::bounded::<String>(1);
+        tx2.send("stderr line".into()).unwrap();
+        assert_eq!(
+            collect_bounded_pipe(Some(rx2), Duration::from_millis(50)),
+            "stderr line"
+        );
     }
 }
