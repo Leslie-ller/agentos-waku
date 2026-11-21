@@ -1819,6 +1819,15 @@ mod tests {
         )
         .unwrap();
 
+        let (tx, rx) = crate::driver::test_event_channel();
+        let watcher = AntigravityTrajectoryWatcher::start_with_mode(
+            dir.clone(),
+            "sess-native",
+            tx,
+            true,
+        );
+        watcher.mark_foreground_start();
+
         let mut td = Vec::new();
         encode_field_str(1, "sess-native/task-0", &mut td);
         encode_field_str(7, "USB transfer", &mut td);
@@ -1828,14 +1837,6 @@ mod tests {
         )
         .unwrap();
 
-        let (tx, rx) = crate::driver::test_event_channel();
-        let watcher = AntigravityTrajectoryWatcher::start_with_mode(
-            dir.clone(),
-            "sess-native",
-            tx,
-            true,
-        );
-        watcher.mark_foreground_start();
         let settlement = watcher.on_foreground_settled(true);
         assert!(settlement.has_live_detached_work);
         while rx.try_recv().is_ok() {}
