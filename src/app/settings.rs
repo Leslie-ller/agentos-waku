@@ -690,6 +690,23 @@ impl Waku {
         )
         .into_any_element();
 
+        let advisor_auto_review_toggle = toggle_switch(
+            "agentos-mcp-advisor-auto-review-toggle",
+            mcp.advisor_auto_review_enabled,
+            false,
+            theme,
+            cx,
+            {
+                let next = !mcp.advisor_auto_review_enabled;
+                move |this, _, cx| {
+                    this.state.agentos_mcp.advisor_auto_review_enabled = next;
+                    this.save();
+                    cx.notify();
+                }
+            },
+        )
+        .into_any_element();
+
         let ask_toggle = toggle_switch(
             "agentos-mcp-ask-toggle",
             mcp.ask_user_enabled,
@@ -842,6 +859,12 @@ impl Waku {
                         )
                         .child(advisor_pills),
                 )
+                .child(make_row(
+                    "row-mcp-advisor-auto-review",
+                    "Auto-Review at Task Scale",
+                    "Automatically run background dual-advisor review once a human-driven task reaches substantial scale (skips cron/game-farming wakeups) and inject advice into the next turn.",
+                    advisor_auto_review_toggle,
+                ))
             })
             .child(make_row(
                 "row-mcp-ask",

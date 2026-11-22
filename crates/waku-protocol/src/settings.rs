@@ -16,6 +16,14 @@ fn default_advisor_provider() -> String {
     "both".to_owned()
 }
 
+fn default_advisor_auto_review_cooldown_minutes() -> u32 {
+    30
+}
+
+fn default_advisor_auto_review_daily_cap() -> u32 {
+    20
+}
+
 /// Feature toggles and routing preferences for the built-in `agentos-mcp`
 /// companion server. Stored in `DaemonSettings` so the desktop UI, Web SPA,
 /// and daemon share one authoritative configuration.
@@ -32,6 +40,14 @@ pub struct AgentOsMcpSettings {
     /// `"auto"` (heterogeneous opposite family), `"codex"`, or `"antigravity"`.
     #[serde(default = "default_advisor_provider")]
     pub advisor_provider: String,
+    // Automatically run background dual-advisor review once a human-rooted task
+    // crosses scale thresholds, injecting the result into the next prompt.
+    #[serde(default = "default_true")]
+    pub advisor_auto_review_enabled: bool,
+    #[serde(default = "default_advisor_auto_review_cooldown_minutes")]
+    pub advisor_auto_review_cooldown_minutes: u32,
+    #[serde(default = "default_advisor_auto_review_daily_cap")]
+    pub advisor_auto_review_daily_cap: u32,
     #[serde(default = "default_true")]
     pub ask_user_enabled: bool,
     #[serde(default)]
@@ -47,6 +63,9 @@ impl Default for AgentOsMcpSettings {
             goal_enabled: true,
             advisor_enabled: true,
             advisor_provider: default_advisor_provider(),
+            advisor_auto_review_enabled: true,
+            advisor_auto_review_cooldown_minutes: default_advisor_auto_review_cooldown_minutes(),
+            advisor_auto_review_daily_cap: default_advisor_auto_review_daily_cap(),
             ask_user_enabled: true,
             delegation_enabled: false,
             session_info_enabled: true,

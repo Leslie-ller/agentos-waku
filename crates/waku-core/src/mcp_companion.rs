@@ -22,8 +22,8 @@ use waku_protocol::memory::{
     MemoryNoteRecord,
 };
 use waku_protocol::model::{
-    GoalOperation, ProviderKind, ThreadGoal, ThreadGoalStatus, UserInputAnswer, UserInputOption,
-    UserInputQuestion,
+    ActivityKind, GoalOperation, ProviderKind, ThreadGoal, ThreadGoalStatus, UserInputAnswer,
+    UserInputOption, UserInputQuestion,
 };
 use waku_protocol::settings::{AgentOsMcpSettings, DaemonSettings};
 
@@ -283,6 +283,18 @@ pub fn ensure_mcp_tables(conn: &Connection) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_agentos_advisor_session
             ON agentos_advisor_consultations(session_id, created_at DESC);
 
+        CREATE TABLE IF NOT EXISTS agentos_pending_advisor_reviews (
+            review_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            trigger_reason TEXT NOT NULL,
+            advice_text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at INTEGER NOT NULL,
+            applied_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_agentos_pending_advisor_session
+            ON agentos_pending_advisor_reviews(session_id, status, created_at DESC);
+
         CREATE TABLE IF NOT EXISTS agentos_delegations (
             delegation_id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL,
@@ -300,13 +312,17 @@ pub fn ensure_mcp_tables(conn: &Connection) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_agentos_delegations_session
             ON agentos_delegations(session_id, created_at DESC);",
     )?;
-    // Additive columns for host-side auto-rotation & autonomous goal continuation.
+    // Additive columns for host-side auto-rotation, goal continuation, and auto-advisor origin.
     let _ = conn.execute(
         "ALTER TABLE agentos_memory_rotations ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'",
         [],
     );
     let _ = conn.execute(
         "ALTER TABLE agentos_goals ADD COLUMN last_reported_status TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agentos_advisor_consultations ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'",
         [],
     );
     Ok(())
@@ -1401,8 +1417,6 @@ fn call_mcp_tool(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or(settings.advisor_provider.as_str());
-            let requested_both = is_parallel_advisor_request(requested);
-            let targets = resolve_advisor_providers(requested, ctx.caller_provider)?;
             let model_override = args
                 .get("model")
                 .and_then(Value::as_str)
@@ -1410,189 +1424,18 @@ fn call_mcp_tool(
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned);
 
-            let mut prompt = format!("{ADVISOR_SYSTEM_PROMPT}\n\n");
-            prompt.push_str(&format!("Question:\n{question}\n"));
-            if let Some(extra) = context {
-                prompt.push_str(&format!("\nContext & hypotheses:\n{extra}\n"));
-            }
-            if !files.is_empty() {
-                prompt.push_str("\nRelevant local workspace files / images to inspect:\n");
-                for f in &files {
-                    prompt.push_str(&format!("- {f}\n"));
-                }
-            }
-
-            let caller_name = ctx.caller_provider.map(|p| p.id().to_owned());
-            let wall_started = Instant::now();
-
-            if targets.len() == 1 {
-                let advisor_provider = targets[0];
-                let model = model_override
-                    .or_else(|| default_advisor_model(advisor_provider).map(str::to_owned));
-                let cid = Uuid::new_v4().to_string();
-                conn.execute(
-                    "INSERT INTO agentos_advisor_consultations
-                     (consultation_id, session_id, caller_provider, advisor_provider, model, question, status, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7)",
-                    params![
-                        cid,
-                        ctx.session_id,
-                        caller_name,
-                        advisor_provider.id(),
-                        model,
-                        question,
-                        now
-                    ],
-                )?;
-
-                match run_isolated_oneshot_agent(
-                    advisor_provider,
-                    &ctx.cwd,
-                    &prompt,
-                    model.as_deref(),
-                    true,
-                    Duration::from_secs(120),
-                    None,
-                ) {
-                    Ok(advice) => {
-                        let completed_at = unix_now();
-                        let _ = conn.execute(
-                            "UPDATE agentos_advisor_consultations
-                             SET status = 'completed', advice = ?1, completed_at = ?2
-                             WHERE consultation_id = ?3",
-                            params![advice, completed_at, cid],
-                        );
-                        let mut response = json!({
-                            "consultationId": cid,
-                            "mode": "single",
-                            "parallel": false,
-                            "advisorProvider": advisor_provider.id(),
-                            "model": model,
-                            "readOnlyEnforced": true,
-                            "durationMs": wall_started.elapsed().as_millis() as u64,
-                            "advice": advice,
-                        });
-                        if requested_both {
-                            response["requestedMode"] = json!("both");
-                            response["warning"] = json!(format!(
-                                "Parallel 'both' mode was requested, but only {} is currently installed/authenticated; ran single-advisor fallback.",
-                                advisor_provider.display_name()
-                            ));
-                        }
-                        Ok(response)
-                    }
-                    Err(error) => {
-                        let _ = conn.execute(
-                            "UPDATE agentos_advisor_consultations
-                             SET status = 'failed', advice = ?1, completed_at = ?2
-                             WHERE consultation_id = ?3",
-                            params![error.to_string(), unix_now(), cid],
-                        );
-                        Err(error)
-                    }
-                }
-            } else {
-                // Parallel dual-advisor mode: pre-insert all running rows on the calling
-                // thread (rusqlite::Connection is !Sync), fan out via std::thread::scope,
-                // then persist every advisor's outcome on the calling thread.
-                let mut jobs: Vec<(String, ProviderKind, Option<String>)> =
-                    Vec::with_capacity(targets.len());
-                {
-                    let tx = conn.unchecked_transaction()?;
-                    for advisor_provider in targets {
-                        let cid = Uuid::new_v4().to_string();
-                        let model = default_advisor_model(advisor_provider).map(str::to_owned);
-                        tx.execute(
-                            "INSERT INTO agentos_advisor_consultations
-                             (consultation_id, session_id, caller_provider, advisor_provider, model, question, status, created_at)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7)",
-                            params![
-                                cid,
-                                ctx.session_id,
-                                caller_name,
-                                advisor_provider.id(),
-                                model,
-                                question,
-                                now
-                            ],
-                        )?;
-                        jobs.push((cid, advisor_provider, model));
-                    }
-                    tx.commit()?;
-                }
-
-                let outcomes: Vec<ParallelAdvisorOutcome> = std::thread::scope(|scope| {
-                    let handles: Vec<_> = jobs
-                        .into_iter()
-                        .map(|(cid, provider, model)| {
-                            let cwd = &ctx.cwd;
-                            let prompt = &prompt;
-                            let cid_for_panic = cid.clone();
-                            let model_for_panic = model.clone();
-                            let handle = scope.spawn(move || {
-                                let started = Instant::now();
-                                let result = run_isolated_oneshot_agent(
-                                    provider,
-                                    cwd,
-                                    prompt,
-                                    model.as_deref(),
-                                    true,
-                                    Duration::from_secs(120),
-                                    None,
-                                );
-                                ParallelAdvisorOutcome {
-                                    consultation_id: cid,
-                                    provider,
-                                    model,
-                                    duration_ms: started.elapsed().as_millis() as u64,
-                                    result,
-                                }
-                            });
-                            (cid_for_panic, provider, model_for_panic, handle)
-                        })
-                        .collect();
-
-                    handles
-                        .into_iter()
-                        .map(|(cid, provider, model, handle)| {
-                            handle.join().unwrap_or_else(|_| ParallelAdvisorOutcome {
-                                consultation_id: cid,
-                                provider,
-                                model,
-                                duration_ms: wall_started.elapsed().as_millis() as u64,
-                                result: Err(anyhow!("advisor worker thread panicked")),
-                            })
-                        })
-                        .collect()
-                });
-
-                let completed_at = unix_now();
-                for outcome in &outcomes {
-                    match &outcome.result {
-                        Ok(advice) => {
-                            let _ = conn.execute(
-                                "UPDATE agentos_advisor_consultations
-                                 SET status = 'completed', advice = ?1, completed_at = ?2
-                                 WHERE consultation_id = ?3",
-                                params![advice, completed_at, outcome.consultation_id],
-                            );
-                        }
-                        Err(error) => {
-                            let _ = conn.execute(
-                                "UPDATE agentos_advisor_consultations
-                                 SET status = 'failed', advice = ?1, completed_at = ?2
-                                 WHERE consultation_id = ?3",
-                                params![error.to_string(), completed_at, outcome.consultation_id],
-                            );
-                        }
-                    }
-                }
-
-                build_parallel_advisor_response(
-                    &outcomes,
-                    wall_started.elapsed().as_millis() as u64,
-                )
-            }
+            execute_advisor_consultation(
+                conn,
+                &ctx.session_id,
+                &ctx.cwd,
+                ctx.caller_provider,
+                requested,
+                model_override,
+                question,
+                context,
+                &files,
+                "manual",
+            )
         }
 
         "delegate_to_agent" => {
@@ -2497,6 +2340,833 @@ fn run_isolated_antigravity_oneshot(
             anyhow!("{err} (stderr: {snippet})")
         }
     })
+}
+
+// ── Shared advisor execution & scale-triggered background auto-review ────────
+
+const AUTO_ADVISOR_PER_SESSION_DAILY_CAP: i64 = 6;
+const AUTO_ADVISOR_MAX_QUEUE: usize = 4;
+const AUTO_ADVISOR_STALE_WINDOW_SECS: i64 = 6 * 3600;
+const AUTO_ADVISOR_MAX_INJECT_CHARS: usize = 6000;
+
+#[allow(clippy::too_many_arguments)]
+fn execute_advisor_consultation(
+    conn: &Connection,
+    session_id: &str,
+    cwd: &Path,
+    caller_provider: Option<ProviderKind>,
+    requested_provider: &str,
+    model_override: Option<String>,
+    question: &str,
+    context: Option<&str>,
+    files: &[String],
+    origin: &str,
+) -> anyhow::Result<Value> {
+    let requested_both = is_parallel_advisor_request(requested_provider);
+    let targets = resolve_advisor_providers(requested_provider, caller_provider)?;
+    let now = unix_now();
+
+    let mut prompt = format!("{ADVISOR_SYSTEM_PROMPT}\n\n");
+    prompt.push_str(&format!("Question:\n{question}\n"));
+    if let Some(extra) = context {
+        prompt.push_str(&format!("\nContext & hypotheses:\n{extra}\n"));
+    }
+    if !files.is_empty() {
+        prompt.push_str("\nRelevant local workspace files / images to inspect:\n");
+        for f in files {
+            prompt.push_str(&format!("- {f}\n"));
+        }
+    }
+
+    let caller_name = caller_provider.map(|p| p.id().to_owned());
+    let wall_started = Instant::now();
+
+    if targets.len() == 1 {
+        let advisor_provider = targets[0];
+        let model = model_override
+            .or_else(|| default_advisor_model(advisor_provider).map(str::to_owned));
+        let cid = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO agentos_advisor_consultations
+             (consultation_id, session_id, caller_provider, advisor_provider, model, question, status, created_at, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8)",
+            params![
+                cid,
+                session_id,
+                caller_name,
+                advisor_provider.id(),
+                model,
+                question,
+                now,
+                origin
+            ],
+        )?;
+
+        match run_isolated_oneshot_agent(
+            advisor_provider,
+            cwd,
+            &prompt,
+            model.as_deref(),
+            true,
+            Duration::from_secs(120),
+            None,
+        ) {
+            Ok(advice) => {
+                let completed_at = unix_now();
+                let _ = conn.execute(
+                    "UPDATE agentos_advisor_consultations
+                     SET status = 'completed', advice = ?1, completed_at = ?2
+                     WHERE consultation_id = ?3",
+                    params![advice, completed_at, cid],
+                );
+                let mut response = json!({
+                    "consultationId": cid,
+                    "mode": "single",
+                    "parallel": false,
+                    "advisorProvider": advisor_provider.id(),
+                    "model": model,
+                    "readOnlyEnforced": true,
+                    "durationMs": wall_started.elapsed().as_millis() as u64,
+                    "advice": advice,
+                });
+                if requested_both {
+                    response["requestedMode"] = json!("both");
+                    response["warning"] = json!(format!(
+                        "Parallel 'both' mode was requested, but only {} is currently installed/authenticated; ran single-advisor fallback.",
+                        advisor_provider.display_name()
+                    ));
+                }
+                Ok(response)
+            }
+            Err(error) => {
+                let _ = conn.execute(
+                    "UPDATE agentos_advisor_consultations
+                     SET status = 'failed', advice = ?1, completed_at = ?2
+                     WHERE consultation_id = ?3",
+                    params![error.to_string(), unix_now(), cid],
+                );
+                Err(error)
+            }
+        }
+    } else {
+        // Parallel dual-advisor mode: pre-insert all running rows transactionally on the
+        // calling thread (rusqlite::Connection is !Sync), fan out via std::thread::scope,
+        // then persist every advisor's outcome on the calling thread.
+        let mut jobs: Vec<(String, ProviderKind, Option<String>)> =
+            Vec::with_capacity(targets.len());
+        {
+            let tx = conn.unchecked_transaction()?;
+            for advisor_provider in targets {
+                let cid = Uuid::new_v4().to_string();
+                let model = default_advisor_model(advisor_provider).map(str::to_owned);
+                tx.execute(
+                    "INSERT INTO agentos_advisor_consultations
+                     (consultation_id, session_id, caller_provider, advisor_provider, model, question, status, created_at, origin)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8)",
+                    params![
+                        cid,
+                        session_id,
+                        caller_name,
+                        advisor_provider.id(),
+                        model,
+                        question,
+                        now,
+                        origin
+                    ],
+                )?;
+                jobs.push((cid, advisor_provider, model));
+            }
+            tx.commit()?;
+        }
+
+        let outcomes: Vec<ParallelAdvisorOutcome> = std::thread::scope(|scope| {
+            let handles: Vec<_> = jobs
+                .into_iter()
+                .map(|(cid, provider, model)| {
+                    let prompt = &prompt;
+                    let cid_for_panic = cid.clone();
+                    let model_for_panic = model.clone();
+                    let handle = scope.spawn(move || {
+                        let started = Instant::now();
+                        let result = run_isolated_oneshot_agent(
+                            provider,
+                            cwd,
+                            prompt,
+                            model.as_deref(),
+                            true,
+                            Duration::from_secs(120),
+                            None,
+                        );
+                        ParallelAdvisorOutcome {
+                            consultation_id: cid,
+                            provider,
+                            model,
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            result,
+                        }
+                    });
+                    (cid_for_panic, provider, model_for_panic, handle)
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|(cid, provider, model, handle)| {
+                    handle.join().unwrap_or_else(|_| ParallelAdvisorOutcome {
+                        consultation_id: cid,
+                        provider,
+                        model,
+                        duration_ms: wall_started.elapsed().as_millis() as u64,
+                        result: Err(anyhow!("advisor worker thread panicked")),
+                    })
+                })
+                .collect()
+        });
+
+        let completed_at = unix_now();
+        for outcome in &outcomes {
+            match &outcome.result {
+                Ok(advice) => {
+                    let _ = conn.execute(
+                        "UPDATE agentos_advisor_consultations
+                         SET status = 'completed', advice = ?1, completed_at = ?2
+                         WHERE consultation_id = ?3",
+                        params![advice, completed_at, outcome.consultation_id],
+                    );
+                }
+                Err(error) => {
+                    let _ = conn.execute(
+                        "UPDATE agentos_advisor_consultations
+                         SET status = 'failed', advice = ?1, completed_at = ?2
+                         WHERE consultation_id = ?3",
+                        params![error.to_string(), completed_at, outcome.consultation_id],
+                    );
+                }
+            }
+        }
+
+        build_parallel_advisor_response(&outcomes, wall_started.elapsed().as_millis() as u64)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AutoAdvisorSnapshot {
+    pub trigger_reason: String,
+    pub recent_user_prompts: Vec<String>,
+    pub latest_assistant_excerpt: String,
+    pub edited_files: Vec<String>,
+    pub read_files: Vec<String>,
+    pub failed_commands: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AutoAdvisorReviewJob {
+    pub session_id: Uuid,
+    pub db_path: PathBuf,
+    pub settings_path: PathBuf,
+    pub cwd: PathBuf,
+    pub caller_provider: ProviderKind,
+    pub snapshot: AutoAdvisorSnapshot,
+}
+
+#[derive(Debug, Default)]
+pub struct SessionScaleTracker {
+    has_human_root: bool,
+    turn_origin_human: bool,
+    parked: bool,
+    human_turns: u32,
+    edited_files: std::collections::BTreeSet<String>,
+    read_files: std::collections::BTreeSet<String>,
+    diff_lines: u64,
+    research_ops: u32,
+    command_ops: u32,
+    failed_commands: u32,
+    plan_ops: u32,
+    other_tool_ops: u32,
+    recent_user_prompts: std::collections::VecDeque<String>,
+    current_assistant_text: String,
+    latest_assistant_excerpt: String,
+    recent_failed_titles: std::collections::VecDeque<String>,
+    turn_tool_names: Vec<String>,
+    recent_turn_fingerprints: std::collections::VecDeque<(String, bool)>,
+    last_review_at: i64,
+}
+
+impl SessionScaleTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mark_human_prompt(&mut self, prompt: &str) {
+        self.has_human_root = true;
+        self.turn_origin_human = true;
+        self.parked = false;
+        self.current_assistant_text.clear();
+        self.turn_tool_names.clear();
+        let trimmed = prompt.trim();
+        if !trimmed.is_empty() {
+            let clipped: String = trimmed.chars().take(400).collect();
+            if self.recent_user_prompts.len() >= 2 {
+                self.recent_user_prompts.pop_front();
+            }
+            self.recent_user_prompts.push_back(clipped);
+        }
+    }
+
+    pub fn mark_goal_continuation(&mut self) {
+        self.turn_origin_human = self.has_human_root;
+        self.parked = false;
+        self.current_assistant_text.clear();
+        self.turn_tool_names.clear();
+    }
+
+    pub fn observe_turn_started(&mut self) {
+        if self.parked {
+            // Resuming from TurnParked without a new human prompt is an autonomous
+            // background/timer wakeup (e.g. game-farming poll) — accrue zero credit.
+            self.turn_origin_human = false;
+            self.parked = false;
+        }
+        self.current_assistant_text.clear();
+        self.turn_tool_names.clear();
+    }
+
+    pub fn observe_turn_parked(&mut self) {
+        self.parked = true;
+        self.turn_origin_human = false;
+    }
+
+    pub fn observe_text_delta(&mut self, delta: &str) {
+        if !self.turn_origin_human || self.current_assistant_text.len() >= 1600 {
+            return;
+        }
+        let remaining = 1600 - self.current_assistant_text.len();
+        let take: String = delta.chars().take(remaining).collect();
+        self.current_assistant_text.push_str(&take);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_activity(
+        &mut self,
+        kind: ActivityKind,
+        tool_name: Option<&str>,
+        mcp_server: Option<&str>,
+        title: &str,
+        target: Option<&str>,
+        failed: bool,
+        file_changes: &[(String, u64)],
+        now: i64,
+    ) {
+        let norm_tool = tool_name.unwrap_or("").trim().to_ascii_lowercase();
+        let norm_title = title.trim().to_ascii_lowercase();
+        if norm_tool.contains("consult_advisor") || norm_title.contains("consult_advisor") {
+            self.reset_after_review(now);
+            return;
+        }
+        if !self.turn_origin_human {
+            return;
+        }
+        if is_excluded_auto_review_activity(&norm_tool, mcp_server) {
+            return;
+        }
+
+        let fp_name = if !norm_tool.is_empty() {
+            norm_tool.clone()
+        } else {
+            format!("{kind:?}").to_ascii_lowercase()
+        };
+        if self.turn_tool_names.len() < 32 {
+            self.turn_tool_names.push(fp_name);
+        }
+
+        if kind == ActivityKind::FileChange || !file_changes.is_empty() {
+            for (path, lines) in file_changes {
+                let p = path.trim();
+                if !p.is_empty() && self.edited_files.len() < 40 {
+                    self.edited_files.insert(p.to_owned());
+                }
+                self.diff_lines = self.diff_lines.saturating_add(*lines);
+            }
+            if file_changes.is_empty()
+                && let Some(p) = target.map(str::trim).filter(|s| !s.is_empty())
+                && self.edited_files.len() < 40
+            {
+                self.edited_files.insert(p.to_owned());
+            }
+            return;
+        }
+
+        match kind {
+            ActivityKind::FileRead
+            | ActivityKind::FileSearch
+            | ActivityKind::FileList
+            | ActivityKind::Search => {
+                self.research_ops = self.research_ops.saturating_add(1);
+                if let Some(p) = target.map(str::trim).filter(|s| !s.is_empty())
+                    && self.read_files.len() < 12
+                {
+                    self.read_files.insert(p.to_owned());
+                }
+            }
+            ActivityKind::Command => {
+                self.command_ops = self.command_ops.saturating_add(1);
+                if failed {
+                    self.failed_commands = self.failed_commands.saturating_add(1);
+                    let summary: String = title.trim().chars().take(120).collect();
+                    if !summary.is_empty() {
+                        if self.recent_failed_titles.len() >= 3 {
+                            self.recent_failed_titles.pop_front();
+                        }
+                        self.recent_failed_titles.push_back(summary);
+                    }
+                }
+            }
+            ActivityKind::Plan => {
+                self.plan_ops = self.plan_ops.saturating_add(1);
+            }
+            ActivityKind::Tool => {
+                self.other_tool_ops = self.other_tool_ops.saturating_add(1);
+            }
+            ActivityKind::Reasoning | ActivityKind::FileChange => {}
+        }
+    }
+
+    pub fn evaluate_on_turn_finished(
+        &mut self,
+        now: i64,
+        cooldown_secs: i64,
+        turn_succeeded: bool,
+    ) -> Option<AutoAdvisorSnapshot> {
+        let was_human = self.turn_origin_human;
+        self.turn_origin_human = false;
+        if !was_human {
+            return None;
+        }
+        let trimmed_out = self.current_assistant_text.trim();
+        if !trimmed_out.is_empty() {
+            self.latest_assistant_excerpt = trimmed_out.chars().take(1200).collect();
+        }
+        self.human_turns = self.human_turns.saturating_add(1);
+
+        // Repetition / polling loop detector: 5 identical tool-fingerprint turns
+        // with zero file edits resets counters so routine loops never trigger.
+        let mut sorted_tools = self.turn_tool_names.clone();
+        sorted_tools.sort();
+        let fp = sorted_tools.join(",");
+        let had_edits = !self.edited_files.is_empty();
+        if self.recent_turn_fingerprints.len() >= 5 {
+            self.recent_turn_fingerprints.pop_front();
+        }
+        self.recent_turn_fingerprints.push_back((fp, had_edits));
+        if self.recent_turn_fingerprints.len() == 5
+            && !had_edits
+            && !self.recent_turn_fingerprints[0].0.is_empty()
+            && self
+                .recent_turn_fingerprints
+                .iter()
+                .all(|(f, edited)| !*edited && *f == self.recent_turn_fingerprints[0].0)
+        {
+            self.reset_counters_only();
+            return None;
+        }
+
+        if self.last_review_at > 0 && now.saturating_sub(self.last_review_at) < cooldown_secs {
+            return None;
+        }
+
+        let total_ops = self
+            .research_ops
+            .saturating_add(self.command_ops)
+            .saturating_add(self.plan_ops)
+            .saturating_add(self.other_tool_ops);
+
+        let trigger_reason = if self.edited_files.len() >= 3 || self.diff_lines >= 150 {
+            Some(format!(
+                "code scale: {} edited files (~{} diff lines)",
+                self.edited_files.len(),
+                self.diff_lines
+            ))
+        } else if self.edited_files.len() >= 2 && self.failed_commands >= 2 {
+            Some(format!(
+                "debugging impasse: {} edited files with {} failed verification commands",
+                self.edited_files.len(),
+                self.failed_commands
+            ))
+        } else if turn_succeeded
+            && self.human_turns >= 2
+            && (self.research_ops >= 10 || (!self.edited_files.is_empty() && total_ops >= 6))
+        {
+            Some(format!(
+                "research/build milestone: {} human turns, {} reads/searches, {} edited files",
+                self.human_turns,
+                self.research_ops,
+                self.edited_files.len()
+            ))
+        } else if turn_succeeded && self.human_turns >= 4 && total_ops >= 12 {
+            Some(format!(
+                "sustained multi-turn session: {} human turns, {} tool actions",
+                self.human_turns, total_ops
+            ))
+        } else {
+            None
+        }?;
+
+        let snapshot = AutoAdvisorSnapshot {
+            trigger_reason,
+            recent_user_prompts: self.recent_user_prompts.iter().cloned().collect(),
+            latest_assistant_excerpt: self.latest_assistant_excerpt.clone(),
+            edited_files: self.edited_files.iter().cloned().collect(),
+            read_files: self.read_files.iter().cloned().collect(),
+            failed_commands: self.recent_failed_titles.iter().cloned().collect(),
+        };
+        self.reset_after_review(now);
+        Some(snapshot)
+    }
+
+    fn reset_counters_only(&mut self) {
+        self.human_turns = 0;
+        self.edited_files.clear();
+        self.read_files.clear();
+        self.diff_lines = 0;
+        self.research_ops = 0;
+        self.command_ops = 0;
+        self.failed_commands = 0;
+        self.plan_ops = 0;
+        self.other_tool_ops = 0;
+        self.recent_failed_titles.clear();
+        self.recent_turn_fingerprints.clear();
+    }
+
+    fn reset_after_review(&mut self, now: i64) {
+        self.reset_counters_only();
+        self.last_review_at = now;
+    }
+}
+
+fn is_excluded_auto_review_activity(norm_tool: &str, mcp_server: Option<&str>) -> bool {
+    if mcp_server.is_some_and(|s| s.eq_ignore_ascii_case("chrome-mcp-server")) {
+        return true;
+    }
+    if norm_tool.starts_with("chrome_")
+        || norm_tool.contains("chrome_click")
+        || norm_tool.contains("chrome_screenshot")
+        || norm_tool.contains("chrome_computer")
+    {
+        return true;
+    }
+    matches!(
+        norm_tool,
+        "schedule"
+            | "manage_task"
+            | "manage_subagents"
+            | "get_goal"
+            | "report_goal"
+            | "mcp_agentos-mcp_get_goal"
+            | "mcp_agentos-mcp_report_goal"
+    )
+}
+
+fn auto_advisor_budget_allows(
+    conn: &Connection,
+    session_id: &str,
+    now: i64,
+    cooldown_secs: i64,
+    global_daily_cap: u32,
+) -> anyhow::Result<bool> {
+    if global_daily_cap == 0 {
+        return Ok(false);
+    }
+    let last_any: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(created_at) FROM agentos_advisor_consultations WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(ts) = last_any
+        && now.saturating_sub(ts) < cooldown_secs
+    {
+        return Ok(false);
+    }
+
+    let day_cutoff = now.saturating_sub(86_400);
+    let session_auto_24h: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT created_at) FROM agentos_advisor_consultations
+         WHERE session_id = ?1 AND origin = 'auto' AND created_at >= ?2",
+        params![session_id, day_cutoff],
+        |r| r.get(0),
+    )?;
+    if session_auto_24h >= AUTO_ADVISOR_PER_SESSION_DAILY_CAP {
+        return Ok(false);
+    }
+
+    let global_auto_24h: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT session_id || ':' || created_at) FROM agentos_advisor_consultations
+         WHERE origin = 'auto' AND created_at >= ?1",
+        params![day_cutoff],
+        |r| r.get(0),
+    )?;
+    Ok(global_auto_24h < i64::from(global_daily_cap))
+}
+
+fn build_auto_advisor_prompt_inputs(snapshot: &AutoAdvisorSnapshot) -> (String, String, Vec<String>) {
+    let question = format!(
+        "Automatic scale-triggered peer review ({}). Audit the recent work for hidden bugs, edge cases, architectural/design trade-offs, weak assumptions, or visual/clarity improvements. State the highest-impact findings first and keep advice concise.",
+        snapshot.trigger_reason
+    );
+    let mut ctx = String::new();
+    if !snapshot.recent_user_prompts.is_empty() {
+        ctx.push_str("Recent user requests:\n");
+        for p in &snapshot.recent_user_prompts {
+            ctx.push_str(&format!("- {p}\n"));
+        }
+    }
+    if !snapshot.latest_assistant_excerpt.is_empty() {
+        ctx.push_str(&format!(
+            "\nLatest assistant output excerpt:\n{}\n",
+            snapshot.latest_assistant_excerpt
+        ));
+    }
+    if !snapshot.failed_commands.is_empty() {
+        ctx.push_str("\nRecent failed commands/checks:\n");
+        for f in &snapshot.failed_commands {
+            ctx.push_str(&format!("- {f}\n"));
+        }
+    }
+    let mut files = Vec::new();
+    for f in snapshot
+        .edited_files
+        .iter()
+        .chain(snapshot.read_files.iter())
+    {
+        if files.len() >= 12 {
+            break;
+        }
+        if !files.contains(f) {
+            files.push(f.clone());
+        }
+    }
+    (question, ctx, files)
+}
+
+fn store_pending_advisor_review(
+    conn: &Connection,
+    session_id: &str,
+    trigger_reason: &str,
+    advice_text: &str,
+) -> anyhow::Result<()> {
+    let now = unix_now();
+    let review_id = Uuid::new_v4().to_string();
+    let bounded: String = advice_text.chars().take(AUTO_ADVISOR_MAX_INJECT_CHARS).collect();
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE agentos_pending_advisor_reviews
+         SET status = 'superseded'
+         WHERE session_id = ?1 AND status = 'pending'",
+        params![session_id],
+    )?;
+    tx.execute(
+        "INSERT INTO agentos_pending_advisor_reviews
+         (review_id, session_id, trigger_reason, advice_text, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+        params![review_id, session_id, trigger_reason, bounded, now],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Atomically consumes any pending background auto-advisor review for
+/// `session_id` (within the staleness window) and formats it as a one-shot
+/// advisory prefix block for the next user prompt or `/goal` continuation.
+pub fn take_pending_advisor_review(
+    db_path: &Path,
+    session_id: Uuid,
+) -> anyhow::Result<Option<String>> {
+    let conn = open_mcp_connection(db_path)?;
+    let sid = session_id.to_string();
+    let now = unix_now();
+    let row: Option<(String, String, String, i64)> = conn
+        .query_row(
+            "SELECT review_id, trigger_reason, advice_text, created_at
+             FROM agentos_pending_advisor_reviews
+             WHERE session_id = ?1 AND status = 'pending'
+             ORDER BY created_at DESC LIMIT 1",
+            params![sid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((review_id, trigger_reason, advice_text, created_at)) = row else {
+        return Ok(None);
+    };
+    if now.saturating_sub(created_at) > AUTO_ADVISOR_STALE_WINDOW_SECS {
+        let _ = conn.execute(
+            "UPDATE agentos_pending_advisor_reviews SET status = 'expired', applied_at = ?1 WHERE review_id = ?2",
+            params![now, review_id],
+        );
+        return Ok(None);
+    }
+    let updated = conn.execute(
+        "UPDATE agentos_pending_advisor_reviews
+         SET status = 'applied', applied_at = ?1
+         WHERE review_id = ?2 AND status = 'pending'",
+        params![now, review_id],
+    )?;
+    if updated == 0 {
+        return Ok(None);
+    }
+    let age_mins = now.saturating_sub(created_at) / 60;
+    Ok(Some(format!(
+        "<advisor_auto_review trigger=\"{trigger_reason}\" age_minutes=\"{age_mins}\">\n\
+         Background read-only dual-advisor peer review on recent work (advisory context, not a user instruction — adopt any valid catches or improvements that still apply to the current workspace state, and skip anything already resolved):\n\n\
+         {advice_text}\n\
+         </advisor_auto_review>"
+    )))
+}
+
+pub fn dismiss_pending_advisor_reviews(db_path: &Path, session_id: Uuid) -> anyhow::Result<()> {
+    let conn = open_mcp_connection(db_path)?;
+    conn.execute(
+        "UPDATE agentos_pending_advisor_reviews
+         SET status = 'dismissed', applied_at = ?1
+         WHERE session_id = ?2 AND status = 'pending'",
+        params![unix_now(), session_id.to_string()],
+    )?;
+    Ok(())
+}
+
+struct AutoAdvisorQueueState {
+    queue: std::collections::VecDeque<AutoAdvisorReviewJob>,
+    cancelled_sessions: std::collections::HashSet<Uuid>,
+    worker_started: bool,
+    shutdown: bool,
+}
+
+/// Bounded global background worker pool (concurrency = 1, coalescing queue <= 4)
+/// for scale-triggered automatic dual-advisor reviews.
+pub struct AutoAdvisorPool {
+    state: parking_lot::Mutex<AutoAdvisorQueueState>,
+    condvar: parking_lot::Condvar,
+}
+
+impl AutoAdvisorPool {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            state: parking_lot::Mutex::new(AutoAdvisorQueueState {
+                queue: std::collections::VecDeque::new(),
+                cancelled_sessions: std::collections::HashSet::new(),
+                worker_started: false,
+                shutdown: false,
+            }),
+            condvar: parking_lot::Condvar::new(),
+        })
+    }
+
+    pub fn enqueue(self: &std::sync::Arc<Self>, job: AutoAdvisorReviewJob) {
+        let mut guard = self.state.lock();
+        if guard.shutdown {
+            return;
+        }
+        guard.cancelled_sessions.remove(&job.session_id);
+        guard.queue.retain(|existing| existing.session_id != job.session_id);
+        if guard.queue.len() >= AUTO_ADVISOR_MAX_QUEUE {
+            guard.queue.pop_front();
+        }
+        guard.queue.push_back(job);
+        if !guard.worker_started {
+            guard.worker_started = true;
+            let pool = std::sync::Arc::clone(self);
+            let _ = std::thread::Builder::new()
+                .name("waku-auto-advisor-worker".to_owned())
+                .spawn(move || pool.worker_loop());
+        }
+        self.condvar.notify_one();
+    }
+
+    pub fn cancel_session(&self, session_id: Uuid) {
+        let mut guard = self.state.lock();
+        guard.queue.retain(|job| job.session_id != session_id);
+        guard.cancelled_sessions.insert(session_id);
+    }
+
+    pub fn shutdown(&self) {
+        let mut guard = self.state.lock();
+        guard.shutdown = true;
+        guard.queue.clear();
+        self.condvar.notify_all();
+    }
+
+    fn worker_loop(self: std::sync::Arc<Self>) {
+        loop {
+            let job = {
+                let mut guard = self.state.lock();
+                while guard.queue.is_empty() && !guard.shutdown {
+                    self.condvar.wait(&mut guard);
+                }
+                if guard.shutdown {
+                    return;
+                }
+                guard.queue.pop_front()
+            };
+            let Some(job) = job else {
+                continue;
+            };
+            let _ = self.run_job(job);
+        }
+    }
+
+    fn run_job(&self, job: AutoAdvisorReviewJob) -> anyhow::Result<()> {
+        let settings = std::fs::read(&job.settings_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<DaemonSettings>(&bytes).ok())
+            .map(|s| s.agentos_mcp)
+            .unwrap_or_default();
+        if !settings.advisor_enabled || !settings.advisor_auto_review_enabled {
+            return Ok(());
+        }
+
+        let conn = open_mcp_connection(&job.db_path)?;
+        let sid = job.session_id.to_string();
+        let cooldown_secs = i64::from(settings.advisor_auto_review_cooldown_minutes).saturating_mul(60);
+        if !auto_advisor_budget_allows(
+            &conn,
+            &sid,
+            unix_now(),
+            cooldown_secs,
+            settings.advisor_auto_review_daily_cap,
+        )? {
+            return Ok(());
+        }
+
+        let (question, context, files) = build_auto_advisor_prompt_inputs(&job.snapshot);
+        let result = execute_advisor_consultation(
+            &conn,
+            &sid,
+            &job.cwd,
+            Some(job.caller_provider),
+            &settings.advisor_provider,
+            None,
+            &question,
+            (!context.trim().is_empty()).then_some(context.as_str()),
+            &files,
+            "auto",
+        )?;
+
+        // If the session was closed or daemon shut down while advisors were running,
+        // skip queuing the pending prompt injection.
+        {
+            let guard = self.state.lock();
+            if guard.shutdown || guard.cancelled_sessions.contains(&job.session_id) {
+                return Ok(());
+            }
+        }
+        if let Some(advice) = result.get("advice").and_then(Value::as_str)
+            && !advice.trim().is_empty()
+        {
+            store_pending_advisor_review(&conn, &sid, &job.snapshot.trigger_reason, advice)?;
+        }
+        Ok(())
+    }
 }
 
 // ── Host-side runtime loop helpers (called by waku-daemon) ──────────────────
@@ -4677,6 +5347,9 @@ mod tests {
             goal_enabled: true,
             advisor_enabled: true,
             advisor_provider: "auto".into(),
+            advisor_auto_review_enabled: true,
+            advisor_auto_review_cooldown_minutes: 30,
+            advisor_auto_review_daily_cap: 20,
             ask_user_enabled: true,
             delegation_enabled: true,
             session_info_enabled: true,
@@ -5621,5 +6294,141 @@ mod tests {
             collect_bounded_pipe(Some(rx2), Duration::from_millis(50)),
             "stderr line"
         );
+    }
+
+    #[test]
+    fn scale_tracker_triggers_on_real_work_filters_farming_and_persists_pending_review() {
+        // 1. Game-farming / TurnParked autonomous wakeups never trigger auto-review.
+        let mut farming = SessionScaleTracker::new();
+        farming.mark_human_prompt("start overnight farming");
+        farming.observe_activity(
+            ActivityKind::Tool,
+            Some("schedule"),
+            None,
+            "schedule",
+            None,
+            false,
+            &[],
+            1_000,
+        );
+        farming.observe_turn_parked();
+        for i in 0..20 {
+            farming.observe_turn_started();
+            farming.observe_activity(
+                ActivityKind::Tool,
+                Some("chrome_screenshot"),
+                Some("chrome-mcp-server"),
+                "screenshot",
+                None,
+                false,
+                &[],
+                1_100 + i * 60,
+            );
+            assert!(
+                farming
+                    .evaluate_on_turn_finished(1_110 + i * 60, 1800, true)
+                    .is_none(),
+                "autonomous wakeups must never trigger auto-review"
+            );
+            farming.observe_turn_parked();
+        }
+
+        // 2. Multi-file coding turn crosses threshold (>= 3 edited files) and respects cooldown.
+        let mut coding = SessionScaleTracker::new();
+        coding.mark_human_prompt("implement parallel dual advisor");
+        coding.observe_activity(
+            ActivityKind::FileChange,
+            Some("edit_file"),
+            None,
+            "edit",
+            None,
+            false,
+            &[
+                ("a.rs".into(), 40),
+                ("b.rs".into(), 30),
+                ("c.rs".into(), 20),
+            ],
+            2_000,
+        );
+        let snap = coding
+            .evaluate_on_turn_finished(2_010, 1800, true)
+            .expect("3 edited files should trigger auto-review");
+        assert!(snap.trigger_reason.contains("code scale"));
+        assert_eq!(snap.edited_files.len(), 3);
+
+        // Within 30-min cooldown, another heavy turn must NOT fire.
+        coding.mark_human_prompt("more edits");
+        coding.observe_activity(
+            ActivityKind::FileChange,
+            Some("edit_file"),
+            None,
+            "edit",
+            None,
+            false,
+            &[("d.rs".into(), 200)],
+            2_500,
+        );
+        assert!(coding.evaluate_on_turn_finished(2_510, 1800, true).is_none());
+
+        // 3. Manual consult_advisor call resets scale counters and cooldown watermark.
+        let mut manual = SessionScaleTracker::new();
+        manual.mark_human_prompt("design review");
+        manual.observe_activity(
+            ActivityKind::FileChange,
+            Some("edit_file"),
+            None,
+            "edit",
+            None,
+            false,
+            &[("x.rs".into(), 100), ("y.rs".into(), 80)],
+            3_000,
+        );
+        manual.observe_activity(
+            ActivityKind::Tool,
+            Some("mcp_agentos-mcp_consult_advisor"),
+            Some("agentos-mcp"),
+            "consult_advisor",
+            None,
+            false,
+            &[],
+            3_005,
+        );
+        assert!(manual.evaluate_on_turn_finished(3_010, 1800, true).is_none());
+
+        // 4. Pending advisor review round-trips once through SQLite & budget checks honor daily caps.
+        let dir = std::env::temp_dir().join(format!("waku-auto-advisor-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("app.db");
+        let conn = open_mcp_connection(&db).unwrap();
+        let sid = Uuid::new_v4();
+        let sid_str = sid.to_string();
+
+        assert!(auto_advisor_budget_allows(&conn, &sid_str, 5_000, 1800, 20).unwrap());
+        store_pending_advisor_review(&conn, &sid_str, "code scale: 3 files", "## Advisor 1\nLooks good.")
+            .unwrap();
+        let injected = take_pending_advisor_review(&db, sid)
+            .unwrap()
+            .expect("pending review should be consumed once");
+        assert!(injected.contains("<advisor_auto_review"));
+        assert!(injected.contains("code scale: 3 files"));
+        assert!(injected.contains("Looks good."));
+        assert!(
+            take_pending_advisor_review(&db, sid).unwrap().is_none(),
+            "second consume must return None"
+        );
+
+        // Insert a recent consultation and verify cooldown blocks immediate auto-review.
+        conn.execute(
+            "INSERT INTO agentos_advisor_consultations
+             (consultation_id, session_id, caller_provider, advisor_provider, model, question, status, created_at, origin)
+             VALUES ('c-auto-1', ?1, 'antigravity', 'codex', 'gpt-6.2-sol', 'q', 'completed', ?2, 'auto')",
+            params![sid_str, 5_000_i64],
+        )
+        .unwrap();
+        assert!(!auto_advisor_budget_allows(&conn, &sid_str, 5_600, 1800, 20).unwrap());
+        assert!(auto_advisor_budget_allows(&conn, &sid_str, 7_000, 1800, 20).unwrap());
+        assert!(!auto_advisor_budget_allows(&conn, &sid_str, 7_000, 1800, 1).unwrap());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

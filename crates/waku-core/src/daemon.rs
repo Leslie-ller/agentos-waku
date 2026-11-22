@@ -45,6 +45,8 @@ fn trim_resident_transcripts(state: &mut PersistedState, pinned: &HashSet<Uuid>)
 
 pub struct WakuBackend {
     sessions: Mutex<HashMap<Uuid, (Uuid, ProviderKind, DriverHandle, Arc<AtomicBool>)>>,
+    scale_trackers: Mutex<HashMap<Uuid, Arc<Mutex<crate::mcp_companion::SessionScaleTracker>>>>,
+    auto_advisor: Arc<crate::mcp_companion::AutoAdvisorPool>,
     terminals: Mutex<HashMap<Uuid, (Uuid, crate::terminal::DaemonTerminal)>>,
     #[cfg(all(test, unix))]
     terminal_shell: Option<alacritty_terminal::tty::Shell>,
@@ -81,6 +83,8 @@ impl WakuBackend {
             .to_owned();
         Ok(Self {
             sessions: Mutex::new(HashMap::new()),
+            scale_trackers: Mutex::new(HashMap::new()),
+            auto_advisor: crate::mcp_companion::AutoAdvisorPool::new(),
             terminals: Mutex::new(HashMap::new()),
             #[cfg(all(test, unix))]
             terminal_shell: None,
@@ -506,6 +510,12 @@ impl Backend for WakuBackend {
                 }
                 let removed = self.sessions.lock().remove(&session_id);
                 drop(removed);
+                self.scale_trackers.lock().remove(&session_id);
+                self.auto_advisor.cancel_session(session_id);
+                let _ = crate::mcp_companion::dismiss_pending_advisor_reviews(
+                    self.task_store.path(),
+                    session_id,
+                );
                 Ok(ResponsePayload::Ack)
             }
             Command::HydrateSession { session_id } => {
@@ -886,6 +896,19 @@ impl Backend for WakuBackend {
                     Some(provider),
                     Some(self.settings.path()),
                 );
+                let cwd_for_loop = options.cwd.clone();
+                let settings_path_for_loop = self.settings.path().to_path_buf();
+                let auto_advisor_for_loop = self.auto_advisor.clone();
+                let scale_tracker_for_loop = self
+                    .scale_trackers
+                    .lock()
+                    .entry(session_id)
+                    .or_insert_with(|| {
+                        Arc::new(Mutex::new(
+                            crate::mcp_companion::SessionScaleTracker::new(),
+                        ))
+                    })
+                    .clone();
                 let options = DriverStartOptions {
                     binary: options.binary,
                     cwd: options.cwd,
@@ -910,6 +933,12 @@ impl Backend for WakuBackend {
                 std::thread::Builder::new()
                     .name(format!("waku-daemon-events-{session_id}"))
                     .spawn(move || {
+                        let unix_now_secs = || {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64
+                        };
                         loop {
                             if let Ok(claimed) = crate::mcp_companion::claim_pending_questions(
                                 &db_path_for_loop,
@@ -934,6 +963,54 @@ impl Backend for WakuBackend {
                                     match &event {
                                         DriverEvent::TurnStarted => {
                                             turn_active_for_loop.store(true, Ordering::Release);
+                                            scale_tracker_for_loop.lock().observe_turn_started();
+                                        }
+                                        DriverEvent::TurnParked => {
+                                            scale_tracker_for_loop.lock().observe_turn_parked();
+                                        }
+                                        DriverEvent::TextDelta(delta) => {
+                                            scale_tracker_for_loop.lock().observe_text_delta(delta);
+                                        }
+                                        DriverEvent::Activity {
+                                            kind,
+                                            title,
+                                            complete: true,
+                                            ..
+                                        } => {
+                                            scale_tracker_for_loop.lock().observe_activity(
+                                                *kind,
+                                                None,
+                                                None,
+                                                title,
+                                                None,
+                                                false,
+                                                &[],
+                                                unix_now_secs(),
+                                            );
+                                        }
+                                        DriverEvent::RichActivity(item) if item.complete => {
+                                            let changes: Vec<(String, u64)> = item
+                                                .file_changes
+                                                .iter()
+                                                .map(|fc| {
+                                                    (
+                                                        fc.path.clone(),
+                                                        fc.additions
+                                                            .unwrap_or(0)
+                                                            .saturating_add(fc.deletions.unwrap_or(0)),
+                                                    )
+                                                })
+                                                .collect();
+                                            scale_tracker_for_loop.lock().observe_activity(
+                                                item.kind,
+                                                item.tool_name.as_deref(),
+                                                item.mcp_server.as_deref(),
+                                                &item.title,
+                                                item.display_target.as_deref(),
+                                                item.failed,
+                                                &changes,
+                                                unix_now_secs(),
+                                            );
                                         }
                                         DriverEvent::TurnFinished { .. } => {
                                             turn_active_for_loop.store(false, Ordering::Release);
@@ -957,6 +1034,43 @@ impl Backend for WakuBackend {
                                     if events.send(wire).is_err() {
                                         break;
                                     }
+                                    if turn_finished {
+                                        let mcp_settings = std::fs::read(&settings_path_for_loop)
+                                            .ok()
+                                            .and_then(|bytes| {
+                                                serde_json::from_slice::<
+                                                    waku_protocol::settings::DaemonSettings,
+                                                >(&bytes)
+                                                .ok()
+                                            })
+                                            .map(|s| s.agentos_mcp)
+                                            .unwrap_or_default();
+                                        let cooldown_secs = i64::from(
+                                            mcp_settings.advisor_auto_review_cooldown_minutes,
+                                        )
+                                        .saturating_mul(60);
+                                        if let Some(snapshot) = scale_tracker_for_loop
+                                            .lock()
+                                            .evaluate_on_turn_finished(
+                                                unix_now_secs(),
+                                                cooldown_secs,
+                                                turn_succeeded,
+                                            )
+                                            && mcp_settings.advisor_enabled
+                                            && mcp_settings.advisor_auto_review_enabled
+                                        {
+                                            auto_advisor_for_loop.enqueue(
+                                                crate::mcp_companion::AutoAdvisorReviewJob {
+                                                    session_id,
+                                                    db_path: db_path_for_loop.clone(),
+                                                    settings_path: settings_path_for_loop.clone(),
+                                                    cwd: cwd_for_loop.clone(),
+                                                    caller_provider: provider,
+                                                    snapshot,
+                                                },
+                                            );
+                                        }
+                                    }
                                     if turn_succeeded
                                         && let Ok(Some((goal, next_prompt))) =
                                             crate::mcp_companion::take_pending_goal_continuation(
@@ -969,14 +1083,30 @@ impl Backend for WakuBackend {
                                         {
                                             let _ = events.send(goal_wire);
                                         }
-                                        let prompt_to_send = if let Ok(Some(rot_pkg)) =
+                                        let mut continuation_prefixes = Vec::new();
+                                        if let Ok(Some(rot_pkg)) =
                                             crate::mcp_companion::take_pending_context_rotation(
                                                 &db_path_for_loop,
                                                 session_id,
-                                            ) {
-                                            format!("{rot_pkg}\n\n{next_prompt}")
-                                        } else {
+                                            )
+                                        {
+                                            continuation_prefixes.push(rot_pkg);
+                                        }
+                                        if let Ok(Some(review_pkg)) =
+                                            crate::mcp_companion::take_pending_advisor_review(
+                                                &db_path_for_loop,
+                                                session_id,
+                                            )
+                                        {
+                                            continuation_prefixes.push(review_pkg);
+                                        }
+                                        let prompt_to_send = if continuation_prefixes.is_empty() {
                                             next_prompt.clone()
+                                        } else {
+                                            format!(
+                                                "{}\n\n{next_prompt}",
+                                                continuation_prefixes.join("\n\n")
+                                            )
                                         };
                                         if let Ok(submit_wire) =
                                             event_to_wire(DriverEvent::PromptSubmitted {
@@ -987,6 +1117,7 @@ impl Backend for WakuBackend {
                                         {
                                             let _ = events.send(submit_wire);
                                         }
+                                        scale_tracker_for_loop.lock().mark_goal_continuation();
                                         turn_active_for_loop.store(true, Ordering::Release);
                                         driver_for_loop.prompt(prompt_to_send);
                                     } else if turn_finished && provider != ProviderKind::Codex {
@@ -1017,6 +1148,11 @@ impl Backend for WakuBackend {
                 let _ =
                     crate::mcp_companion::cancel_pending_questions(self.task_store.path(), session_id);
                 let _ = crate::mcp_companion::pause_active_goal_on_cancel(
+                    self.task_store.path(),
+                    session_id,
+                );
+                self.auto_advisor.cancel_session(session_id);
+                let _ = crate::mcp_companion::dismiss_pending_advisor_reviews(
                     self.task_store.path(),
                     session_id,
                 );
@@ -1104,9 +1240,19 @@ impl Backend for WakuBackend {
                 } = &mut command
                 {
                     turn_active.store(true, Ordering::Release);
+                    self.scale_trackers
+                        .lock()
+                        .entry(session_id)
+                        .or_insert_with(|| {
+                            Arc::new(Mutex::new(
+                                crate::mcp_companion::SessionScaleTracker::new(),
+                            ))
+                        })
+                        .lock()
+                        .mark_human_prompt(prompt);
                     // Publish the user's clean prompt into the runtime event
                     // stream before prepending any one-shot cross-agent handoff
-                    // digest or context-rotation restore package.
+                    // digest, context-rotation package, or background advisor review.
                     events.send(event_to_wire(DriverEvent::PromptSubmitted {
                         message: prompt.clone(),
                         turn_id: turn_id.unwrap_or_else(Uuid::new_v4),
@@ -1119,6 +1265,14 @@ impl Backend for WakuBackend {
                         session_id,
                     ) {
                         prefix_blocks.push(rot_pkg);
+                    }
+                    if let Ok(Some(review_pkg)) =
+                        crate::mcp_companion::take_pending_advisor_review(
+                            self.task_store.path(),
+                            session_id,
+                        )
+                    {
+                        prefix_blocks.push(review_pkg);
                     }
 
                     let handoff_seed = {
@@ -1150,6 +1304,7 @@ impl Backend for WakuBackend {
     }
 
     fn shutdown(&self) {
+        self.auto_advisor.shutdown();
         let sessions = std::mem::take(&mut *self.sessions.lock());
         drop(sessions);
         let terminals = std::mem::take(&mut *self.terminals.lock());

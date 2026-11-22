@@ -75,7 +75,9 @@ function fixture(options: { attached?: boolean } = {}) {
             computer_use_enabled: false, computer_use_allowed_apps: [],
             agentos_mcp: {
               memoryEnabled: true, goalEnabled: true, advisorEnabled: true,
-              advisorProvider: 'auto', askUserEnabled: true,
+              advisorProvider: 'auto', advisorAutoReviewEnabled: true,
+              advisorAutoReviewCooldownMinutes: 30, advisorAutoReviewDailyCap: 20,
+              askUserEnabled: true,
               delegationEnabled: true, sessionInfoEnabled: true,
             },
           } };
