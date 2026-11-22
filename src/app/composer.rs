@@ -101,6 +101,23 @@ impl Waku {
                     })),
             );
         }
+        let (title, detail) = permission_card_parts(&permission.title, &permission.detail);
+        let detail_box = (!detail.trim().is_empty()).then(|| {
+            div()
+                .id("permission-detail")
+                .mt(px(8.0))
+                .max_h(px(140.0))
+                .overflow_y_scroll()
+                .p(px(8.0))
+                .rounded(px(7.0))
+                .bg(theme.inset)
+                .font_family(crate::md::render::MONO_FAMILY)
+                .text_size(sp(12.5))
+                .line_height(sp(16.0))
+                .text_color(theme.text_secondary)
+                .whitespace_normal()
+                .child(SharedString::from(detail))
+        });
         Some(
             div().px(px(20.0)).pb(px(8.0)).child(
                 div()
@@ -118,31 +135,24 @@ impl Waku {
                             .flex()
                             .items_center()
                             .gap(px(8.0))
-                            .child(icon("icons/alert.svg", 13.0, theme.warning))
+                            .min_w_0()
                             .child(
                                 div()
+                                    .flex_shrink_0()
+                                    .child(icon("icons/alert.svg", 13.0, theme.warning)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
                                     .text_size(sp(12.5))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(theme.text)
-                                    .child(SharedString::from(permission.title.clone())),
+                                    .child(SharedString::from(title)),
                             ),
                     )
-                    .child(
-                        div()
-                            .id("permission-detail")
-                            .mt(px(8.0))
-                            .max_h(px(92.0))
-                            .overflow_y_scroll()
-                            .p(px(8.0))
-                            .rounded(px(7.0))
-                            .bg(theme.inset)
-                            .font_family(crate::md::render::MONO_FAMILY)
-                            .text_size(sp(12.5))
-                            .line_height(sp(16.0))
-                            .text_color(theme.text_secondary)
-                            .whitespace_normal()
-                            .child(SharedString::from(permission.detail.clone())),
-                    )
+                    .children(detail_box)
                     .child(buttons),
             ),
         )
@@ -3887,6 +3897,74 @@ pub(super) fn picker_has_no_providers(
 
 /// The models the picker lists, in display order.
 ///
+const PERMISSION_HEADER_MAX_CHARS: usize = 120;
+
+/// Defensive UI normalization for permission cards: keeps the header row to a
+/// single concise line regardless of provider, and moves any multi-line or
+/// overlong title body into the scrollable detail box so action buttons stay
+/// reachable.
+fn permission_card_parts(raw_title: &str, raw_detail: &str) -> (String, String) {
+    let title = raw_title.trim();
+    let detail = raw_detail.trim();
+    let has_newline = title.contains('\n') || title.contains('\r');
+    let too_long = title.chars().count() > PERMISSION_HEADER_MAX_CHARS;
+    if !has_newline && !too_long {
+        return (title.to_owned(), detail.to_owned());
+    }
+    let first_line = title
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(title);
+    let compact_title = if first_line.chars().count() > PERMISSION_HEADER_MAX_CHARS {
+        first_line
+            .chars()
+            .take(PERMISSION_HEADER_MAX_CHARS)
+            .chain(std::iter::once('…'))
+            .collect()
+    } else {
+        first_line.to_owned()
+    };
+    let expanded_detail = if detail.is_empty() || detail == title {
+        title.to_owned()
+    } else if detail.contains(title) {
+        detail.to_owned()
+    } else {
+        format!("{detail}\n\n{title}")
+    };
+    (compact_title, expanded_detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::permission_card_parts;
+
+    #[test]
+    fn permission_card_parts_moves_multiline_title_into_detail() {
+        let script = "python3 - <<'PY'\nimport sqlite3\nprint(1)\nPY";
+        let (title, detail) = permission_card_parts(script, "The agent wants to execute");
+        assert_eq!(title, "python3 - <<'PY'");
+        assert!(!title.contains('\n'));
+        assert_eq!(detail, format!("The agent wants to execute\n\n{script}"));
+    }
+
+    #[test]
+    fn permission_card_parts_does_not_duplicate_title_already_in_detail() {
+        let script = "python3 - <<'PY'\nprint(1)\nPY";
+        let combined = format!("Reason\n\n{script}");
+        let (title, detail) = permission_card_parts(script, &combined);
+        assert_eq!(title, "python3 - <<'PY'");
+        assert_eq!(detail, combined);
+    }
+
+    #[test]
+    fn permission_card_parts_keeps_short_single_line_title() {
+        let (title, detail) = permission_card_parts("Run command", "ls -la");
+        assert_eq!(title, "Run command");
+        assert_eq!(detail, "ls -la");
+    }
+}
+
 /// Shared by the panel body and by `enter`'s handler so a keyboard cursor index
 /// always means the same row in both.
 pub(super) fn visible_picker_models(

@@ -1967,18 +1967,15 @@ fn handle_permission_request(
         };
     }
 
-    let title = params
-        .pointer("/toolCall/title")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| tr!("permission.run_a_tool"));
-    let detail = permission_reason(&params).unwrap_or_else(|| {
+    let raw_title = params.pointer("/toolCall/title").and_then(Value::as_str);
+    let reason_or_kind = permission_reason(&params).unwrap_or_else(|| {
         params
             .pointer("/toolCall/kind")
             .and_then(Value::as_str)
             .map(|kind| tr!("permission.agent_wants_to", action = kind))
             .unwrap_or_else(|| tr!("permission.agent_asks_for_permission"))
     });
+    let (title, detail) = normalize_permission_text(raw_title, reason_or_kind);
     pending.lock().insert(request_id.clone(), responder);
     if events
         .send(DriverEvent::Permission {
@@ -2143,6 +2140,39 @@ fn permission_reason(params: &Value) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
     (!reason.is_empty()).then(|| truncate(&reason, 400))
+}
+
+const PERMISSION_TITLE_MAX_CHARS: usize = 120;
+
+/// Keep permission card titles to a single concise line. Some ACP agents (such
+/// as Antigravity) place an entire multi-line shell script in `toolCall.title`,
+/// which would otherwise blow up the permission header; move the full body into
+/// the scrollable `detail` field instead.
+fn normalize_permission_text(raw_title: Option<&str>, detail: String) -> (String, String) {
+    let trimmed = raw_title.map(str::trim).unwrap_or_default();
+    if trimmed.is_empty() {
+        return (tr!("permission.run_a_tool"), detail);
+    }
+    let has_newline = trimmed.contains('\n') || trimmed.contains('\r');
+    let too_long = trimmed.chars().count() > PERMISSION_TITLE_MAX_CHARS;
+    if !has_newline && !too_long {
+        return (trimmed.to_owned(), detail);
+    }
+    let first_line = trimmed
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(trimmed);
+    let compact_title = truncate(first_line, PERMISSION_TITLE_MAX_CHARS);
+    let trimmed_detail = detail.trim();
+    let expanded_detail = if trimmed_detail.is_empty() || trimmed_detail == trimmed {
+        trimmed.to_owned()
+    } else if trimmed_detail.contains(trimmed) {
+        trimmed_detail.to_owned()
+    } else {
+        format!("{trimmed_detail}\n\n{trimmed}")
+    };
+    (compact_title, expanded_detail)
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -2839,6 +2869,34 @@ mod tests {
             permission_reason(&params).as_deref(),
             Some("Not in allowlist: rm")
         );
+    }
+
+    #[test]
+    fn normalize_permission_text_moves_multiline_command_title_into_detail() {
+        let script = "python3 - <<'PY'\nimport sqlite3\nprint('hello')\nPY";
+        let (title, detail) =
+            normalize_permission_text(Some(script), "The agent wants to execute".into());
+        assert_eq!(title, "python3 - <<'PY'");
+        assert!(!title.contains('\n'));
+        assert!(detail.starts_with("The agent wants to execute\n\n"));
+        assert!(detail.contains("import sqlite3"));
+    }
+
+    #[test]
+    fn normalize_permission_text_keeps_short_single_line_title() {
+        let (title, detail) =
+            normalize_permission_text(Some("git status"), "The agent wants to execute".into());
+        assert_eq!(title, "git status");
+        assert_eq!(detail, "The agent wants to execute");
+    }
+
+    #[test]
+    fn normalize_permission_text_truncates_overlong_single_line_title() {
+        let long_cmd = format!("cargo test {}", "a".repeat(200));
+        let (title, detail) = normalize_permission_text(Some(&long_cmd), String::new());
+        assert!(title.chars().count() <= PERMISSION_TITLE_MAX_CHARS + 1);
+        assert!(title.ends_with('…'));
+        assert_eq!(detail, long_cmd);
     }
 
     /// Drives a real agent through the SDK-backed driver. Ignored by default:
