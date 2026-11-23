@@ -16,7 +16,7 @@ mod title_refresh;
 pub(crate) use acp::catalog_agent;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crossbeam_channel::{Receiver, SendError, Sender, unbounded};
 
@@ -79,9 +79,29 @@ pub struct DriverHandle {
     inner: Arc<dyn DriverControl>,
 }
 
+/// Non-owning handle for background helper threads (such as the daemon event
+/// forwarder) that must not keep a provider runtime alive after the session
+/// map drops its owning [`DriverHandle`].
+#[derive(Clone)]
+pub struct WeakDriverHandle {
+    inner: Weak<dyn DriverControl>,
+}
+
+impl WeakDriverHandle {
+    pub fn upgrade(&self) -> Option<DriverHandle> {
+        self.inner.upgrade().map(|inner| DriverHandle { inner })
+    }
+}
+
 impl DriverHandle {
     pub fn from_control(control: Arc<dyn DriverControl>) -> Self {
         Self { inner: control }
+    }
+
+    pub fn downgrade(&self) -> WeakDriverHandle {
+        WeakDriverHandle {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 
     pub fn prompt(&self, prompt: String) {

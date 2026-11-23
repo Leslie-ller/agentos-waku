@@ -1,4 +1,4 @@
-import type { AgentSession, ProviderKind } from './generated'
+import type { AgentSession, ProviderKind, RuntimeMode } from './generated'
 
 const STORAGE_KEY = 'waku.composer-preferences.v1'
 
@@ -16,6 +16,7 @@ export interface ComposerPreferences {
   lastReasoningEffort: string | null
   lastServiceTier: string | null
   lastContextWindow: string | null
+  lastRuntimeMode: RuntimeMode
   modelTraits: Record<string, RememberedModelTraits>
 }
 
@@ -25,8 +26,16 @@ const DEFAULT_PREFERENCES: ComposerPreferences = {
   lastReasoningEffort: null,
   lastServiceTier: null,
   lastContextWindow: null,
+  lastRuntimeMode: 'fullAccess',
   modelTraits: {},
 }
+
+const RUNTIME_MODES = new Set<RuntimeMode>([
+  'ask',
+  'autoAcceptEdits',
+  'auto',
+  'fullAccess',
+])
 
 const PROVIDERS = new Set<ProviderKind>([
   'amp',
@@ -91,9 +100,14 @@ export function rememberComposerSession(
   session: Pick<
     AgentSession,
     'provider' | 'model' | 'reasoning_effort' | 'service_tier' | 'context_window'
-  >,
+  > & { runtime_mode?: RuntimeMode },
 ): ComposerPreferences {
-  if (!session.model) return preferences
+  const nextRuntimeMode = currentRuntimeMode(session.runtime_mode) ?? preferences.lastRuntimeMode
+  if (!session.model) {
+    return nextRuntimeMode === preferences.lastRuntimeMode
+      ? preferences
+      : { ...preferences, lastRuntimeMode: nextRuntimeMode }
+  }
   const reasoningEffort = session.reasoning_effort ?? null
   const serviceTier = session.service_tier ?? null
   const contextWindow = session.context_window ?? null
@@ -104,6 +118,7 @@ export function rememberComposerSession(
     lastReasoningEffort: reasoningEffort,
     lastServiceTier: serviceTier,
     lastContextWindow: contextWindow,
+    lastRuntimeMode: nextRuntimeMode,
     modelTraits: {
       ...preferences.modelTraits,
       [modelKey(session.provider, session.model)]: {
@@ -130,6 +145,12 @@ const RENAMED_PROVIDERS = new Map<string, ProviderKind>([['openCode2', 'openCode
 function currentProvider(value: unknown): ProviderKind | undefined {
   const provider = typeof value === 'string' ? (RENAMED_PROVIDERS.get(value) ?? value) : value
   return PROVIDERS.has(provider as ProviderKind) ? (provider as ProviderKind) : undefined
+}
+
+function currentRuntimeMode(value: unknown): RuntimeMode | undefined {
+  return typeof value === 'string' && RUNTIME_MODES.has(value as RuntimeMode)
+    ? (value as RuntimeMode)
+    : undefined
 }
 
 function currentModelKey(key: string): string {
@@ -165,6 +186,7 @@ function parsePreferences(value: unknown): ComposerPreferences {
     lastReasoningEffort: nullableString(value.lastReasoningEffort) ?? null,
     lastServiceTier: nullableString(value.lastServiceTier) ?? null,
     lastContextWindow: nullableString(value.lastContextWindow) ?? null,
+    lastRuntimeMode: currentRuntimeMode(value.lastRuntimeMode) ?? DEFAULT_PREFERENCES.lastRuntimeMode,
     modelTraits,
   }
 }

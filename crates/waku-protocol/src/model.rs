@@ -3146,11 +3146,14 @@ fn structured_file_change(
     let object = value.as_object()?;
     let path = [
         "path",
+        "Path",
         "filePath",
+        "FilePath",
         "file_path",
         "filename",
         "fileName",
         "targetFile",
+        "TargetFile",
         "target_file",
         "notebookPath",
         "notebook_path",
@@ -3191,6 +3194,8 @@ fn structured_file_change(
         "old_content",
         "oldSource",
         "old_source",
+        "Target",
+        "TargetContent",
     ]
     .into_iter()
     .find_map(|key| object.get(key).and_then(serde_json::Value::as_str));
@@ -3205,6 +3210,8 @@ fn structured_file_change(
         "new_content",
         "newSource",
         "new_source",
+        "Replacement",
+        "ReplacementContent",
     ]
     .into_iter()
     .find_map(|key| object.get(key).and_then(serde_json::Value::as_str));
@@ -3218,6 +3225,7 @@ fn structured_file_change(
     .then(|| {
         object
             .get("content")
+            .or_else(|| object.get("Content"))
             .and_then(serde_json::Value::as_str)
             .or(patch)
     })
@@ -3240,7 +3248,11 @@ fn structured_file_change(
         replacement_diff(old, new)
     } else if let Some(edits) = object.get("edits").and_then(serde_json::Value::as_array) {
         edits_diff(edits)
-    } else if let Some(content) = object.get("content").and_then(serde_json::Value::as_str) {
+    } else if let Some(content) = object
+        .get("content")
+        .or_else(|| object.get("Content"))
+        .and_then(serde_json::Value::as_str)
+    {
         // A write tool that only names a file and its new contents. Nothing
         // says whether the file already existed, so present it as added.
         whole_file_diff(content, true)
@@ -5243,5 +5255,50 @@ mod tests {
         assert!(projection.transcript_blocks.is_empty());
         assert!(projection.turns.is_empty());
         assert!(projection.queued_messages.is_empty());
+    }
+
+    #[test]
+    fn structured_file_change_supports_antigravity_capitalized_fields() {
+        let mut write_activity = ActivityItem::new(
+            Some("call-write".into()),
+            ActivityKind::FileChange,
+            "write_file",
+            None,
+            true,
+        );
+        write_activity.arguments = Some(
+            serde_json::json!({
+                "Path": "/tmp/demo/hello.txt",
+                "Content": "line 1\nline 2\n",
+                "Overwrite": true
+            })
+            .to_string(),
+        );
+        write_activity.refresh_activity_metadata();
+        assert_eq!(write_activity.file_changes.len(), 1);
+        assert_eq!(write_activity.file_changes[0].path, "/tmp/demo/hello.txt");
+        assert_eq!(write_activity.file_changes[0].additions, Some(2));
+        assert_eq!(write_activity.file_changes[0].deletions, Some(0));
+
+        let mut edit_activity = ActivityItem::new(
+            Some("call-edit".into()),
+            ActivityKind::FileChange,
+            "edit_file",
+            None,
+            true,
+        );
+        edit_activity.arguments = Some(
+            serde_json::json!({
+                "Path": "/tmp/demo/app.rs",
+                "Target": "let a = 1;\n",
+                "Replacement": "let a = 2;\nlet b = 3;\n"
+            })
+            .to_string(),
+        );
+        edit_activity.refresh_activity_metadata();
+        assert_eq!(edit_activity.file_changes.len(), 1);
+        assert_eq!(edit_activity.file_changes[0].path, "/tmp/demo/app.rs");
+        assert_eq!(edit_activity.file_changes[0].additions, Some(2));
+        assert_eq!(edit_activity.file_changes[0].deletions, Some(1));
     }
 }

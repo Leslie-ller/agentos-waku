@@ -116,6 +116,25 @@ describe('desktop transcript language', () => {
     })).toBe('Read README.md')
   })
 
+  test('extracts basename for Antigravity fileChange fallback titles and display_target', () => {
+    const legacyAntigravity = {
+      ...activity('fileChange', true),
+      title: 'File /Users/leslie/Code/demo/hello.txt',
+      file_changes: [],
+    }
+    expect(activityDisplayTitle(legacyAntigravity)).toBe('Edited hello.txt')
+    expect(activityRowDetail(legacyAntigravity)).toBe('hello.txt')
+
+    const withTarget = {
+      ...activity('fileChange', false),
+      title: 'write_file',
+      display_target: '/Users/leslie/Code/demo/report.md',
+      file_changes: [],
+    }
+    expect(activityDisplayTitle(withTarget)).toBe('Editing report.md')
+    expect(activityRowDetail(withTarget)).toBe('report.md')
+  })
+
   test('keeps activity arguments and output in separate disclosure sections', () => {
     const item = {
       ...activity('tool', true),

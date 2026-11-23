@@ -1110,7 +1110,14 @@ function ChangesPanel({
   if (diff.isPending) {
     reviewContent = <PanelMessage title={t('diff.loading')} detail={t('diff.loading_description')} />
   } else if (diff.error) {
-    reviewContent = <PanelMessage title={t('diff.unavailable')} detail={errorMessage(diff.error)} danger />
+    const detail = errorMessage(diff.error)
+    reviewContent = (
+      <PanelMessage
+        title={t('diff.unavailable')}
+        detail={detail === 'the workspace is not a Git repository' ? t('diff.not_git_repository') : detail}
+        danger
+      />
+    )
   } else if (!diff.data?.patch.trim()) {
     reviewContent = <PanelMessage title={t('diff.no_changes')} detail={t('diff.no_changes_description')} />
   } else {

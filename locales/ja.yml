@@ -909,6 +909,7 @@ diff.loading: 変更を読み込み中…
 diff.preparing_review: レビューを準備中…
 diff.loading_description: レビュー用に一貫した Git スナップショットを取得しています
 diff.unavailable: 変更を利用できません
+diff.not_git_repository: このワークスペースは Git リポジトリではありません
 diff.refresh: 変更を更新
 diff.refresh_failed: "変更を更新できませんでした：%{error}"
 diff.truncated: 大きな差分 · 先頭 50,000 行を表示

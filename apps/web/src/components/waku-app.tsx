@@ -304,10 +304,11 @@ export function WakuApp() {
 
     enteringNewTask.current = true
     const project = currentProject ?? draftProject ?? taskState.data?.projects[0]
+    const inheritedRuntimeMode = current?.runtime_mode ?? draft?.runtime_mode
     setDisplayed(null)
     setNewTaskMode(true)
     setDraftProject(project ?? null)
-    setDraft(project ? createRememberedSession(project.id) : null)
+    setDraft(project ? createRememberedSession(project.id, inheritedRuntimeMode) : null)
     rememberNavigation({ kind: 'newTask', projectId: project?.id })
   }, [search.session])
 
@@ -616,9 +617,10 @@ export function WakuApp() {
     const project = preferred === null
       ? undefined
       : preferred ?? currentProject ?? draftProject ?? taskState.data?.projects[0]
+    const inheritedRuntimeMode = current?.runtime_mode ?? draft?.runtime_mode
     if (newTaskMode && draft) forgetRightPanelSession(draft.id)
     const nextDraft = project
-      ? createRememberedSession(project.id)
+      ? createRememberedSession(project.id, inheritedRuntimeMode)
       : null
     enteringNewTask.current = true
     pendingPaletteFocusSession.current = null
@@ -669,7 +671,8 @@ export function WakuApp() {
       project.id,
       summary,
       history,
-      activeSession?.runtime_mode ?? 'fullAccess',
+      activeSession?.runtime_mode
+        ?? readComposerPreferences(browserComposerPreferenceStorage(), config.address).lastRuntimeMode,
     )
     const saved = await saveSession(session, existingProject ? undefined : project)
     pendingPaletteFocusSession.current = saved.id
@@ -830,7 +833,7 @@ export function WakuApp() {
     setDraftProject(project)
     setDraft((currentDraft) => currentDraft
       ? { ...currentDraft, project_id: project.id, workspace: { kind: 'local' } }
-      : createRememberedSession(project.id))
+      : createRememberedSession(project.id, current?.runtime_mode))
     setNewTaskMode(true)
     rememberNavigation({ kind: 'newTask', projectId: project.id })
     void navigate({ search: { session: undefined }, replace: false })
@@ -873,7 +876,10 @@ export function WakuApp() {
     }
   }
 
-  function createRememberedSession(projectId: string): AgentSession {
+  function createRememberedSession(
+    projectId: string,
+    inheritedRuntimeMode?: AgentSession['runtime_mode'],
+  ): AgentSession {
     const preferences = readComposerPreferences(
       browserComposerPreferenceStorage(),
       config?.address ?? 'disconnected',
@@ -884,6 +890,7 @@ export function WakuApp() {
       reasoning_effort: preferences.lastReasoningEffort,
       service_tier: preferences.lastServiceTier,
       context_window: preferences.lastContextWindow,
+      runtime_mode: inheritedRuntimeMode ?? preferences.lastRuntimeMode,
     }
   }
 

@@ -20,6 +20,7 @@ import {
   createMarkdownVeilState,
   markdownVeilPlugin,
 } from '@/lib/markdown-veil'
+import { remarkHtmlBr } from '@/lib/markdown-br'
 import type {
   BackgroundWorkItem,
   BackgroundWorkKey,
@@ -1398,7 +1399,7 @@ function Markdown({
   return (
     <div className={cn('markdown min-w-0', compact && '[&>*:first-child]:mt-0 [&>*:last-child]:mb-0')}>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkHtmlBr]}
         rehypePlugins={chunks.length ? [markdownVeilPlugin(chunks, now)] : []}
         components={{
           a: ({ children, href, ...props }) => (

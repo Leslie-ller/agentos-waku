@@ -4646,7 +4646,12 @@ impl Waku {
                         waku.sync_right_panel_diff_tree_rows(cx);
                     }
                     Err(error) => {
-                        let message = error.to_string();
+                        let raw = error.to_string();
+                        let message = if raw.trim() == "the workspace is not a Git repository" {
+                            tr!("diff.not_git_repository")
+                        } else {
+                            raw
+                        };
                         if waku.right_panel_diff_snapshot.is_some() {
                             waku.show_toast(tr!("diff.refresh_failed", error = message));
                         } else {

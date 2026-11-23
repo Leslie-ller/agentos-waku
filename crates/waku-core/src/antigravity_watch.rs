@@ -1249,7 +1249,10 @@ impl AntigravityTrajectoryWatcher {
 impl Drop for AntigravityTrajectoryWatcher {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        self.shared.1.notify_all();
+        {
+            let _guard = self.shared.0.lock();
+            self.shared.1.notify_all();
+        }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }

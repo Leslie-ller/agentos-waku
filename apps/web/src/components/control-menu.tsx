@@ -63,14 +63,14 @@ export function ControlMenu({
       <Menu.Trigger
         aria-label={label}
         className={cn(
-          'flex h-6 max-w-44 shrink-0 items-center gap-1.5 rounded-[6px] px-[7px] text-[11.5px] leading-[14px] text-[var(--text-secondary)] outline-none hover:bg-accent focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-45',
+          'flex h-6 max-w-[min(11rem,100%)] min-w-0 shrink-0 items-center gap-1.5 rounded-[6px] px-[7px] text-[11.5px] leading-[14px] text-[var(--text-secondary)] outline-none hover:bg-accent focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-45',
           highlightTriggerWhenOpen && open && 'bg-accent text-foreground',
           triggerClassName,
         )}
       >
-        {icon && <WakuIcon className="size-[11px] text-[var(--text-tertiary)]" name={icon} />}
-        {children ?? <span className="truncate">{label}</span>}
-        {caret && <WakuIcon className="size-2.5 text-[var(--text-ghost)]" name="chevronDown" />}
+        {icon && <WakuIcon className="size-[11px] shrink-0 text-[var(--text-tertiary)]" name={icon} />}
+        {children ?? <span className="min-w-0 truncate">{label}</span>}
+        {caret && <WakuIcon className="size-2.5 shrink-0 text-[var(--text-ghost)]" name="chevronDown" />}
       </Menu.Trigger>
       <Menu.Portal>
         <Menu.Positioner

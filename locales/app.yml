@@ -1774,6 +1774,8 @@ diff.loading_description:
   en: Capturing a consistent Git snapshot for review
 diff.unavailable:
   en: Changes unavailable
+diff.not_git_repository:
+  en: This workspace is not a Git repository
 diff.refresh:
   en: Refresh changes
 diff.refresh_failed:

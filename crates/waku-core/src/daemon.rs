@@ -45,6 +45,7 @@ fn trim_resident_transcripts(state: &mut PersistedState, pinned: &HashSet<Uuid>)
 
 pub struct WakuBackend {
     sessions: Mutex<HashMap<Uuid, (Uuid, ProviderKind, DriverHandle, Arc<AtomicBool>)>>,
+    shutting_down: AtomicBool,
     scale_trackers: Mutex<HashMap<Uuid, Arc<Mutex<crate::mcp_companion::SessionScaleTracker>>>>,
     auto_advisor: Arc<crate::mcp_companion::AutoAdvisorPool>,
     terminals: Mutex<HashMap<Uuid, (Uuid, crate::terminal::DaemonTerminal)>>,
@@ -83,6 +84,7 @@ impl WakuBackend {
             .to_owned();
         Ok(Self {
             sessions: Mutex::new(HashMap::new()),
+            shutting_down: AtomicBool::new(false),
             scale_trackers: Mutex::new(HashMap::new()),
             auto_advisor: crate::mcp_companion::AutoAdvisorPool::new(),
             terminals: Mutex::new(HashMap::new()),
@@ -448,6 +450,7 @@ impl Backend for WakuBackend {
                             merge_stale_session_metadata(existing, session);
                         } else {
                             preserve_daemon_checkpoints(existing, &mut session);
+                            preserve_daemon_handoff_consumption(existing, &mut session);
                             *existing = session;
                         }
                     } else {
@@ -927,7 +930,10 @@ impl Backend for WakuBackend {
                     driver::start_local_with_mcp(provider, options, mcp_companion, event_sender)?;
                 let supports_steer = handle.supports_steer();
                 let db_path_for_loop = self.task_store.path().to_path_buf();
-                let driver_for_loop = handle.clone();
+                // Keep a weak handle here so the event-forwarding thread cannot
+                // form an Arc cycle with the driver's event sender and keep
+                // child processes alive after CloseSession / Start / RemoveSession.
+                let driver_for_loop = handle.downgrade();
                 let turn_active = Arc::new(AtomicBool::new(false));
                 let turn_active_for_loop = turn_active.clone();
                 std::thread::Builder::new()
@@ -1072,6 +1078,7 @@ impl Backend for WakuBackend {
                                         }
                                     }
                                     if turn_succeeded
+                                        && let Some(driver) = driver_for_loop.upgrade()
                                         && let Ok(Some((goal, next_prompt))) =
                                             crate::mcp_companion::take_pending_goal_continuation(
                                                 &db_path_for_loop,
@@ -1119,7 +1126,7 @@ impl Backend for WakuBackend {
                                         }
                                         scale_tracker_for_loop.lock().mark_goal_continuation();
                                         turn_active_for_loop.store(true, Ordering::Release);
-                                        driver_for_loop.prompt(prompt_to_send);
+                                        driver.prompt(prompt_to_send);
                                     } else if turn_finished && provider != ProviderKind::Codex {
                                         if let Ok(Some(goal)) =
                                             crate::mcp_companion::current_session_goal(
@@ -1139,9 +1146,15 @@ impl Backend for WakuBackend {
                         }
                     })
                     .context("could not start daemon event forwarding thread")?;
-                self.sessions
-                    .lock()
-                    .insert(session_id, (runtime_id, provider, handle, turn_active));
+                {
+                    let mut sessions = self.sessions.lock();
+                    if self.shutting_down.load(Ordering::Acquire) {
+                        drop(sessions);
+                        drop(handle);
+                        bail!("daemon is shutting down");
+                    }
+                    sessions.insert(session_id, (runtime_id, provider, handle, turn_active));
+                }
                 Ok(ResponsePayload::Started { supports_steer })
             }
             Command::CloseSession => {
@@ -1305,7 +1318,11 @@ impl Backend for WakuBackend {
 
     fn shutdown(&self) {
         self.auto_advisor.shutdown();
-        let sessions = std::mem::take(&mut *self.sessions.lock());
+        let sessions = {
+            let mut sessions = self.sessions.lock();
+            self.shutting_down.store(true, Ordering::Release);
+            std::mem::take(&mut *sessions)
+        };
         drop(sessions);
         let terminals = std::mem::take(&mut *self.terminals.lock());
         drop(terminals);
@@ -1344,6 +1361,7 @@ fn merge_stale_session_metadata(existing: &mut AgentSession, incoming: AgentSess
         existing.title = incoming.title;
         existing.project_id = incoming.project_id;
         existing.workspace = incoming.workspace;
+        let provider_changed = existing.provider != incoming.provider;
         existing.provider = incoming.provider;
         existing.model = incoming.model;
         existing.runtime_mode = incoming.runtime_mode;
@@ -1354,7 +1372,7 @@ fn merge_stale_session_metadata(existing: &mut AgentSession, incoming: AgentSess
         if !incoming.parked_cursors.is_empty() {
             existing.parked_cursors = incoming.parked_cursors;
         }
-        if incoming.pending_handoff_seed.is_some() {
+        if provider_changed && incoming.pending_handoff_seed.is_some() {
             existing.pending_handoff_seed = incoming.pending_handoff_seed;
         }
         existing.updated_at = incoming.updated_at;
@@ -1391,6 +1409,19 @@ fn preserve_daemon_checkpoints(existing: &AgentSession, incoming: &mut AgentSess
             continue;
         };
         turn.checkpoint = Some(checkpoint.clone());
+    }
+}
+
+/// `Command::Prompt` consumes `pending_handoff_seed` on the daemon, while
+/// connected clients may still hold the pre-prompt snapshot and save it back
+/// milliseconds later. Once the daemon has cleared the seed for the current
+/// provider, never let a same-provider client save resurrect it.
+fn preserve_daemon_handoff_consumption(existing: &AgentSession, incoming: &mut AgentSession) {
+    if existing.pending_handoff_seed.is_none()
+        && existing.provider == incoming.provider
+        && incoming.pending_handoff_seed.is_some()
+    {
+        incoming.pending_handoff_seed = None;
     }
 }
 
@@ -2608,6 +2639,36 @@ mod tests {
     }
 
     #[test]
+    fn stale_client_save_cannot_resurrect_consumed_handoff_seed() {
+        let mut existing = AgentSession::new(Uuid::new_v4(), ProviderKind::Antigravity);
+        existing.pending_handoff_seed = None;
+
+        // Same provider stale snapshot carrying an already-consumed seed must keep None.
+        let mut stale = existing.clone();
+        stale.pending_handoff_seed = Some("<agent_handoff_context>old</agent_handoff_context>".into());
+        preserve_daemon_handoff_consumption(&existing, &mut stale);
+        assert!(stale.pending_handoff_seed.is_none());
+
+        // Same provider stale metadata merge also refuses to resurrect the seed.
+        let mut stale_meta = existing.clone();
+        stale_meta.pending_handoff_seed =
+            Some("<agent_handoff_context>old</agent_handoff_context>".into());
+        merge_stale_session_metadata(&mut existing, stale_meta);
+        assert!(existing.pending_handoff_seed.is_none());
+
+        // A genuine provider switch IS allowed to attach a new handoff seed.
+        let mut switched = existing.clone();
+        switched.provider = ProviderKind::Codex;
+        switched.pending_handoff_seed =
+            Some("<agent_handoff_context>fresh</agent_handoff_context>".into());
+        preserve_daemon_handoff_consumption(&existing, &mut switched);
+        assert_eq!(
+            switched.pending_handoff_seed.as_deref(),
+            Some("<agent_handoff_context>fresh</agent_handoff_context>")
+        );
+    }
+
+    #[test]
     fn response_fork_titles_follow_one_numbered_sequence() {
         assert_eq!(
             next_response_fork_title("Fix the bug", ["Fix the bug"]),
@@ -2908,7 +2969,7 @@ for raw in sys.stdin:
                                 .unwrap(),
                             binary: fake_agy_sh,
                             cwd: workspace,
-                            mode: waku_protocol::encode_enum(RuntimeMode::FullAccess).unwrap(),
+                            mode: waku_protocol::encode_enum(crate::model::RuntimeMode::FullAccess).unwrap(),
                             model: None,
                             reasoning_effort: None,
                             service_tier: None,
@@ -3030,5 +3091,172 @@ for raw in sys.stdin:
         assert!(!warm_seed.contains("Step 1 on Codex"));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn close_session_and_restart_terminate_acp_child_process() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct Cleanup {
+            dir: std::path::PathBuf,
+            pid_file: std::path::PathBuf,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for line in std::fs::read_to_string(&self.pid_file)
+                    .unwrap_or_default()
+                    .lines()
+                {
+                    for part in line.split_whitespace() {
+                        if let Ok(pid) = part.parse::<i32>() {
+                            let _ = std::process::Command::new("kill")
+                                .args(["-9", &format!("-{pid}")])
+                                .status();
+                            let _ = std::process::Command::new("kill")
+                                .args(["-9", &pid.to_string()])
+                                .status();
+                        }
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("waku-leak-regression-{}", Uuid::new_v4()));
+        let workspace = dir.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let pid_file = dir.join("pids.log");
+        let _cleanup = Cleanup {
+            dir: dir.clone(),
+            pid_file: pid_file.clone(),
+        };
+        let fake_agy_sh = dir.join("agy");
+        // Ignore SIGTERM, spawn a descendant child (like `agy --worker`), and
+        // block on stdin so only real process-group termination (ChildGuard::drop)
+        // can reap both the leader and descendant.
+        let wrapper = format!(
+            "#!/bin/sh\ntrap '' TERM\nsleep 300 &\nchild=$!\necho \"$$ $child\" >> \"{}\"\nwhile read -r _line; do :; done\nwait $child\n",
+            pid_file.display()
+        );
+        std::fs::write(&fake_agy_sh, wrapper).unwrap();
+        std::fs::set_permissions(&fake_agy_sh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let store = StateStore::daemon(dir.join("app.db"));
+        let settings = DaemonSettingsStore::open_with_legacy(
+            dir.join("settings.json"),
+            Vec::<std::path::PathBuf>::new(),
+        )
+        .unwrap();
+        let backend = WakuBackend::new(settings, store).unwrap();
+
+        let session_id = Uuid::new_v4();
+        let start_opts = || waku_protocol::WireDriverStartOptions {
+            provider: waku_protocol::encode_enum(ProviderKind::Antigravity).unwrap(),
+            binary: fake_agy_sh.clone(),
+            cwd: workspace.clone(),
+            mode: waku_protocol::encode_enum(crate::model::RuntimeMode::FullAccess).unwrap(),
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            context_window: None,
+            agent_preset: None,
+            computer_use_enabled: false,
+            provider_cursor: None,
+        };
+
+        let read_pid_pairs = || -> Vec<(i32, i32)> {
+            std::fs::read_to_string(&pid_file)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| {
+                    let mut parts = line.split_whitespace();
+                    Some((
+                        parts.next()?.parse::<i32>().ok()?,
+                        parts.next()?.parse::<i32>().ok()?,
+                    ))
+                })
+                .collect()
+        };
+        let wait_for_pid_count = |expected: usize| -> Vec<(i32, i32)> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                let pairs = read_pid_pairs();
+                if pairs.len() >= expected {
+                    return pairs;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            panic!(
+                "timed out waiting for {expected} fake ACP PID pairs, got {:?}",
+                read_pid_pairs()
+            );
+        };
+        let wait_for_exit = |pid: i32| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                let status = std::process::Command::new("/bin/kill")
+                    .args(["-0", &pid.to_string()])
+                    .status()
+                    .expect("failed to invoke /bin/kill");
+                if !status.success() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            panic!("leaked ACP process {pid} did not terminate");
+        };
+
+        // 1. Start runtime #1
+        let runtime_1 = Uuid::new_v4();
+        backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id,
+                    runtime_id: runtime_1,
+                    command: Command::Start {
+                        options: start_opts(),
+                    },
+                },
+                EventSink::test_sink(),
+            )
+            .unwrap();
+        let (leader_1, child_1) = wait_for_pid_count(1)[0];
+
+        // 2. Replacing the session with runtime #2 must drop & terminate runtime #1 + its descendant
+        let runtime_2 = Uuid::new_v4();
+        backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id,
+                    runtime_id: runtime_2,
+                    command: Command::Start {
+                        options: start_opts(),
+                    },
+                },
+                EventSink::test_sink(),
+            )
+            .unwrap();
+        let (leader_2, child_2) = wait_for_pid_count(2)[1];
+        wait_for_exit(leader_1);
+        wait_for_exit(child_1);
+
+        // 3. CloseSession must drop & terminate runtime #2 + its descendant even while stuck in startup
+        backend
+            .handle(
+                Request {
+                    request_id: Uuid::new_v4(),
+                    session_id,
+                    runtime_id: runtime_2,
+                    command: Command::CloseSession,
+                },
+                EventSink::test_sink(),
+            )
+            .unwrap();
+        wait_for_exit(leader_2);
+        wait_for_exit(child_2);
     }
 }

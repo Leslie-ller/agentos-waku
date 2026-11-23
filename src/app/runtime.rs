@@ -999,11 +999,14 @@ impl Waku {
         snapshot: RemoteTaskStateSnapshot,
         cx: &mut Context<Self>,
     ) {
-        let runtime_ids = self.runtimes.keys().copied().collect::<HashSet<_>>();
+        let mut protected_ids = self.runtimes.keys().copied().collect::<HashSet<_>>();
+        protected_ids.extend(self.submission_preparations.iter().copied());
+        protected_ids.extend(self.goal_runtime_starts.iter().copied());
+        protected_ids.extend(self.response_fork_preparations.keys().copied());
         let removed = merge_remote_session_catalog(
             &mut self.state.sessions,
             snapshot.sessions,
-            |session_id| runtime_ids.contains(&session_id),
+            |session_id| protected_ids.contains(&session_id),
         );
         for session_id in &removed {
             self.runtime_attach_pending.remove(session_id);
@@ -1020,8 +1023,11 @@ impl Waku {
             .sessions
             .iter()
             .filter(|session| {
-                session.status.is_busy()
-                    || (self.state.selected_session == Some(session.id) && session.has_started())
+                !self.submission_preparations.contains(&session.id)
+                    && !self.goal_runtime_starts.contains(&session.id)
+                    && (session.status.is_busy()
+                        || (self.state.selected_session == Some(session.id)
+                            && session.has_started()))
             })
             .map(|session| session.id)
             .collect::<Vec<_>>();
@@ -1075,6 +1081,8 @@ impl Waku {
 
     pub(super) fn start_runtime_attachment(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
         if self.runtimes.contains_key(&session_id)
+            || self.submission_preparations.contains(&session_id)
+            || self.goal_runtime_starts.contains(&session_id)
             || !self.runtime_attach_pending.insert(session_id)
         {
             return;
@@ -1113,7 +1121,10 @@ impl Waku {
                 else {
                     return;
                 };
-                if !self.runtimes.contains_key(&session_id) {
+                if !self.runtimes.contains_key(&session_id)
+                    && !self.submission_preparations.contains(&session_id)
+                    && !self.goal_runtime_starts.contains(&session_id)
+                {
                     self.state.sessions[index] = session;
                     self.install_prepared_driver(session_id, prepared);
                     if self.state.selected_session == Some(session_id) {
@@ -1124,6 +1135,12 @@ impl Waku {
                 }
             }
             Ok(None) => {
+                if self.submission_preparations.contains(&session_id)
+                    || self.goal_runtime_starts.contains(&session_id)
+                {
+                    self.runtime_attach_misses.remove(&session_id);
+                    return;
+                }
                 let busy = self
                     .state
                     .sessions
@@ -3420,6 +3437,9 @@ impl Waku {
             });
         if !can_start {
             self.submission_preparations.remove(&session_id);
+            if selected {
+                self.restore_composer_submission(submission, cx);
+            }
             cx.notify();
             return;
         }

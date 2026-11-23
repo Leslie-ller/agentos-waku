@@ -70,12 +70,7 @@ export function activityDisplayTitle(activity: ActivityItem, t?: Translator) {
   const target = activity.display_target?.trim() || null
   switch (activity.kind) {
     case 'fileChange': {
-      const changes = activity.file_changes ?? []
-      const subject = changes.length === 1
-        ? pathName(changes[0]!.path)
-        : changes.length > 1
-          ? t ? t('activity.file_count', { count: changes.length }) : `${changes.length} files`
-          : null
+      const subject = fileChangeSubject(activity, t)
       if (!subject && !isGenericActivityTitle(activity)) return activity.title
       if (!activity.complete) return t
         ? t(subject ? 'activity.editing_named_file' : 'activity.editing_files', subject ? { file: subject } : undefined)
@@ -213,14 +208,8 @@ export function activityRowDetail(activity: ActivityItem, t?: Translator) {
       return reasoningTitle(activity, t)
     case 'command':
       return activity.display_description?.trim() || activity.display_target?.trim() || customTitle
-    case 'fileChange': {
-      const changes = activity.file_changes ?? []
-      if (changes.length === 1) return pathName(changes[0]!.path)
-      if (changes.length > 1) return t
-        ? t('activity.file_count', { count: changes.length })
-        : `${changes.length} files`
-      return customTitle
-    }
+    case 'fileChange':
+      return fileChangeSubject(activity, t) ?? customTitle
     case 'fileRead':
     case 'fileList':
       return activity.display_target?.trim()
@@ -586,6 +575,19 @@ function activityNounKey(kind: ActivityItem['kind'], count: number) {
   }
   const [one, many] = keys[kind]
   return count === 1 ? one : many
+}
+
+function fileChangeSubject(activity: ActivityItem, t?: Translator): string | null {
+  const changes = activity.file_changes ?? []
+  if (changes.length === 1) return pathName(changes[0]!.path)
+  if (changes.length > 1) {
+    return t ? t('activity.file_count', { count: changes.length }) : `${changes.length} files`
+  }
+  const target = activity.display_target?.trim()
+  if (target) return pathName(target)
+  const titleMatch = activity.title.trim().match(/^File\s+(.+)$/i)
+  if (titleMatch?.[1]?.trim()) return pathName(titleMatch[1].trim())
+  return null
 }
 
 function pathName(path: string) {

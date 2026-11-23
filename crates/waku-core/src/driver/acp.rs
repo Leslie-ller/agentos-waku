@@ -62,6 +62,7 @@ enum CommandMessage {
 
 pub struct AcpDriver {
     commands: smol::channel::Sender<CommandMessage>,
+    shutdown: smol::channel::Sender<()>,
     supports_steer: bool,
     mode: RuntimeMode,
     computer_use: Option<super::support::HeadlessComputerUseRuntime>,
@@ -188,6 +189,7 @@ impl AcpDriver {
             stderr_lines.clone(),
         )?;
         let (commands, command_rx) = smol::channel::unbounded();
+        let (shutdown, shutdown_rx) = smol::channel::bounded(1);
         let provider_name = provider.display_name();
         let thread_events = events.clone();
 
@@ -201,22 +203,28 @@ impl AcpDriver {
                     let _ = thread_events.send(DriverEvent::ProcessExited);
                     return;
                 }
-                let result = smol::block_on(run_sdk_connection(
-                    agent,
-                    provider,
-                    cwd,
-                    mode,
-                    model,
-                    reasoning_effort,
-                    service_tier,
-                    context_window,
-                    resume_session_id,
-                    fork_context,
-                    mcp_companion,
-                    grok_title_home,
-                    agy_native_acp_streams_wakeups,
-                    command_rx,
-                    thread_events.clone(),
+                let result = smol::block_on(smol::future::race(
+                    run_sdk_connection(
+                        agent,
+                        provider,
+                        cwd,
+                        mode,
+                        model,
+                        reasoning_effort,
+                        service_tier,
+                        context_window,
+                        resume_session_id,
+                        fork_context,
+                        mcp_companion,
+                        grok_title_home,
+                        agy_native_acp_streams_wakeups,
+                        command_rx,
+                        thread_events.clone(),
+                    ),
+                    async move {
+                        let _ = shutdown_rx.recv().await;
+                        Ok(())
+                    },
                 ));
                 if let Err(error) = result {
                     let stderr = super::support::provider_stderr_error(stderr_lines.lock().clone());
@@ -230,6 +238,7 @@ impl AcpDriver {
 
         Ok(Self {
             commands,
+            shutdown,
             supports_steer: provider != ProviderKind::Fx,
             mode,
             computer_use,
@@ -2320,6 +2329,8 @@ impl Drop for AcpDriver {
     fn drop(&mut self) {
         self.cancel_computer_use();
         let _ = self.commands.try_send(CommandMessage::Shutdown);
+        let _ = self.shutdown.try_send(());
+        self.shutdown.close();
     }
 }
 

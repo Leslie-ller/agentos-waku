@@ -90,11 +90,49 @@ describe('composer preferences', () => {
     const preferences = readComposerPreferences(storage, 'ws://first')
     expect(preferences.lastProvider).toBe('openCode')
     expect(preferences.lastModel).toBe('opencode-go/deepseek-v4-flash')
+    expect(preferences.lastRuntimeMode).toBe('fullAccess')
     expect(rememberedModelTraits(preferences, 'openCode', 'opencode-go/deepseek-v4-flash')).toEqual({
       reasoningEffort: 'high',
       serviceTier: null,
       contextWindow: null,
     })
+  })
+
+  test('remembers runtime_mode across blank drafts and invalid stored values', () => {
+    const storage = memoryStorage()
+    const withModel = rememberComposerSession(
+      readComposerPreferences(storage, 'ws://first'),
+      {
+        provider: 'claude',
+        model: 'claude-opus-4-1',
+        reasoning_effort: null,
+        service_tier: null,
+        runtime_mode: 'ask',
+      },
+    )
+    writeComposerPreferences(storage, 'ws://first', withModel)
+    expect(readComposerPreferences(storage, 'ws://first').lastRuntimeMode).toBe('ask')
+
+    const draftModeChanged = rememberComposerSession(withModel, {
+      provider: 'codex',
+      model: null,
+      reasoning_effort: null,
+      service_tier: null,
+      runtime_mode: 'autoAcceptEdits',
+    })
+    expect(draftModeChanged.lastProvider).toBe('claude')
+    expect(draftModeChanged.lastModel).toBe('claude-opus-4-1')
+    expect(draftModeChanged.lastRuntimeMode).toBe('autoAcceptEdits')
+
+    storage.setItem('waku.composer-preferences.v1', JSON.stringify({
+      'ws://first': {
+        lastProvider: 'codex',
+        lastModel: 'gpt-5',
+        lastRuntimeMode: 'bogusMode',
+        modelTraits: {},
+      },
+    }))
+    expect(readComposerPreferences(storage, 'ws://first').lastRuntimeMode).toBe('fullAccess')
   })
 })
 

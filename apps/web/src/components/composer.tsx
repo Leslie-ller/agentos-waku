@@ -653,7 +653,7 @@ export function Composer({
 
   function savePatch(patch: Partial<AgentSession>) {
     const next = { ...session, ...patch, updated_at: Math.floor(Date.now() / 1_000) }
-    if (config && next.model) {
+    if (config) {
       const storage = browserComposerPreferenceStorage()
       const preferences = rememberComposerSession(
         readComposerPreferences(storage, config.address),
@@ -864,7 +864,7 @@ export function Composer({
               onSelect={(event) => setCursor(event.currentTarget.selectionStart)}
             />
           <div
-            className="mt-2 flex min-w-0 flex-wrap items-center gap-1 pb-px text-[11.5px] leading-[14px] sm:flex-nowrap"
+            className="mt-2 flex min-w-0 flex-wrap items-center gap-1 pb-px text-[11.5px] leading-[14px]"
             onMouseDown={preserveComposerFocusOnMouseDown}
           >
             <ModelPicker
@@ -913,8 +913,7 @@ export function Composer({
               session={session}
               onOpen={() => setGoalDialog({ prefill: null, replace: false })}
             />
-            <div className="flex-1" />
-            <div className="flex items-center gap-2">
+            <div className="ml-auto flex shrink-0 items-center gap-2">
               {busy && (
                 <Button
                   aria-label={t(escapeStopArmed ? 'composer.stop_confirm' : 'composer.stop')}
