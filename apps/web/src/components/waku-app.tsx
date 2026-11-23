@@ -535,7 +535,7 @@ export function WakuApp() {
     if (!activeSession) return
     retainPanelSession(activeSession, activeProject)
     setRequestedPanel(surface)
-    setRequestedFile(surface === 'files' ? file : null)
+    setRequestedFile(surface === 'files' || surface === 'externalFile' ? file : null)
     if (surface === 'changes') setRequestedDiffSource(source)
     setPanelRequestSessionId(activeSession.id)
     setPanelRequestSignal((value) => value + 1)
@@ -555,6 +555,10 @@ export function WakuApp() {
       return false
     }
     if (route.kind === 'external') return false
+    if (route.kind === 'externalFile') {
+      openPanel('externalFile', 'uncommitted', route.path)
+      return true
+    }
     if (route.kind === 'remoteFile') {
       toast.error(t('errors.path_outside_workspace'))
       return true
@@ -1208,6 +1212,7 @@ export function WakuApp() {
             session={panelSession}
             sidebarWidth={sidebarVisible ? sidebarWidth : 0}
             onOpenChange={(open) => setRightPanelForSession(sessionId, open)}
+            onOpenLink={openTranscriptLink}
             onPanelWidthChange={setRightPanelWidth}
           />
         )

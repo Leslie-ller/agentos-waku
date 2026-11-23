@@ -15,6 +15,8 @@ import {
   type ReactNode,
   type SetStateAction,
 } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import { toast } from 'sonner'
 import { ControlMenu } from '@/components/control-menu'
@@ -26,6 +28,7 @@ import {
   collectWorkspaceDiff,
   daemonKeys,
   listWorkspaceTree,
+  readExternalTextFile,
   readWorkspaceTextFile,
   sessionCwd,
   writeWorkspaceTextFile,
@@ -59,11 +62,14 @@ import { cn } from '@/lib/utils'
 const CodeFileSurface = lazy(() => import('@/components/code-surfaces').then((module) => ({
   default: module.CodeFileSurface,
 })))
+const ReadOnlyCodeFileSurface = lazy(() => import('@/components/code-surfaces').then((module) => ({
+  default: module.ReadOnlyCodeFileSurface,
+})))
 const CodeDiffSurface = lazy(() => import('@/components/code-surfaces').then((module) => ({
   default: module.CodeDiffSurface,
 })))
 
-export type PanelSurface = 'files' | 'file' | 'changes' | 'terminal' | 'backgroundWork'
+export type PanelSurface = 'files' | 'file' | 'externalFile' | 'changes' | 'terminal' | 'backgroundWork'
 
 interface PanelTab {
   id: string
@@ -93,6 +99,7 @@ export function RightPanel({
   requestSignal,
   sidebarWidth,
   onOpenChange,
+  onOpenLink,
   onPanelWidthChange,
 }: {
   active: boolean
@@ -107,6 +114,7 @@ export function RightPanel({
   requestSignal: number
   sidebarWidth: number
   onOpenChange: (open: boolean) => void
+  onOpenLink?: (target: string) => boolean
   onPanelWidthChange: Dispatch<SetStateAction<number>>
 }) {
   const { t } = useI18n()
@@ -135,6 +143,9 @@ export function RightPanel({
   ) => {
     if (surface === 'changes') setDiffSource(source)
     if (surface === 'changes') onPanelWidthChange((current) => Math.max(current, 820))
+    if (surface === 'externalFile' && file) {
+      onPanelWidthChange((current) => Math.max(current, 540))
+    }
     if (surface === 'files' && file) {
       onPanelWidthChange((current) => Math.max(current, 684))
       setPanelState((current) => openFileInPanel(
@@ -153,7 +164,7 @@ export function RightPanel({
       const reusable = surface === 'terminal'
         ? undefined
         : current.tabs.find((tab) => tab.surface === surface && (
-            surface === 'file'
+            surface === 'file' || surface === 'externalFile'
               ? tab.selectedFile === file
               : surface !== 'backgroundWork'
                 || (backgroundWorkKey && tab.backgroundWorkKey
@@ -163,7 +174,7 @@ export function RightPanel({
         return {
           ...current,
           activeId: reusable.id,
-          tabs: (surface === 'files' || surface === 'file') && file
+          tabs: (surface === 'files' || surface === 'file' || surface === 'externalFile') && file
             ? current.tabs.map((tab) => tab.id === reusable.id
               ? { ...tab, selectedFile: file }
               : tab)
@@ -171,13 +182,14 @@ export function RightPanel({
         }
       }
       if (surface === 'backgroundWork' && !backgroundWorkKey) return current
+      if (surface === 'externalFile' && !file) return current
       const id = crypto.randomUUID()
       const tab: PanelTab = surface === 'terminal'
         ? { id, surface, terminalId: crypto.randomUUID() }
         : {
             id,
             surface,
-            selectedFile: surface === 'files' || surface === 'file' ? file ?? null : undefined,
+            selectedFile: surface === 'files' || surface === 'file' || surface === 'externalFile' ? file ?? null : undefined,
             backgroundWorkKey: surface === 'backgroundWork'
               ? backgroundWorkKey ?? undefined
               : undefined,
@@ -414,6 +426,13 @@ export function RightPanel({
               onOpenFile={openFile}
             />
           )}
+          {tab.surface === 'externalFile' && tab.selectedFile && (
+            <ExternalFilePanel
+              active={active && tab.id === activeTab?.id}
+              path={tab.selectedFile}
+              onOpenLink={onOpenLink}
+            />
+          )}
           {tab.surface === 'changes' && (
             <ChangesPanel
               diffSource={diffSource}
@@ -460,14 +479,14 @@ function PanelTabButton({
 }) {
   const { t } = useI18n()
   const saveShortcut = usePrimaryShortcut('⌘S', 'Ctrl+S')
-  const title = tab.surface === 'files' || tab.surface === 'file'
+  const title = tab.surface === 'files' || tab.surface === 'file' || tab.surface === 'externalFile'
     ? tab.selectedFile?.split('/').at(-1) ?? t('right_panel.files')
     : tab.surface === 'changes'
       ? t('right_panel.diff')
       : tab.surface === 'backgroundWork'
         ? tab.title?.trim() || backgroundWorkKindLabel(tab.backgroundWorkKey?.kind, t)
         : tab.title?.trim() || t('right_panel.terminal')
-  const icon = tab.surface === 'files' || tab.surface === 'file'
+  const icon = tab.surface === 'files' || tab.surface === 'file' || tab.surface === 'externalFile'
     ? 'folder'
     : tab.surface === 'changes'
       ? 'fileDiff'
@@ -497,7 +516,7 @@ function PanelTabButton({
         }
       }}
     >
-      {(tab.surface === 'files' || tab.surface === 'file') && tab.selectedFile
+      {(tab.surface === 'files' || tab.surface === 'file' || tab.surface === 'externalFile') && tab.selectedFile
         ? <FileTypeIcon className="size-[13px]" path={tab.selectedFile} />
         : <WakuIcon className="size-[13px] text-[var(--text-secondary)]" name={icon} />}
       <span className="min-w-0 flex-1 truncate">{title}</span>
@@ -898,6 +917,117 @@ function FilesPanel({
               )}
       </div>
       {fileTree}
+    </div>
+  )
+}
+
+function isMarkdownPath(path: string) {
+  return /\.(?:md|markdown|mdx)$/i.test(path)
+}
+
+function resolveRelativeLink(href: string, currentFilePath: string): string {
+  const trimmed = href.trim()
+  if (
+    !trimmed
+    || trimmed.startsWith('#')
+    || trimmed.startsWith('/')
+    || /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed)
+  ) {
+    return trimmed
+  }
+  const slash = currentFilePath.lastIndexOf('/')
+  const dir = slash >= 0 ? currentFilePath.slice(0, slash + 1) : '/'
+  return `${dir}${trimmed}`
+}
+
+function ExternalFilePanel({
+  active,
+  path,
+  onOpenLink,
+}: {
+  active: boolean
+  path: string
+  onOpenLink?: (target: string) => boolean
+}) {
+  const { t } = useI18n()
+  const { client, config, phase } = useDaemon()
+  const isMarkdown = isMarkdownPath(path)
+  const [previewMarkdown, setPreviewMarkdown] = useState(true)
+
+  const file = useQuery({
+    queryKey: daemonKeys.externalFile(config?.address ?? 'disconnected', path),
+    queryFn: () => readExternalTextFile(requireClient(client), path),
+    enabled: phase === 'connected' && Boolean(client && config && path),
+  })
+
+  useEffect(() => {
+    if (active && phase === 'connected' && client && config) {
+      void file.refetch()
+    }
+  }, [active, client, config, file.refetch, path, phase])
+
+  return (
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <div className="flex h-[42px] shrink-0 items-center gap-2 border-b px-4 text-[11px] text-[var(--text-secondary)]">
+        <FileTypeIcon className="size-[13px]" path={path} />
+        <span className="min-w-0 flex-1 truncate" title={path}>{path}</span>
+        <span className="shrink-0 rounded bg-accent px-1.5 py-0.5 text-[10px] text-[var(--text-tertiary)]">
+          {t('files.read_only')}
+        </span>
+        {isMarkdown && (
+          <Button
+            aria-label={previewMarkdown ? t('files.view_markdown_source') : t('files.preview_markdown')}
+            size="icon-sm"
+            title={previewMarkdown ? t('files.view_markdown_source') : t('files.preview_markdown')}
+            variant="ghost"
+            onClick={() => setPreviewMarkdown((value) => !value)}
+          >
+            <WakuIcon className="size-3.5" name={previewMarkdown ? 'file' : 'eye'} />
+          </Button>
+        )}
+      </div>
+      {file.isPending
+        ? <PanelMessage title={t('files.loading_file')} detail={t('files.reading_from_daemon')} />
+        : file.error
+          ? <PanelMessage title={t('files.file_unavailable')} detail={errorMessage(file.error)} danger />
+          : isMarkdown && previewMarkdown
+            ? (
+                <div className="min-h-0 flex-1 overflow-auto bg-card px-5 py-4">
+                  <div className="markdown min-w-0 text-[13px] leading-6 text-foreground">
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      components={{
+                        a: ({ children, href, ...props }) => (
+                          <a
+                            {...props}
+                            href={href}
+                            rel="noreferrer noopener"
+                            target="_blank"
+                            onClick={(event) => {
+                              if (!href || !onOpenLink) return
+                              const resolved = resolveRelativeLink(href, path)
+                              if (onOpenLink(resolved)) event.preventDefault()
+                            }}
+                          >
+                            {children}
+                          </a>
+                        ),
+                      }}
+                    >
+                      {file.data ?? ''}
+                    </ReactMarkdown>
+                  </div>
+                </div>
+              )
+            : (
+                <Suspense fallback={<PanelMessage title={t('files.loading_editor')} detail={t('files.preparing_syntax')} />}>
+                  <ReadOnlyCodeFileSurface
+                    cacheKey={`external:${path}:${file.dataUpdatedAt}`}
+                    contents={file.data ?? ''}
+                    path={path}
+                  />
+                </Suspense>
+              )}
     </div>
   )
 }

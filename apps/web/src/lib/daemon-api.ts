@@ -74,6 +74,8 @@ export const daemonKeys = {
     ['daemon', address, 'directory', path] as const,
   workspaceFile: (address: string, cwd: string, path: string) =>
     ['daemon', address, 'workspace-file', cwd, path] as const,
+  externalFile: (address: string, path: string) =>
+    ['daemon', address, 'external-file', path] as const,
   workspaceDiff: (address: string, cwd: string, source: ReviewDiffSource = 'uncommitted') =>
     ['daemon', address, 'workspace-diff', cwd, JSON.stringify(source)] as const,
 }
@@ -372,6 +374,18 @@ export async function readWorkspaceTextFile(
     type: 'readTextFile',
     root,
     relative_path: relativePath,
+  })
+  if (result.type !== 'textFile') throw new Error('The daemon returned an unexpected file response')
+  return result.content
+}
+
+export async function readExternalTextFile(
+  client: WakuClient,
+  path: string,
+): Promise<string> {
+  const result = await workspaceRequest(client, {
+    type: 'readExternalTextFile',
+    path,
   })
   if (result.type !== 'textFile') throw new Error('The daemon returned an unexpected file response')
   return result.content

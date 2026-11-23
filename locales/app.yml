@@ -1650,6 +1650,10 @@ files.no_project_is_open:
   en: No project is open
 files.unable_to_edit:
   en: "Unable to edit this file: %{error}"
+files.unable_to_preview:
+  en: "Unable to preview this file: %{error}"
+files.read_only:
+  en: Read-only
 files.could_not_save_opening:
   en: "Could not save %{path}: still opening"
 files.could_not_save_read_only:
@@ -1660,6 +1664,8 @@ files.preview_markdown:
   en: Preview markdown
 files.edit_markdown_source:
   en: Edit source
+files.view_markdown_source:
+  en: View source
 files.resize_tree:
   en: Resize file tree
 files.refresh:

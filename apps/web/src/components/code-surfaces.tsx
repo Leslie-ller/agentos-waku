@@ -193,6 +193,43 @@ export function CodeFileSurface({
   )
 }
 
+export function ReadOnlyCodeFileSurface({
+  path,
+  contents,
+  cacheKey,
+}: {
+  path: string
+  contents: string
+  cacheKey?: string
+}) {
+  const { t } = useI18n()
+  const themeType = useResolvedTheme()
+  const [renderReady, setRenderReady] = useState(false)
+  const file = {
+    name: path,
+    contents,
+    cacheKey: cacheKey ?? `readonly:${path}:${fastHash(contents)}`,
+  }
+  const options = {
+    ...sharedOptions,
+    disableFileHeader: true,
+    onPostRender: () => setRenderReady(true),
+    themeType,
+    unsafeCSS: fullHeightEditorCSS,
+  }
+  return (
+    <div className="relative h-full min-h-0 min-w-0 flex-1 overflow-auto bg-card">
+      <DiffsFile
+        className="waku-code-surface h-full min-h-full min-w-full bg-card"
+        disableWorkerPool
+        file={file}
+        options={options}
+      />
+      {!renderReady && <CodeSurfaceLoading label={t('files.preparing_syntax')} />}
+    </div>
+  )
+}
+
 interface CodeDiffSurfaceProps {
   patch: string
   completeContext: boolean

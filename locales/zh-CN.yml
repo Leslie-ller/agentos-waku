@@ -805,11 +805,14 @@ files.no_project_open: 尚未打开项目
 files.no_project_open_description: 打开一个项目即可浏览其中的文件
 files.no_project_is_open: 尚未打开项目
 files.unable_to_edit: "无法编辑此文件：%{error}"
+files.unable_to_preview: "无法预览此文件：%{error}"
+files.read_only: 只读
 files.could_not_save_opening: "无法保存 %{path}：文件仍在打开"
 files.could_not_save_read_only: "无法保存 %{path}：文件不可编辑"
 files.could_not_save: "无法保存 %{path}：%{error}"
 files.preview_markdown: 预览 Markdown
 files.edit_markdown_source: 编辑源码
+files.view_markdown_source: 查看源码
 files.resize_tree: 调整文件树宽度
 files.refresh: 刷新文件
 files.loading: 正在加载文件…

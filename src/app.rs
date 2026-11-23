@@ -518,6 +518,41 @@ fn fitted_panel_widths(
     (sidebar, right_panel)
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) enum RightPanelFileTarget {
+    Project(String),
+    External(PathBuf),
+}
+
+impl RightPanelFileTarget {
+    pub(super) fn is_external(&self) -> bool {
+        matches!(self, Self::External(_))
+    }
+
+    pub(super) fn display_path(&self) -> String {
+        match self {
+            Self::Project(path) => path.clone(),
+            Self::External(path) => path.to_string_lossy().into_owned(),
+        }
+    }
+
+    pub(super) fn element_id_key(&self) -> String {
+        match self {
+            Self::Project(path) => format!("project:{path}"),
+            Self::External(path) => format!("external:{}", path.to_string_lossy()),
+        }
+    }
+
+    pub(super) fn parent_dir(&self, workspace: Option<&Path>) -> Option<PathBuf> {
+        match self {
+            Self::Project(relative) => workspace
+                .map(|root| root.join(relative))
+                .and_then(|full| full.parent().map(Path::to_path_buf)),
+            Self::External(path) => path.parent().map(Path::to_path_buf),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RightPanelSurface {
     Browser(Uuid),
@@ -529,6 +564,7 @@ enum RightPanelSurface {
     Files,
     Diff,
     File(String),
+    ExternalFile(PathBuf),
 }
 
 /// A turn whose checkpoint still has to be captured.
@@ -714,6 +750,15 @@ struct RightPanelFileEditor {
     disk_content: String,
     writable: bool,
     dirty: bool,
+    /// Error from loading a read-only external file (e.g. directory, binary,
+    /// oversized, or missing). Kept separate from `disk_content` so the preview
+    /// can show an unavailable state with a Reveal-in-Finder action instead of
+    /// rendering an error string inside the code editor.
+    read_error: Option<String>,
+    /// Per-file markdown preview toggle used by read-only external files so
+    /// external `.md` artifacts open in rendered preview by default without
+    /// altering the user's persisted project-file preference.
+    external_markdown_preview: bool,
     /// A read is in flight on the background executor. Set from the moment the
     /// editor is created, because `render` may not touch the filesystem: until
     /// the first read lands the editor is empty and locked, and that means
@@ -734,7 +779,7 @@ struct RightPanelSessionState {
     expanded_paths: HashSet<PathBuf>,
     files_selected_path: Option<String>,
     file_tree_width: f32,
-    file_editors: HashMap<String, RightPanelFileEditor>,
+    file_editors: HashMap<RightPanelFileTarget, RightPanelFileEditor>,
     diff_source: ReviewDiffSource,
     diff_snapshot: Option<Arc<ReviewDiffSnapshot>>,
     diff_selected_file: Option<usize>,
@@ -1386,9 +1431,9 @@ pub struct Waku {
     right_panel_diff_tree_scrollbar: Rc<ScrollbarState>,
     right_panel_editor_scroll_handle: ScrollHandle,
     right_panel_editor_scrollbar: Rc<ScrollbarState>,
-    /// Rendered-markdown preview of the visible file editor, cached per path
+    /// Rendered-markdown preview of the visible file editor, cached per target
     /// the way `skills_detail_markdown` caches the skill document.
-    file_preview_markdown: RefCell<Option<(String, MarkdownView)>>,
+    file_preview_markdown: RefCell<Option<(RightPanelFileTarget, MarkdownView)>>,
     file_preview_selection: TranscriptSelection,
     file_preview_scroll_handle: ScrollHandle,
     file_preview_scrollbar: Rc<ScrollbarState>,
@@ -1397,7 +1442,7 @@ pub struct Waku {
     right_panel_expanded_paths: HashSet<PathBuf>,
     right_panel_files_selected_path: Option<String>,
     right_panel_file_tree_width: f32,
-    right_panel_file_editors: HashMap<String, RightPanelFileEditor>,
+    right_panel_file_editors: HashMap<RightPanelFileTarget, RightPanelFileEditor>,
     /// Find-and-replace over the visible file editor. Created on first use of
     /// the primary find shortcut and kept for the window's lifetime so the
     /// query and toggles survive closing the bar; `open` says whether it shows.

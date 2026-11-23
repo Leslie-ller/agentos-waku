@@ -26,11 +26,23 @@ describe('transcriptLinkRoute', () => {
     )).toEqual({ kind: 'session', sessionId: '1861' })
   })
 
-  test('does not reinterpret another daemon path or an external URL', () => {
+  test('routes outside-workspace text files to read-only external preview and rejects binary/dir links', () => {
     expect(transcriptLinkRoute(
       '/Users/egoist/dev/waku/../kero/src/app.rs:20',
       workspace,
-    )).toEqual({ kind: 'remoteFile', path: '/Users/egoist/dev/kero/src/app.rs' })
+    )).toEqual({ kind: 'externalFile', path: '/Users/egoist/dev/kero/src/app.rs' })
+    expect(transcriptLinkRoute(
+      'file:///Volumes/data/brain/nlp_cw1_plan.md#L10-L20',
+      workspace,
+    )).toEqual({ kind: 'externalFile', path: '/Volumes/data/brain/nlp_cw1_plan.md' })
+    expect(transcriptLinkRoute(
+      'file:///Volumes/data/brain/archive.zip',
+      workspace,
+    )).toEqual({ kind: 'remoteFile', path: '/Volumes/data/brain/archive.zip' })
+    expect(transcriptLinkRoute(
+      'file:///Volumes/data/brain/',
+      workspace,
+    )).toEqual({ kind: 'remoteFile', path: '/Volumes/data/brain' })
     expect(transcriptLinkRoute('https://example.com/file.rs:12', workspace))
       .toEqual({ kind: 'external' })
     expect(transcriptLinkRoute('src/app.rs', workspace)).toEqual({ kind: 'external' })

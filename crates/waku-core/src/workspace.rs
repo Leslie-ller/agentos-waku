@@ -4,13 +4,15 @@
 //! may display them, but must never reinterpret them against its own machine.
 
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::Output;
 
 use anyhow::{Context as _, anyhow, bail};
 
 const MAX_HYDRATED_PATCH_BYTES: usize = 32 * 1024 * 1024;
+const MAX_EXTERNAL_TEXT_FILE_BYTES: usize = 8 * 1024 * 1024;
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 pub use waku_protocol::workspace::{
@@ -55,6 +57,14 @@ pub fn execute(operation: WorkspaceOperation) -> anyhow::Result<WorkspaceResult>
         } => WorkspaceResult::TextFile {
             content: fs::read_to_string(resolve_workspace_path(&root, &relative_path)?)?,
         },
+        WorkspaceOperation::ReadExternalTextFile { path } => {
+            if !path.is_absolute() {
+                bail!("external file path must be absolute");
+            }
+            WorkspaceResult::TextFile {
+                content: read_bounded_text_file(&path, MAX_EXTERNAL_TEXT_FILE_BYTES)?,
+            }
+        }
         WorkspaceOperation::WriteTextFile {
             root,
             relative_path,
@@ -227,6 +237,42 @@ fn resolve_workspace_path(root: &Path, relative: &Path) -> anyhow::Result<PathBu
         bail!("workspace path must be a non-empty relative path");
     }
     Ok(root.join(relative))
+}
+
+fn read_bounded_text_file(path: &Path, max_bytes: usize) -> anyhow::Result<String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("could not open {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("could not inspect {}", path.display()))?;
+    if metadata.is_dir() {
+        bail!("path is a directory");
+    }
+    if !metadata.is_file() {
+        bail!("path is not a regular file");
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    if bytes.len() > max_bytes {
+        bail!(
+            "file is too large to preview (limit: {} MiB)",
+            (max_bytes / (1024 * 1024)).max(1)
+        );
+    }
+    if bytes.contains(&0) {
+        bail!("binary files cannot be previewed");
+    }
+    String::from_utf8(bytes).map_err(|_| anyhow!("file is not valid UTF-8 text"))
 }
 
 fn list_tree(root: &Path, expanded_paths: &HashSet<PathBuf>) -> Vec<WorkingTreeEntry> {
@@ -627,6 +673,56 @@ mod tests {
                 relative_path: PathBuf::from("missing.txt"),
             })
             .is_err()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn external_text_file_reader_validates_and_bounds_reads() {
+        let root = std::env::temp_dir().join(format!("waku-external-file-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+
+        let markdown = root.join("plan.md");
+        fs::write(&markdown, "# Plan\n\nReady.\n").unwrap();
+        let WorkspaceResult::TextFile { content } =
+            execute(WorkspaceOperation::ReadExternalTextFile {
+                path: markdown.clone(),
+            })
+            .unwrap()
+        else {
+            panic!("unexpected workspace response")
+        };
+        assert_eq!(content, "# Plan\n\nReady.\n");
+
+        assert!(
+            execute(WorkspaceOperation::ReadExternalTextFile {
+                path: PathBuf::from("relative/plan.md"),
+            })
+            .is_err()
+        );
+        assert!(
+            execute(WorkspaceOperation::ReadExternalTextFile { path: root.clone() }).is_err()
+        );
+
+        let binary = root.join("binary.dat");
+        fs::write(&binary, b"abc\0def").unwrap();
+        assert!(
+            execute(WorkspaceOperation::ReadExternalTextFile { path: binary }).is_err()
+        );
+
+        let invalid_utf8 = root.join("bad.txt");
+        fs::write(&invalid_utf8, [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(
+            execute(WorkspaceOperation::ReadExternalTextFile { path: invalid_utf8 }).is_err()
+        );
+
+        let oversized = root.join("oversized.txt");
+        fs::write(&oversized, "0123456789abcdefX").unwrap();
+        assert!(read_bounded_text_file(&oversized, 16).is_err());
+        assert_eq!(
+            read_bounded_text_file(&oversized, 17).unwrap(),
+            "0123456789abcdefX"
         );
 
         fs::remove_dir_all(root).unwrap();

@@ -20,6 +20,7 @@ pub(super) struct WorkingTreeEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TranscriptLinkRoute {
     ProjectFile(String),
+    ExternalFile(PathBuf),
     SystemDefault(PathBuf),
     Finder(PathBuf),
     External,
@@ -31,13 +32,20 @@ fn positive_number(value: &str) -> bool {
         && value.parse::<usize>().is_ok_and(|value| value > 0)
 }
 
-fn line_fragment(fragment: &str) -> bool {
-    let Some(location) = fragment.strip_prefix('L') else {
+fn line_point(point: &str) -> bool {
+    let Some(location) = point.strip_prefix('L') else {
         return false;
     };
     match location.split_once('C') {
         Some((line, column)) => positive_number(line) && positive_number(column),
         None => positive_number(location),
+    }
+}
+
+fn line_fragment(fragment: &str) -> bool {
+    match fragment.split_once('-') {
+        Some((start, end)) => line_point(start) && line_point(end),
+        None => line_point(fragment),
     }
 }
 
@@ -148,6 +156,112 @@ fn should_open_link_with_system_default(path: &Path) -> bool {
         || ext.eq_ignore_ascii_case("pdf")
 }
 
+fn should_reveal_external_link_in_finder(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "avif"
+            | "ico"
+            | "tiff"
+            | "bmp"
+            | "heic"
+            | "mp3"
+            | "wav"
+            | "flac"
+            | "ogg"
+            | "m4a"
+            | "mp4"
+            | "mov"
+            | "avi"
+            | "webm"
+            | "mkv"
+            | "zip"
+            | "gz"
+            | "tgz"
+            | "bz2"
+            | "xz"
+            | "7z"
+            | "rar"
+            | "tar"
+            | "jar"
+            | "dmg"
+            | "pkg"
+            | "app"
+            | "db"
+            | "sqlite"
+            | "sqlite3"
+            | "exe"
+            | "dll"
+            | "so"
+            | "dylib"
+            | "wasm"
+            | "class"
+            | "pyc"
+            | "o"
+            | "a"
+            | "doc"
+            | "docx"
+            | "xls"
+            | "xlsx"
+            | "ppt"
+            | "pptx"
+            | "pages"
+            | "numbers"
+            | "key"
+    )
+}
+
+fn target_has_trailing_directory_separator(target: &str) -> bool {
+    let stripped = strip_file_location(target.trim());
+    let path_part = stripped.split(['?', '#']).next().unwrap_or(stripped);
+    path_part.ends_with('/') || path_part.ends_with('\\')
+}
+
+fn has_url_scheme(target: &str) -> bool {
+    let Some((scheme, _)) = target.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
+fn resolve_relative_markdown_link(target: &str, base_dir: &Path) -> Option<String> {
+    let trimmed = target.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('#')
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('\\')
+        || has_url_scheme(trimmed)
+    {
+        return None;
+    }
+    let path_without_location = strip_file_location(trimmed);
+    let suffix = &trimmed[path_without_location.len()..];
+    let decoded = percent_decode_file_path(path_without_location);
+    let candidate = PathBuf::from(&decoded);
+    if candidate.is_absolute() {
+        return None;
+    }
+    let resolved = normalized_path(&base_dir.join(candidate));
+    let mut result = resolved.to_string_lossy().into_owned();
+    if path_without_location.ends_with('/') && !result.ends_with('/') {
+        result.push('/');
+    }
+    result.push_str(suffix);
+    Some(result)
+}
+
 fn transcript_link_route(target: &str, workspace: Option<&Path>) -> TranscriptLinkRoute {
     let Some(path) = markdown_file_link_path(target) else {
         return TranscriptLinkRoute::External;
@@ -160,8 +274,12 @@ fn transcript_link_route(target: &str, workspace: Option<&Path>) -> TranscriptLi
         workspace.and_then(|workspace| workspace_relative_file_path(workspace, &path))
     {
         TranscriptLinkRoute::ProjectFile(relative_path)
-    } else {
+    } else if target_has_trailing_directory_separator(target)
+        || should_reveal_external_link_in_finder(&path)
+    {
         TranscriptLinkRoute::Finder(path)
+    } else {
+        TranscriptLinkRoute::ExternalFile(path)
     }
 }
 
@@ -872,6 +990,22 @@ fn read_right_panel_file(
     }
 }
 
+fn read_external_right_panel_file(
+    workspace: &waku_client::WorkspaceClient,
+    path: &Path,
+) -> Result<String, String> {
+    match workspace.request(waku_client::WorkspaceOperation::ReadExternalTextFile {
+        path: path.to_path_buf(),
+    }) {
+        Ok(waku_client::WorkspaceResult::TextFile { content }) => Ok(content),
+        Ok(_) => Err(tr!(
+            "files.unable_to_preview",
+            error = "the daemon returned an invalid file response"
+        )),
+        Err(error) => Err(tr!("files.unable_to_preview", error = error.to_string())),
+    }
+}
+
 impl RightPanelSurface {
     fn new_browser() -> Self {
         Self::Browser(Uuid::new_v4())
@@ -913,6 +1047,12 @@ impl RightPanelSurface {
             Self::Files => tr!("right_panel.files"),
             Self::Diff => tr!("right_panel.diff"),
             Self::File(path) => path.rsplit('/').next().unwrap_or(path).to_owned(),
+            Self::ExternalFile(path) => path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| path.to_string_lossy().into_owned()),
         }
     }
 
@@ -924,6 +1064,7 @@ impl RightPanelSurface {
             Self::Files => "icons/folder.svg",
             Self::Diff => "icons/file-diff.svg",
             Self::File(path) => file_icon_for_path(path),
+            Self::ExternalFile(path) => file_icon_for_path(&path.to_string_lossy()),
         }
     }
 }
@@ -962,7 +1103,10 @@ fn reusable_surface_index(
         RightPanelSurface::BackgroundWork { key, .. } => surfaces.iter().position(|surface| {
             matches!(surface, RightPanelSurface::BackgroundWork { key: candidate, .. } if candidate == key)
         }),
-        RightPanelSurface::Files | RightPanelSurface::Diff | RightPanelSurface::File(_) => {
+        RightPanelSurface::Files
+        | RightPanelSurface::Diff
+        | RightPanelSurface::File(_)
+        | RightPanelSurface::ExternalFile(_) => {
             surfaces.iter().position(|surface| surface == requested)
         }
     }
@@ -1138,7 +1282,43 @@ mod tests {
         let outside_file_with_line = format!("{}:20", outside_file.display());
         assert_eq!(
             transcript_link_route(&outside_file_with_line, Some(workspace)),
-            TranscriptLinkRoute::Finder(normalized_path(&outside_file))
+            TranscriptLinkRoute::ExternalFile(normalized_path(&outside_file))
+        );
+        let outside_markdown = workspace.join("../brain/nlp_cw1_plan.md");
+        let outside_markdown_url =
+            url::Url::from_file_path(&outside_markdown).expect("absolute markdown file path");
+        assert_eq!(
+            transcript_link_route(&format!("{outside_markdown_url}#L10-L20"), Some(workspace)),
+            TranscriptLinkRoute::ExternalFile(normalized_path(&outside_markdown))
+        );
+        assert_eq!(
+            transcript_link_route(
+                &format!("{}#L10C2-L20C5", outside_markdown.display()),
+                None
+            ),
+            TranscriptLinkRoute::ExternalFile(normalized_path(&outside_markdown))
+        );
+        let outside_binary = workspace.join("../artifacts/archive.zip");
+        assert_eq!(
+            transcript_link_route(&outside_binary.to_string_lossy(), Some(workspace)),
+            TranscriptLinkRoute::Finder(normalized_path(&outside_binary))
+        );
+        let outside_dir = workspace.join("../artifacts");
+        assert_eq!(
+            transcript_link_route(&format!("{}/", outside_dir.display()), Some(workspace)),
+            TranscriptLinkRoute::Finder(normalized_path(&outside_dir))
+        );
+        assert_eq!(
+            resolve_relative_markdown_link("./phase0.md#L10-L20", Path::new("/tmp/brain")),
+            Some("/tmp/brain/phase0.md#L10-L20".into())
+        );
+        assert_eq!(
+            resolve_relative_markdown_link("https://example.com/doc.md", Path::new("/tmp/brain")),
+            None
+        );
+        assert_eq!(
+            resolve_relative_markdown_link("#section-1", Path::new("/tmp/brain")),
+            None
         );
         assert_eq!(
             transcript_link_route("https://example.com/file.rs:12", Some(workspace)),
@@ -1783,6 +1963,11 @@ impl Waku {
                 self.open_right_panel_surface(RightPanelSurface::Files, cx);
                 self.open_right_panel_file(relative_path, cx);
             }
+            TranscriptLinkRoute::ExternalFile(path) => {
+                let target = RightPanelFileTarget::External(path.clone());
+                self.open_right_panel_surface(RightPanelSurface::ExternalFile(path), cx);
+                self.reload_right_panel_file_if_clean(&target, cx);
+            }
             TranscriptLinkRoute::SystemDefault(path) => {
                 if self.daemon.is_remote() {
                     self.show_toast(tr!("errors.remote_host_path"));
@@ -1958,21 +2143,27 @@ impl Waku {
             .and_then(RightPanelSurface::browser_id);
     }
 
-    /// The file the active editor surface is showing, whether via a File tab
-    /// or the Files browser's selection — regardless of whether the panel is
-    /// currently visible, which is a per-caller decision: save works on a
-    /// hidden panel, find does not.
-    pub(super) fn visible_right_panel_file_path(&self) -> Option<String> {
+    /// The file the active editor surface is showing, whether via a File tab,
+    /// an ExternalFile preview tab, or the Files browser's selection —
+    /// regardless of whether the panel is currently visible, which is a
+    /// per-caller decision: save works on a hidden panel, find does not.
+    pub(super) fn visible_right_panel_file_target(&self) -> Option<RightPanelFileTarget> {
         match self.active_right_panel_surface() {
-            Some(RightPanelSurface::Files) => self.right_panel_files_selected_path.clone(),
-            Some(RightPanelSurface::File(path)) => Some(path.clone()),
+            Some(RightPanelSurface::Files) => self
+                .right_panel_files_selected_path
+                .clone()
+                .map(RightPanelFileTarget::Project),
+            Some(RightPanelSurface::File(path)) => Some(RightPanelFileTarget::Project(path.clone())),
+            Some(RightPanelSurface::ExternalFile(path)) => {
+                Some(RightPanelFileTarget::External(path.clone()))
+            }
             _ => None,
         }
     }
 
-    fn right_panel_file_is_dirty(&self, relative_path: &str) -> bool {
+    fn right_panel_file_is_dirty(&self, target: &RightPanelFileTarget) -> bool {
         self.right_panel_file_editors
-            .get(relative_path)
+            .get(target)
             .is_some_and(|editor| editor.dirty)
     }
 
@@ -1980,9 +2171,13 @@ impl Waku {
         match surface {
             RightPanelSurface::Files => self
                 .right_panel_files_selected_path
-                .as_deref()
-                .is_some_and(|path| self.right_panel_file_is_dirty(path)),
-            RightPanelSurface::File(path) => self.right_panel_file_is_dirty(path),
+                .as_ref()
+                .is_some_and(|path| {
+                    self.right_panel_file_is_dirty(&RightPanelFileTarget::Project(path.clone()))
+                }),
+            RightPanelSurface::File(path) => {
+                self.right_panel_file_is_dirty(&RightPanelFileTarget::Project(path.clone()))
+            }
             _ => false,
         }
     }
@@ -2004,6 +2199,9 @@ impl Waku {
         let reusable_index = reusable_surface_index(&self.right_panel_surfaces, &surface);
         if matches!(&surface, RightPanelSurface::File(_)) {
             self.ensure_initial_right_panel_file_editor_width();
+        }
+        if matches!(&surface, RightPanelSurface::ExternalFile(_)) && reusable_index.is_none() {
+            self.right_panel_width = self.right_panel_width.max(540.0);
         }
         if surface == RightPanelSurface::Diff {
             if reusable_index.is_none() {
@@ -2071,7 +2269,9 @@ impl Waku {
                     .as_deref()
                     .is_some_and(|current_path| {
                         current_path != relative_path
-                            && self.right_panel_file_is_dirty(current_path)
+                            && self.right_panel_file_is_dirty(&RightPanelFileTarget::Project(
+                                current_path.to_owned(),
+                            ))
                     });
                 if dirty_file_would_be_replaced {
                     self.open_right_panel_surface(RightPanelSurface::File(relative_path), cx);
@@ -2086,7 +2286,7 @@ impl Waku {
                 if current_path == relative_path {
                     return;
                 }
-                if self.right_panel_file_is_dirty(&current_path) {
+                if self.right_panel_file_is_dirty(&RightPanelFileTarget::Project(current_path)) {
                     self.open_right_panel_surface(RightPanelSurface::File(relative_path), cx);
                     return;
                 }
@@ -2237,6 +2437,9 @@ impl Waku {
                 }),
             Some(RightPanelSurface::File(path)) => self
                 .render_right_panel_file(path, width, window, cx)
+                .into_any_element(),
+            Some(RightPanelSurface::ExternalFile(path)) => self
+                .render_right_panel_external_file(path, width, window, cx)
                 .into_any_element(),
             Some(RightPanelSurface::Browser(browser_id)) => {
                 let browser = self.ensure_right_panel_browser(browser_id, window, cx);
@@ -2443,11 +2646,17 @@ impl Waku {
             });
             let icon_path =
                 right_panel_tab_icon(&surface, self.right_panel_files_selected_path.as_deref());
-            let uses_file_icon = matches!(&surface, RightPanelSurface::File(_))
-                || matches!(&surface, RightPanelSurface::Files)
-                    && self.right_panel_files_selected_path.is_some();
+            let uses_file_icon = matches!(
+                &surface,
+                RightPanelSurface::File(_) | RightPanelSurface::ExternalFile(_)
+            ) || matches!(&surface, RightPanelSurface::Files)
+                && self.right_panel_files_selected_path.is_some();
             let activate_weak = cx.entity().downgrade();
             let close_weak = cx.entity().downgrade();
+            let reload_external_path = match &surface {
+                RightPanelSurface::ExternalFile(path) => Some(path.clone()),
+                _ => None,
+            };
             tabs = tabs.child(
                 div()
                     .id(SharedString::from(format!("right-panel-tab-{index}")))
@@ -2523,10 +2732,17 @@ impl Waku {
                             }),
                     )
                     .on_click(move |_, _, cx| {
+                        let reload_external_path = reload_external_path.clone();
                         let _ = activate_weak.update(cx, |this, cx| {
                             this.right_panel_active_surface = Some(index);
                             this.reveal_right_panel_tab(index);
                             this.request_active_terminal_focus();
+                            if let Some(path) = reload_external_path {
+                                this.reload_right_panel_file_if_clean(
+                                    &RightPanelFileTarget::External(path),
+                                    cx,
+                                );
+                            }
                             cx.notify();
                         });
                     }),
@@ -2899,18 +3115,19 @@ impl Waku {
     ) -> Div {
         let theme = Theme::current(cx);
         let file_tree_width = fitted_file_tree_width(panel_width, self.right_panel_file_tree_width);
+        let target = RightPanelFileTarget::Project(relative_path.clone());
         let (editor_state, writable, _) =
-            self.ensure_right_panel_file_editor(&relative_path, window, cx);
+            self.ensure_right_panel_file_editor(&target, window, cx);
 
         // Markdown files carry the global source/preview toggle; every other
         // language always shows source.
         let is_markdown = file_highlighter_language(&relative_path) == "markdown";
         let preview = is_markdown && self.state.markdown_preview;
         let body = if preview {
-            self.render_file_markdown_preview(&relative_path, &editor_state, cx)
+            self.render_file_markdown_preview(&target, &editor_state, cx)
         } else {
             self.render_file_editor_body(
-                &relative_path,
+                &target,
                 &editor_state,
                 panel_width - file_tree_width,
                 writable,
@@ -3005,20 +3222,206 @@ impl Waku {
             )
     }
 
+    fn render_right_panel_external_file(
+        &mut self,
+        path: PathBuf,
+        panel_width: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = Theme::current(cx);
+        let display_path = path.to_string_lossy().into_owned();
+        let target = RightPanelFileTarget::External(path.clone());
+        let (editor_state, _, _) = self.ensure_right_panel_file_editor(&target, window, cx);
+        let (read_error, external_preview) = self
+            .right_panel_file_editors
+            .get(&target)
+            .map(|editor| (editor.read_error.clone(), editor.external_markdown_preview))
+            .unwrap_or((None, true));
+
+        let is_markdown = file_highlighter_language(&display_path) == "markdown";
+        let preview = is_markdown && external_preview;
+        let can_reveal_locally = !self.daemon.is_remote();
+
+        let body = if let Some(error) = read_error {
+            let reveal_path = path.clone();
+            let reveal_button = can_reveal_locally.then(|| {
+                let focus = self.transcript_control_focus("external-file-error-reveal", cx);
+                div()
+                    .id("external-file-error-reveal")
+                    .track_focus(&focus)
+                    .tab_index(0)
+                    .mt(px(14.0))
+                    .h(px(30.0))
+                    .px(px(12.0))
+                    .rounded(px(7.0))
+                    .border_1()
+                    .border_color(theme.border_strong)
+                    .bg(theme.composer)
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_size(sp(12.5))
+                    .text_color(theme.text)
+                    .cursor_default()
+                    .focus_visible(|style| style.border_color(theme.accent))
+                    .hover(|style| style.bg(theme.raised))
+                    .active(|style| style.bg(theme.overlay_strong))
+                    .child(icon("icons/folder-open.svg", 13.0, theme.text_secondary))
+                    .child(tr!("common.reveal_in_finder"))
+                    .on_click(move |_, _, cx| {
+                        crate::platform::reveal_in_file_manager(&reveal_path, cx);
+                    })
+                    .on_key_down({
+                        let reveal_path = path.clone();
+                        move |event: &KeyDownEvent, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                crate::platform::reveal_in_file_manager(&reveal_path, cx);
+                                cx.stop_propagation();
+                            }
+                        }
+                    })
+            });
+            self.render_right_panel_empty_message(tr!("files.file_unavailable"), error, cx)
+                .children(reveal_button)
+        } else if preview {
+            self.render_file_markdown_preview(&target, &editor_state, cx)
+        } else {
+            self.render_file_editor_body(&target, &editor_state, panel_width, false, window, cx)
+        };
+
+        let preview_toggle = is_markdown.then(|| {
+            let toggle_target = target.clone();
+            let key_target = target.clone();
+            let focus = self.transcript_control_focus("external-file-markdown-preview-toggle", cx);
+            let (icon_path, label) = if preview {
+                ("icons/file.svg", tr!("files.view_markdown_source"))
+            } else {
+                ("icons/eye.svg", tr!("files.preview_markdown"))
+            };
+            div()
+                .id("external-file-markdown-preview-toggle")
+                .track_focus(&focus)
+                .tab_index(0)
+                .size(px(26.0))
+                .rounded(px(7.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_default()
+                .focus_visible(|style| style.border_1().border_color(theme.accent))
+                .hover(|style| style.bg(theme.overlay))
+                .child(icon(icon_path, 12.0, theme.text_tertiary))
+                .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_external_markdown_preview(&toggle_target, cx);
+                }))
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        this.toggle_external_markdown_preview(&key_target, cx);
+                        cx.stop_propagation();
+                    }
+                }))
+        });
+
+        let reveal_button = can_reveal_locally.then(|| {
+            let reveal_path = path.clone();
+            let key_path = path.clone();
+            let focus = self.transcript_control_focus("external-file-reveal-in-finder", cx);
+            let label = tr!("common.reveal_in_finder");
+            div()
+                .id("external-file-reveal-in-finder")
+                .track_focus(&focus)
+                .tab_index(0)
+                .size(px(26.0))
+                .rounded(px(7.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_default()
+                .focus_visible(|style| style.border_1().border_color(theme.accent))
+                .hover(|style| style.bg(theme.overlay))
+                .child(icon("icons/folder-open.svg", 12.0, theme.text_tertiary))
+                .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+                .on_click(move |_, _, cx| {
+                    crate::platform::reveal_in_file_manager(&reveal_path, cx);
+                })
+                .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        crate::platform::reveal_in_file_manager(&key_path, cx);
+                        cx.stop_propagation();
+                    }
+                })
+        });
+
+        let header_path_tooltip = display_path.clone();
+        div()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(42.0))
+                    .flex_none()
+                    .px(px(16.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(file_icon(file_icon_for_path(&display_path), 13.0))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "external-file-header-path-{}",
+                                target.element_id_key()
+                            )))
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_size(sp(12.5))
+                            .text_color(theme.text_secondary)
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(header_path_tooltip.clone()).build(window, cx)
+                            })
+                            .child(display_path),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .rounded(px(5.0))
+                            .bg(theme.overlay)
+                            .text_size(sp(11.0))
+                            .text_color(theme.text_tertiary)
+                            .child(tr!("files.read_only")),
+                    )
+                    .children(preview_toggle)
+                    .children(reveal_button),
+            )
+            .child(body)
+    }
+
     fn ensure_right_panel_file_editor(
         &mut self,
-        relative_path: &str,
+        target: &RightPanelFileTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> (Entity<TextInput>, bool, bool) {
-        if let Some(editor) = self.right_panel_file_editors.get(relative_path) {
+        if let Some(editor) = self.right_panel_file_editors.get(target) {
             return (editor.state.clone(), editor.writable, editor.dirty);
         }
 
         // Reached from `render`, so the file cannot be read here. The editor
         // starts empty and locked, and `read_right_panel_file_into_editor`
         // fills it in from the background executor a frame or two later.
-        let language = file_highlighter_language(relative_path);
+        let display_path = target.display_path();
+        let language = file_highlighter_language(&display_path);
         let state = cx.new(|cx| {
             TextInput::new(window, cx)
                 .multi_line()
@@ -3027,12 +3430,14 @@ impl Waku {
         });
 
         self.right_panel_file_editors.insert(
-            relative_path.to_owned(),
+            target.clone(),
             RightPanelFileEditor {
                 state: state.clone(),
                 disk_content: String::new(),
                 writable: false,
                 dirty: false,
+                read_error: None,
+                external_markdown_preview: true,
                 reading: false,
                 read_epoch: 0,
             },
@@ -3041,7 +3446,7 @@ impl Waku {
         // Dirty tracking follows content edits. Observing raw notifies would
         // also fire for caret blinks and selection drags, cloning the whole
         // file's text for each one.
-        let subscribed_path = relative_path.to_owned();
+        let subscribed_target = target.clone();
         cx.subscribe(
             &state,
             move |this: &mut Self, state, event: &InputEvent, cx| {
@@ -3049,10 +3454,7 @@ impl Waku {
                     return;
                 }
                 let value = state.read(cx).content().to_owned();
-                if let Some(editor) = this
-                    .right_panel_file_editors
-                    .get_mut(subscribed_path.as_str())
-                {
+                if let Some(editor) = this.right_panel_file_editors.get_mut(&subscribed_target) {
                     let dirty = editor.writable && value != editor.disk_content;
                     if editor.dirty != dirty {
                         editor.dirty = dirty;
@@ -3061,20 +3463,20 @@ impl Waku {
                 }
                 // Any content change — typing, a replace, a reload from disk —
                 // moves the text out from under an open find's match list.
-                this.refresh_file_search_for_edit(subscribed_path.as_str(), cx);
+                this.refresh_file_search_for_edit(&subscribed_target, cx);
             },
         )
         .detach();
 
-        let focused_path = relative_path.to_owned();
+        let focused_target = target.clone();
         cx.subscribe(&state, move |this: &mut Self, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Focus) {
-                this.reload_right_panel_file_if_clean(focused_path.as_str(), cx);
+                this.reload_right_panel_file_if_clean(&focused_target, cx);
             }
         })
         .detach();
 
-        self.read_right_panel_file_into_editor(relative_path.to_owned(), cx);
+        self.read_right_panel_file_into_editor(target.clone(), cx);
         (state, false, false)
     }
 
@@ -3087,25 +3489,38 @@ impl Waku {
     /// The result is applied only if the same session is still selected and the
     /// editor is still the one that asked, so a read started before a project
     /// or session switch cannot write another workspace's text into the view.
-    fn read_right_panel_file_into_editor(&mut self, relative_path: String, cx: &mut Context<Self>) {
-        let project_path = self
-            .selected_workspace_path()
-            .map(std::path::Path::to_path_buf);
-        let (Some(project_path), Some(session_id)) = (project_path, self.state.selected_session)
-        else {
-            // Nothing to read from. Say so in the editor rather than leaving it
-            // looking like an empty file.
-            if let Some(editor) = self.right_panel_file_editors.get_mut(&relative_path) {
-                editor.reading = false;
-                editor.disk_content = tr!("files.no_project_is_open");
-                editor.writable = false;
-                let state = editor.state.clone();
-                let content = editor.disk_content.clone();
-                state.update(cx, |state, cx| state.set_content(content, cx));
-            }
+    fn read_right_panel_file_into_editor(
+        &mut self,
+        target: RightPanelFileTarget,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_id) = self.state.selected_session else {
             return;
         };
-        let Some(editor) = self.right_panel_file_editors.get_mut(&relative_path) else {
+        let project_path = match &target {
+            RightPanelFileTarget::Project(_) => {
+                let Some(project_path) = self
+                    .selected_workspace_path()
+                    .map(std::path::Path::to_path_buf)
+                else {
+                    // Nothing to read from. Say so in the editor rather than leaving it
+                    // looking like an empty file.
+                    if let Some(editor) = self.right_panel_file_editors.get_mut(&target) {
+                        editor.reading = false;
+                        editor.read_error = None;
+                        editor.disk_content = tr!("files.no_project_is_open");
+                        editor.writable = false;
+                        let state = editor.state.clone();
+                        let content = editor.disk_content.clone();
+                        state.update(cx, |state, cx| state.set_content(content, cx));
+                    }
+                    return;
+                };
+                Some(project_path)
+            }
+            RightPanelFileTarget::External(_) => None,
+        };
+        let Some(editor) = self.right_panel_file_editors.get_mut(&target) else {
             return;
         };
         // A second asker would only duplicate the read and race to apply it.
@@ -3122,26 +3537,49 @@ impl Waku {
                 .background_executor()
                 .spawn({
                     let project_path = project_path.clone();
-                    let relative_path = relative_path.clone();
-                    async move { read_right_panel_file(&workspace, &project_path, &relative_path) }
+                    let target = target.clone();
+                    async move {
+                        match target {
+                            RightPanelFileTarget::Project(relative_path) => {
+                                let (content, writable) = read_right_panel_file(
+                                    &workspace,
+                                    project_path.as_deref().expect("project path checked above"),
+                                    &relative_path,
+                                );
+                                (content, writable, None)
+                            }
+                            RightPanelFileTarget::External(path) => {
+                                match read_external_right_panel_file(&workspace, &path) {
+                                    Ok(content) => (content, false, None),
+                                    Err(error) => (String::new(), false, Some(error)),
+                                }
+                            }
+                        }
+                    }
                 })
                 .await;
             waku.update(cx, |waku, cx| {
-                if waku.state.selected_session != Some(session_id)
-                    || waku
+                if waku.state.selected_session != Some(session_id) {
+                    // The editor moved into another session's stored state;
+                    // `restore_right_panel_state` clears `reading` when that
+                    // session is selected again. Never touch the active
+                    // session's map here.
+                    return;
+                }
+                if let Some(expected_project_path) = project_path.as_deref()
+                    && waku
                         .selected_workspace_path()
-                        .is_none_or(|path| path != project_path)
+                        .is_none_or(|path| path != expected_project_path)
                 {
-                    // The editor moved into another session's stored state, or
-                    // the project changed. Clear the flag so a later reload can
-                    // ask again, and drop the text.
-                    if let Some(editor) = waku.right_panel_file_editors.get_mut(&relative_path) {
+                    if let Some(editor) = waku.right_panel_file_editors.get_mut(&target)
+                        && editor.read_epoch == epoch
+                    {
                         editor.reading = false;
                     }
                     return;
                 }
-                let (content, writable) = read;
-                let Some(editor) = waku.right_panel_file_editors.get_mut(&relative_path) else {
+                let (content, writable, read_error) = read;
+                let Some(editor) = waku.right_panel_file_editors.get_mut(&target) else {
                     return;
                 };
                 // A save landed while the read was in flight, so this text
@@ -3155,11 +3593,15 @@ impl Waku {
                 if editor.dirty {
                     return;
                 }
-                if editor.disk_content == content && editor.writable == writable {
+                if editor.disk_content == content
+                    && editor.writable == writable
+                    && editor.read_error == read_error
+                {
                     return;
                 }
                 editor.disk_content = content.clone();
                 editor.writable = writable;
+                editor.read_error = read_error;
                 editor.dirty = false;
                 let state = editor.state.clone();
                 state.update(cx, |state, cx| {
@@ -3185,7 +3627,7 @@ impl Waku {
     /// two columns cannot drift apart down a long file.
     fn render_file_editor_body(
         &mut self,
-        relative_path: &str,
+        target: &RightPanelFileTarget,
         editor_state: &Entity<TextInput>,
         pane_width: f32,
         writable: bool,
@@ -3201,7 +3643,7 @@ impl Waku {
         // An open find bar follows whichever file this body is showing; a
         // cheap comparison every frame, one recompute on the frame after the
         // visible file actually changes.
-        self.sync_file_search_target(relative_path, cx);
+        self.sync_file_search_target(target, cx);
         let find_bar = self.render_file_search_bar(pane_width, writable, window, cx);
 
         let theme = Theme::current(cx);
@@ -3284,7 +3726,10 @@ impl Waku {
                     .relative()
                     .child(
                         div()
-                            .id(SharedString::from(format!("file-editor-{relative_path}")))
+                            .id(SharedString::from(format!(
+                                "file-editor-{}",
+                                target.element_id_key()
+                            )))
                             .size_full()
                             .overflow_y_scroll()
                             .track_scroll(&self.right_panel_editor_scroll_handle)
@@ -3321,35 +3766,62 @@ impl Waku {
         cx.notify();
     }
 
+    /// Flips the per-tab source/preview mode for a read-only external markdown
+    /// file without touching the persisted project-file preference.
+    fn toggle_external_markdown_preview(
+        &mut self,
+        target: &RightPanelFileTarget,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = self.right_panel_file_editors.get_mut(target) {
+            editor.external_markdown_preview = !editor.external_markdown_preview;
+            cx.notify();
+        }
+    }
+
     /// The rendered-markdown alternative to the editor body, shown while the
-    /// global preview toggle is on. It renders the editor's current text —
+    /// preview toggle is on. It renders the editor's current text —
     /// unsaved edits included — with the transcript's markdown engine; the
-    /// parse is cached per path, so re-rendering an unchanged document costs
+    /// parse is cached per target, so re-rendering an unchanged document costs
     /// `Rc` clones, not a re-parse. Reads only in-memory editor state: the
     /// render path may not touch the filesystem.
     fn render_file_markdown_preview(
         &mut self,
-        relative_path: &str,
+        target: &RightPanelFileTarget,
         editor_state: &Entity<TextInput>,
         cx: &mut Context<Self>,
     ) -> Div {
         let theme = Theme::current(cx);
         let palette = MarkdownPalette::from_theme(&theme);
+        let target_key = target.element_id_key();
         let mut cache = self.file_preview_markdown.borrow_mut();
-        if !matches!(cache.as_ref(), Some((cached, _)) if cached == relative_path) {
-            *cache = Some((relative_path.to_owned(), MarkdownView::new()));
+        if !matches!(cache.as_ref(), Some((cached, _)) if cached == target) {
+            *cache = Some((target.clone(), MarkdownView::new()));
         }
         let (_, view) = cache.as_mut().expect("entry ensured above");
         view.set_text(editor_state.read(cx).content(), false);
+        let link_handler = match target.parent_dir(self.selected_workspace_path()) {
+            Some(base_dir) => {
+                let fallback = self.markdown_link_handler.clone();
+                Rc::new(move |href: &str, window: &mut Window, cx: &mut App| {
+                    if let Some(resolved) = resolve_relative_markdown_link(href, &base_dir) {
+                        fallback(&resolved, window, cx);
+                    } else {
+                        fallback(href, window, cx);
+                    }
+                }) as md::render::LinkHandler
+            }
+            None => self.markdown_link_handler.clone(),
+        };
         let ctx = MarkdownCtx::new(
-            format!("file-preview-{relative_path}"),
+            format!("file-preview-{target_key}"),
             &palette,
             MarkdownMetrics::document(self.state.ui_font_size, self.state.code_font_size),
             self.file_preview_selection.clone(),
         )
         .with_math_enabled(self.state.render_math)
         .with_math_context_menu(self.menu_handle("file-preview-math", cx))
-        .with_link_handler(self.markdown_link_handler.clone());
+        .with_link_handler(link_handler);
         let document = md::render::markdown(view, &ctx);
 
         let selection_input = {
@@ -3370,7 +3842,7 @@ impl Waku {
             .bg(theme.surface)
             .child(
                 div()
-                    .id(SharedString::from(format!("file-preview-{relative_path}")))
+                    .id(SharedString::from(format!("file-preview-{target_key}")))
                     .size_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.file_preview_scroll_handle)
@@ -3397,26 +3869,30 @@ impl Waku {
     ///
     /// Reaches the filesystem, so it queues a background read rather than
     /// blocking; the editor keeps showing its current text until that lands.
-    fn reload_right_panel_file_if_clean(&mut self, relative_path: &str, cx: &mut Context<Self>) {
+    fn reload_right_panel_file_if_clean(
+        &mut self,
+        target: &RightPanelFileTarget,
+        cx: &mut Context<Self>,
+    ) {
         if self
             .right_panel_file_editors
-            .get(relative_path)
+            .get(target)
             .is_none_or(|editor| editor.dirty)
         {
             return;
         }
-        self.read_right_panel_file_into_editor(relative_path.to_owned(), cx);
+        self.read_right_panel_file_into_editor(target.clone(), cx);
     }
 
     pub(super) fn reload_clean_right_panel_file_editors(&mut self, cx: &mut Context<Self>) {
-        let paths = self
+        let targets = self
             .right_panel_file_editors
             .iter()
             .filter(|(_, editor)| !editor.dirty)
-            .map(|(path, _)| path.clone())
+            .map(|(target, _)| target.clone())
             .collect::<Vec<_>>();
-        for path in paths {
-            self.reload_right_panel_file_if_clean(&path, cx);
+        for target in targets {
+            self.reload_right_panel_file_if_clean(&target, cx);
         }
     }
 
@@ -3426,8 +3902,19 @@ impl Waku {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(relative_path) = self.visible_right_panel_file_path() else {
+        let Some(target) = self.visible_right_panel_file_target() else {
             return;
+        };
+        let relative_path = match &target {
+            RightPanelFileTarget::Project(path) => path.clone(),
+            RightPanelFileTarget::External(path) => {
+                self.show_toast(tr!(
+                    "files.could_not_save_read_only",
+                    path = path.to_string_lossy()
+                ));
+                cx.notify();
+                return;
+            }
         };
         let Some(project_path) = self
             .selected_workspace_path()
@@ -3435,7 +3922,7 @@ impl Waku {
         else {
             return;
         };
-        let Some(editor) = self.right_panel_file_editors.get(&relative_path) else {
+        let Some(editor) = self.right_panel_file_editors.get(&target) else {
             return;
         };
         if !editor.writable {
@@ -3452,7 +3939,7 @@ impl Waku {
         let Some(session_id) = self.state.selected_session else {
             return;
         };
-        let epoch = if let Some(editor) = self.right_panel_file_editors.get_mut(&relative_path) {
+        let epoch = if let Some(editor) = self.right_panel_file_editors.get_mut(&target) {
             editor.reading = false;
             editor.read_epoch += 1;
             editor.read_epoch
@@ -3489,7 +3976,7 @@ impl Waku {
                 }
                 match result {
                     Ok(()) => {
-                        if let Some(editor) = waku.right_panel_file_editors.get_mut(&relative_path)
+                        if let Some(editor) = waku.right_panel_file_editors.get_mut(&target)
                             && editor.read_epoch == epoch
                         {
                             let current = editor.state.read(cx).content();

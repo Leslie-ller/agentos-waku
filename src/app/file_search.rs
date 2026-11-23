@@ -22,10 +22,10 @@ const FIND_BAR_CONTROLS_WIDTH: f32 = 252.0;
 
 pub(super) struct FileSearch {
     open: bool,
-    /// The file the current match list was computed against. Cleared to an
-    /// empty string when the list must not be trusted, e.g. after a session
-    /// switch swapped every editor out from under it.
-    path: String,
+    /// The file the current match list was computed against. Cleared to `None`
+    /// when the list must not be trusted, e.g. after a session switch swapped
+    /// every editor out from under it.
+    target: Option<RightPanelFileTarget>,
     query: Entity<TextInput>,
     replace: Entity<TextInput>,
     replace_visible: bool,
@@ -54,7 +54,7 @@ enum SearchRefresh {
     Content,
     /// Another file became the visible editor: recompute against it without
     /// selecting or scrolling.
-    Target(String),
+    Target(RightPanelFileTarget),
 }
 
 /// The compiled query, or why there is nothing to run.
@@ -237,16 +237,17 @@ impl Waku {
         }) {
             return true;
         }
-        self.visible_right_panel_file_path()
-            .and_then(|path| self.right_panel_file_editors.get(&path))
+        self.visible_right_panel_file_target()
+            .and_then(|target| self.right_panel_file_editors.get(&target))
             .is_some_and(|editor| editor.state.read(cx).focus().is_focused(window))
     }
 
     /// The editor entity the open search operates on.
     fn file_search_editor(&self) -> Option<Entity<TextInput>> {
         let search = self.file_search.as_ref().filter(|search| search.open)?;
+        let target = search.target.as_ref()?;
         self.right_panel_file_editors
-            .get(&search.path)
+            .get(target)
             .map(|editor| editor.state.clone())
     }
 
@@ -274,7 +275,7 @@ impl Waku {
         .detach();
         self.file_search = Some(FileSearch {
             open: false,
-            path: String::new(),
+            target: None,
             query,
             replace,
             replace_visible: false,
@@ -297,7 +298,7 @@ impl Waku {
         if !self.right_panel_visible {
             return;
         }
-        let Some(path) = self.visible_right_panel_file_path() else {
+        let Some(target) = self.visible_right_panel_file_target() else {
             return;
         };
         self.ensure_file_search(window, cx);
@@ -305,19 +306,22 @@ impl Waku {
         // Seed the query from the editor's selection, the way editors
         // conventionally do, but only a single-line one: a multi-line
         // selection means "search within", which this bar does not model.
-        let seed = self.right_panel_file_editors.get(&path).and_then(|editor| {
-            let editor = editor.state.read(cx);
-            let selection = editor.selected_range();
-            let text = editor.content().get(selection)?;
-            (!text.is_empty() && !text.contains('\n')).then(|| text.to_owned())
-        });
+        let seed = self
+            .right_panel_file_editors
+            .get(&target)
+            .and_then(|editor| {
+                let editor = editor.state.read(cx);
+                let selection = editor.selected_range();
+                let text = editor.content().get(selection)?;
+                (!text.is_empty() && !text.contains('\n')).then(|| text.to_owned())
+            });
 
         let search = self
             .file_search
             .as_mut()
             .expect("ensure_file_search just created it");
         search.open = true;
-        if with_replace {
+        if with_replace && !target.is_external() {
             search.replace_visible = true;
         }
         let query = search.query.clone();
@@ -328,7 +332,7 @@ impl Waku {
         query.update(cx, |query, cx| query.select_all_text(cx));
         window.focus(&query.read(cx).focus(), cx);
 
-        self.refresh_file_search(SearchRefresh::Target(path), cx);
+        self.refresh_file_search(SearchRefresh::Target(target), cx);
         self.refresh_file_search(SearchRefresh::Query, cx);
         cx.notify();
     }
@@ -355,8 +359,8 @@ impl Waku {
             });
         }
         if restore_editor_focus
-            && let Some(path) = self.visible_right_panel_file_path()
-            && let Some(editor) = self.right_panel_file_editors.get(&path)
+            && let Some(target) = self.visible_right_panel_file_target()
+            && let Some(editor) = self.right_panel_file_editors.get(&target)
         {
             let focus = editor.state.read(cx).focus();
             window.focus(&focus, cx);
@@ -370,7 +374,7 @@ impl Waku {
     pub(super) fn reset_file_search_for_session(&mut self, cx: &mut Context<Self>) {
         if let Some(search) = self.file_search.as_mut() {
             search.open = false;
-            search.path = String::new();
+            search.target = None;
             search.matches = Vec::new();
             search.current = None;
         }
@@ -382,15 +386,19 @@ impl Waku {
     }
 
     /// Re-aims an open search at the file editor actually on screen. Called
-    /// from the editor's render path: a cheap string compare per frame, and
+    /// from the editor's render path: a cheap compare per frame, and
     /// one recompute on the frame after the visible file changes.
-    pub(super) fn sync_file_search_target(&mut self, relative_path: &str, cx: &mut Context<Self>) {
+    pub(super) fn sync_file_search_target(
+        &mut self,
+        target: &RightPanelFileTarget,
+        cx: &mut Context<Self>,
+    ) {
         if self
             .file_search
             .as_ref()
-            .is_some_and(|search| search.open && search.path != relative_path)
+            .is_some_and(|search| search.open && search.target.as_ref() != Some(target))
         {
-            self.refresh_file_search(SearchRefresh::Target(relative_path.to_owned()), cx);
+            self.refresh_file_search(SearchRefresh::Target(target.clone()), cx);
         }
     }
 
@@ -398,13 +406,13 @@ impl Waku {
     /// disk — keeping highlights in step with the text.
     pub(super) fn refresh_file_search_for_edit(
         &mut self,
-        relative_path: &str,
+        target: &RightPanelFileTarget,
         cx: &mut Context<Self>,
     ) {
         if self
             .file_search
             .as_ref()
-            .is_some_and(|search| search.open && search.path == relative_path)
+            .is_some_and(|search| search.open && search.target.as_ref() == Some(target))
         {
             self.refresh_file_search(SearchRefresh::Content, cx);
         }
@@ -414,10 +422,10 @@ impl Waku {
         let Some(search) = self.file_search.as_ref().filter(|search| search.open) else {
             return;
         };
-        let previous_path = search.path.clone();
-        let path = match &refresh {
-            SearchRefresh::Target(path) => path.clone(),
-            _ => previous_path.clone(),
+        let previous_target = search.target.clone();
+        let target = match &refresh {
+            SearchRefresh::Target(target) => Some(target.clone()),
+            _ => previous_target.clone(),
         };
         let query_text = search.query.read(cx).content().to_owned();
         let (case_sensitive, whole_word, use_regex) =
@@ -428,17 +436,18 @@ impl Waku {
             .map(|found| found.start);
 
         // The editor the search is leaving keeps no washes.
-        if path != previous_path
-            && let Some(editor) = self.right_panel_file_editors.get(&previous_path)
+        if target != previous_target
+            && let Some(previous_target) = previous_target.as_ref()
+            && let Some(editor) = self.right_panel_file_editors.get(previous_target)
         {
             editor.state.update(cx, |editor, cx| {
                 editor.set_search_matches(Vec::new(), None, cx)
             });
         }
 
-        let editor = self
-            .right_panel_file_editors
-            .get(&path)
+        let editor = target
+            .as_ref()
+            .and_then(|target| self.right_panel_file_editors.get(target))
             .map(|editor| editor.state.clone());
         let (matches, limited, invalid) = match (
             &editor,
@@ -474,7 +483,7 @@ impl Waku {
             .file_search
             .as_mut()
             .expect("still present: nothing above removes it");
-        search.path = path;
+        search.target = target;
         search.matches = matches;
         search.current = current;
         search.limited = limited;
@@ -566,7 +575,8 @@ impl Waku {
         self.file_search
             .as_ref()
             .filter(|search| search.open)
-            .and_then(|search| self.right_panel_file_editors.get(&search.path))
+            .and_then(|search| search.target.as_ref())
+            .and_then(|target| self.right_panel_file_editors.get(target))
             .is_some_and(|editor| editor.writable)
     }
 

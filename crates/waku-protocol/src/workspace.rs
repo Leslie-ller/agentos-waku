@@ -63,6 +63,10 @@ pub enum WorkspaceOperation {
         #[ts(type = "string")]
         relative_path: PathBuf,
     },
+    ReadExternalTextFile {
+        #[ts(type = "string")]
+        path: PathBuf,
+    },
     WriteTextFile {
         #[ts(type = "string")]
         root: PathBuf,
