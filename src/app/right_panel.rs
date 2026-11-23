@@ -1308,16 +1308,20 @@ mod tests {
             transcript_link_route(&format!("{}/", outside_dir.display()), Some(workspace)),
             TranscriptLinkRoute::Finder(normalized_path(&outside_dir))
         );
-        assert_eq!(
-            resolve_relative_markdown_link("./phase0.md#L10-L20", Path::new("/tmp/brain")),
-            Some("/tmp/brain/phase0.md#L10-L20".into())
+        let expected_relative = format!(
+            "{}#L10-L20",
+            normalized_path(&workspace.join("../brain/phase0.md")).display()
         );
         assert_eq!(
-            resolve_relative_markdown_link("https://example.com/doc.md", Path::new("/tmp/brain")),
+            resolve_relative_markdown_link("./phase0.md#L10-L20", &workspace.join("../brain")),
+            Some(expected_relative)
+        );
+        assert_eq!(
+            resolve_relative_markdown_link("https://example.com/doc.md", &workspace.join("../brain")),
             None
         );
         assert_eq!(
-            resolve_relative_markdown_link("#section-1", Path::new("/tmp/brain")),
+            resolve_relative_markdown_link("#section-1", &workspace.join("../brain")),
             None
         );
         assert_eq!(
