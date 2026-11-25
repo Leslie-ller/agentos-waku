@@ -1384,7 +1384,22 @@ fn write_mcp_response(
     if !head_only && !body.is_empty() {
         stream.write_all(body)?;
     }
-    stream.flush()
+    stream.flush()?;
+    // RFC 7230 §6.6 graceful half-close: closing a socket while unread request
+    // body bytes sit in the kernel receive buffer emits TCP RST on macOS/BSD
+    // and Windows, causing HTTP clients to hit ECONNRESET while reading 401/403
+    // error responses. Signal FIN on the write half and drain a bounded prefix.
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut discard = [0u8; 4096];
+    let mut drained = 0usize;
+    while drained < 64 * 1024 {
+        match stream.read(&mut discard) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => drained += n,
+        }
+    }
+    Ok(())
 }
 
 fn dispatch_remote_mcp_rpc(
