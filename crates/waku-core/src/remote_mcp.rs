@@ -41,6 +41,7 @@ pub const REMOTE_MCP_PATH: &str = "/mcp";
 pub const REMOTE_MCP_SERVER_NAME: &str = "agentos-remote-mcp";
 pub const MAX_MCP_CONNECTIONS: usize = 12;
 pub const MAX_MCP_CONCURRENT_WAITS: usize = 6;
+pub const MAX_MCP_ERROR_DRAINS: usize = 8;
 const MAX_MCP_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_FINISHED_TURNS: usize = 512;
 const MAX_EARLY_ERROR_DRAIN_BYTES: usize = 4 * 1024 * 1024;
@@ -382,15 +383,32 @@ impl DaemonEventScribe {
         let now = unix_now();
         let instant_now = Instant::now();
 
-        let (mut stream_phase, flush_now, should_wake) = {
+        let (mut stream_phase, flush_now, should_wake, deferred_terminal) = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let mut newly_finished: Option<FinishedTurnRecord> = None;
+            let mut replaced_finished: Option<FinishedTurnRecord> = None;
+            let mut deferred_terminal: Option<(SessionStatus, Option<FinishedTurnRecord>, Option<bool>)> =
+                None;
+            let mut wake = false;
             let entry = state
                 .live
                 .entry(sequenced.session_id)
                 .and_modify(|existing| {
                     if existing.runtime_id != sequenced.runtime_id || existing.epoch != sequenced.epoch
                     {
+                        if existing.status.is_busy()
+                            && let Some(old_tid) = existing.active_turn_id.take()
+                        {
+                            replaced_finished = Some(FinishedTurnRecord {
+                                session_id: sequenced.session_id,
+                                runtime_id: existing.runtime_id,
+                                turn_id: old_tid,
+                                success: false,
+                                error: existing.last_error.clone().or_else(|| {
+                                    Some("runtime replaced before turn finished".into())
+                                }),
+                            });
+                            wake = true;
+                        }
                         existing.runtime_id = sequenced.runtime_id;
                         existing.epoch = sequenced.epoch;
                         existing.status = SessionStatus::Idle;
@@ -419,7 +437,6 @@ impl DaemonEventScribe {
 
             entry.last_sequence = sequenced.sequence;
             let mut immediate_flush = false;
-            let mut wake = false;
 
             match &driver_event {
                 DriverEvent::Connected { .. } => {
@@ -496,26 +513,26 @@ impl DaemonEventScribe {
                     wake = true;
                 }
                 DriverEvent::TurnFinished { success, .. } => {
-                    entry.status = if *success {
+                    // Defer publishing terminal status + FinishedTurnRecord until
+                    // after `persist_scribe_event` commits the final reply so no
+                    // waiter can hydrate a partial/empty transcript.
+                    let terminal_status = if *success {
                         SessionStatus::Idle
                     } else {
                         SessionStatus::Failed
                     };
-                    if let Some(tid) = entry.active_turn_id.take() {
-                        entry.last_finished_turn_id = Some(tid);
-                        newly_finished = Some(FinishedTurnRecord {
-                            session_id: sequenced.session_id,
-                            runtime_id: sequenced.runtime_id,
-                            turn_id: tid,
-                            success: *success,
-                            error: if *success {
-                                None
-                            } else {
-                                entry.last_error.clone()
-                            },
-                        });
-                    }
-                    entry.last_turn_success = Some(*success);
+                    let record = entry.active_turn_id.map(|tid| FinishedTurnRecord {
+                        session_id: sequenced.session_id,
+                        runtime_id: sequenced.runtime_id,
+                        turn_id: tid,
+                        success: *success,
+                        error: if *success {
+                            None
+                        } else {
+                            entry.last_error.clone()
+                        },
+                    });
+                    deferred_terminal = Some((terminal_status, record, Some(*success)));
                     entry.pending_permissions.clear();
                     entry.pending_user_inputs.clear();
                     entry.stream_phase = None;
@@ -529,20 +546,16 @@ impl DaemonEventScribe {
                 }
                 DriverEvent::ProcessExited => {
                     if entry.status.is_busy() {
-                        entry.status = SessionStatus::Failed;
-                        if let Some(tid) = entry.active_turn_id.take() {
-                            entry.last_finished_turn_id = Some(tid);
-                            newly_finished = Some(FinishedTurnRecord {
-                                session_id: sequenced.session_id,
-                                runtime_id: sequenced.runtime_id,
-                                turn_id: tid,
-                                success: false,
-                                error: entry.last_error.clone().or_else(|| {
-                                    Some("agent process exited before turn finished".into())
-                                }),
-                            });
-                        }
-                        entry.last_turn_success = Some(false);
+                        let record = entry.active_turn_id.map(|tid| FinishedTurnRecord {
+                            session_id: sequenced.session_id,
+                            runtime_id: sequenced.runtime_id,
+                            turn_id: tid,
+                            success: false,
+                            error: entry.last_error.clone().or_else(|| {
+                                Some("agent process exited before turn finished".into())
+                            }),
+                        });
+                        deferred_terminal = Some((SessionStatus::Failed, record, Some(false)));
                     }
                     entry.pending_permissions.clear();
                     entry.pending_user_inputs.clear();
@@ -567,27 +580,46 @@ impl DaemonEventScribe {
                 entry.dirty_unflushed = true;
             }
             let phase = entry.stream_phase;
-            if let Some(record) = newly_finished {
+            if let Some(record) = replaced_finished {
                 state.record_finished_turn(record);
             }
-            (phase, flush, wake)
+            (phase, flush, wake, deferred_terminal)
         };
 
-        if let Some(mcp_backend) = backend.remote_mcp() {
-            if let Ok(catalog_changed) = mcp_backend.persist_scribe_event(
+        if let Some(mcp_backend) = backend.remote_mcp()
+            && let Ok(catalog_changed) = mcp_backend.persist_scribe_event(
                 sequenced,
                 &driver_event,
                 &mut stream_phase,
                 flush_now,
-            ) && catalog_changed
-            {
-                hub.broadcast_task_state_changed_all();
-            }
+            )
+            && catalog_changed
+        {
+            hub.broadcast_task_state_changed_all();
+        }
+
+        {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = state.live.get_mut(&sequenced.session_id)
                 && entry.runtime_id == sequenced.runtime_id
+                && entry.epoch == sequenced.epoch
             {
                 entry.stream_phase = stream_phase;
+                if let Some((terminal_status, ref record, last_success)) = deferred_terminal {
+                    entry.status = terminal_status;
+                    if let Some(rec) = record {
+                        if entry.active_turn_id == Some(rec.turn_id) {
+                            entry.active_turn_id = None;
+                        }
+                        entry.last_finished_turn_id = Some(rec.turn_id);
+                    }
+                    if let Some(ok) = last_success {
+                        entry.last_turn_success = Some(ok);
+                    }
+                }
+            }
+            if let Some((_, Some(record), _)) = deferred_terminal {
+                state.record_finished_turn(record);
             }
         }
 
@@ -770,6 +802,14 @@ fn evaluate_wait_state(
 pub struct McpBudget {
     active_connections: AtomicUsize,
     active_waits: AtomicUsize,
+    active_error_drains: AtomicUsize,
+}
+
+#[derive(Clone, Copy)]
+enum BudgetKind {
+    Connection,
+    Wait,
+    ErrorDrain,
 }
 
 impl McpBudget {
@@ -781,7 +821,7 @@ impl McpBudget {
             .ok()
             .map(|_| BudgetGuard {
                 counter: self.clone(),
-                is_wait: false,
+                kind: BudgetKind::Connection,
             })
     }
 
@@ -793,24 +833,44 @@ impl McpBudget {
             .ok()
             .map(|_| BudgetGuard {
                 counter: self.clone(),
-                is_wait: true,
+                kind: BudgetKind::Wait,
+            })
+    }
+
+    fn try_acquire_error_drain(self: &Arc<Self>) -> Option<BudgetGuard> {
+        self.active_error_drains
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_MCP_ERROR_DRAINS).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| BudgetGuard {
+                counter: self.clone(),
+                kind: BudgetKind::ErrorDrain,
             })
     }
 }
 
 struct BudgetGuard {
     counter: Arc<McpBudget>,
-    is_wait: bool,
+    kind: BudgetKind,
 }
 
 impl Drop for BudgetGuard {
     fn drop(&mut self) {
-        if self.is_wait {
-            self.counter.active_waits.fetch_sub(1, Ordering::AcqRel);
-        } else {
-            self.counter
-                .active_connections
-                .fetch_sub(1, Ordering::AcqRel);
+        match self.kind {
+            BudgetKind::Connection => {
+                self.counter
+                    .active_connections
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
+            BudgetKind::Wait => {
+                self.counter.active_waits.fetch_sub(1, Ordering::AcqRel);
+            }
+            BudgetKind::ErrorDrain => {
+                self.counter
+                    .active_error_drains
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
         }
     }
 }
@@ -932,6 +992,7 @@ pub(crate) fn handle_mcp_http_request(
             &[],
             method == "HEAD",
             drain,
+            &ctx.budget,
         )?;
         return Ok(());
     }
@@ -953,6 +1014,7 @@ pub(crate) fn handle_mcp_http_request(
                 &[],
                 false,
                 drain,
+                &ctx.budget,
             )?;
             return Ok(());
         }
@@ -971,6 +1033,7 @@ pub(crate) fn handle_mcp_http_request(
                 &[],
                 false,
                 early_drain,
+                &ctx.budget,
             )?;
             return Ok(());
         }
@@ -1005,6 +1068,7 @@ pub(crate) fn handle_mcp_http_request(
             &[],
             false,
             early_drain,
+            &ctx.budget,
         )?;
         return Ok(());
     };
@@ -1020,6 +1084,7 @@ pub(crate) fn handle_mcp_http_request(
             &extra,
             method == "HEAD",
             early_drain,
+            &ctx.budget,
         )?;
         return Ok(());
     }
@@ -1046,6 +1111,7 @@ pub(crate) fn handle_mcp_http_request(
             &extra,
             method == "HEAD",
             early_drain,
+            &ctx.budget,
         )?;
         return Ok(());
     }
@@ -1069,6 +1135,7 @@ pub(crate) fn handle_mcp_http_request(
             &extra,
             method == "HEAD",
             early_drain,
+            &ctx.budget,
         )?;
         return Ok(());
     }
@@ -1088,6 +1155,7 @@ pub(crate) fn handle_mcp_http_request(
             &extra,
             method == "HEAD",
             early_drain,
+            &ctx.budget,
         )?;
         return Ok(());
     };
@@ -1150,6 +1218,7 @@ pub(crate) fn handle_mcp_http_request(
                 &extra,
                 false,
                 early_drain,
+                &ctx.budget,
             )?;
             return Ok(());
         }
@@ -1169,6 +1238,7 @@ pub(crate) fn handle_mcp_http_request(
             &extra,
             false,
             early_drain,
+            &ctx.budget,
         )?;
         return Ok(());
     }
@@ -1183,6 +1253,7 @@ pub(crate) fn handle_mcp_http_request(
             &extra,
             false,
             early_drain,
+            &ctx.budget,
         )?;
         return Ok(());
     }
@@ -1197,6 +1268,7 @@ pub(crate) fn handle_mcp_http_request(
             &extra,
             false,
             early_drain,
+            &ctx.budget,
         )?;
         return Ok(());
     }
@@ -1225,6 +1297,7 @@ pub(crate) fn handle_mcp_http_request(
                 &extra,
                 false,
                 EarlyDrainHint::Unknown,
+                &ctx.budget,
             )?;
             return Ok(());
         }
@@ -1255,6 +1328,7 @@ pub(crate) fn handle_mcp_http_request(
                 &extra,
                 false,
                 EarlyDrainHint::Unknown,
+                &ctx.budget,
             )?;
             return Ok(());
         }
@@ -1629,6 +1703,7 @@ fn write_mcp_response(
     stream.flush()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_mcp_error_and_drain(
     stream: &mut TcpStream,
     status: &str,
@@ -1637,6 +1712,7 @@ fn write_mcp_error_and_drain(
     extra_headers: &[(&str, &str)],
     head_only: bool,
     drain: EarlyDrainHint,
+    budget: &Arc<McpBudget>,
 ) -> io::Result<()> {
     write_mcp_response(stream, status, content_type, body, extra_headers, head_only)?;
     let (limit, deadline) = match drain {
@@ -1653,6 +1729,12 @@ fn write_mcp_error_and_drain(
             Instant::now() + EARLY_ERROR_DRAIN_DEADLINE,
         ),
     };
+    // Cap concurrent early-error drains well below the shared listener limit
+    // (64 slots in server.rs) so unauthenticated slow/incomplete uploads cannot
+    // starve `/v1` WebSockets or authorized `/mcp` traffic.
+    let Some(_drain_permit) = budget.try_acquire_error_drain() else {
+        return Ok(());
+    };
     // RFC 7230 §6.6 graceful half-close: closing a socket while unread request
     // body bytes sit in the kernel receive buffer emits TCP RST on macOS/BSD
     // and Windows, causing HTTP clients to hit ECONNRESET while reading early
@@ -1661,7 +1743,7 @@ fn write_mcp_error_and_drain(
     let _ = stream.shutdown(std::net::Shutdown::Write);
     let mut discard = [0u8; 8192];
     let mut drained = 0usize;
-    let mut last_read_at: Option<Instant> = None;
+    let mut last_activity = Instant::now();
     while drained < limit {
         let now = Instant::now();
         if now >= deadline {
@@ -1674,7 +1756,7 @@ fn write_mcp_error_and_drain(
             Ok(0) => break,
             Ok(n) => {
                 drained += n;
-                last_read_at = Some(Instant::now());
+                last_activity = Instant::now();
             }
             Err(e)
                 if matches!(
@@ -1685,8 +1767,7 @@ fn write_mcp_error_and_drain(
                 ) =>
             {
                 if matches!(drain, EarlyDrainHint::Unknown)
-                    && last_read_at
-                        .is_some_and(|t| t.elapsed() >= Duration::from_millis(200))
+                    && last_activity.elapsed() >= Duration::from_millis(200)
                 {
                     break;
                 }
@@ -2770,6 +2851,56 @@ fn execute_send_message(
     Ok(response)
 }
 
+fn resolve_persisted_turn_response(
+    session_id: Uuid,
+    tid: Uuid,
+    backend: &dyn RemoteMcpBackend,
+    ctx: &RemoteMcpHttpContext<'_>,
+) -> anyhow::Result<Option<Value>> {
+    let is_currently_active = ctx
+        .scribe
+        .snapshot(session_id)
+        .is_some_and(|snap| snap.active_turn_id == Some(tid));
+    if is_currently_active {
+        return Ok(None);
+    }
+    let Some(session) = backend.hydrate_session_by_id(session_id)? else {
+        return Ok(None);
+    };
+    let Some(persisted_turn) = session.turns.iter().find(|t| t.id == tid) else {
+        return Ok(None);
+    };
+    let status_label = match persisted_turn.status {
+        TurnStatus::Completed => "completed",
+        TurnStatus::Failed => "failed",
+        TurnStatus::Interrupted => "interrupted",
+        TurnStatus::Running => {
+            // If the daemon restarted while this turn was in flight, no live
+            // runtime exists anymore; report interrupted immediately rather
+            // than blocking until timeout.
+            if backend.active_runtime_for(session_id).is_none()
+                && ctx.scribe.snapshot(session_id).is_none()
+            {
+                "interrupted"
+            } else {
+                return Ok(None);
+            }
+        }
+    };
+    let reply = extract_assistant_reply(&session, Some(tid));
+    Ok(Some(json!({
+        "session_id": session_id.to_string(),
+        "turn_id": tid.to_string(),
+        "runtime_id": Value::Null,
+        "status": status_label,
+        "timed_out": false,
+        "reply": reply,
+        "error": Value::Null,
+        "pending_permissions": [],
+        "pending_user_inputs": [],
+    })))
+}
+
 fn wait_for_turn_with_persistence(
     session_id: Uuid,
     target_turn_id: Option<Uuid>,
@@ -2786,37 +2917,27 @@ fn wait_for_turn_with_persistence(
                 backend,
             );
         }
-        let is_currently_active = ctx
-            .scribe
-            .snapshot(session_id)
-            .is_some_and(|snap| snap.active_turn_id == Some(tid));
-        if !is_currently_active
-            && let Some(session) = backend.hydrate_session_by_id(session_id)?
-            && let Some(persisted_turn) = session.turns.iter().find(|t| t.id == tid)
-            && persisted_turn.status != TurnStatus::Running
-        {
-            let status_label = match persisted_turn.status {
-                TurnStatus::Completed => "completed",
-                TurnStatus::Failed => "failed",
-                TurnStatus::Interrupted => "interrupted",
-                TurnStatus::Running => "running",
-            };
-            let reply = extract_assistant_reply(&session, Some(tid));
-            return Ok(json!({
-                "session_id": session_id.to_string(),
-                "turn_id": tid.to_string(),
-                "runtime_id": Value::Null,
-                "status": status_label,
-                "timed_out": false,
-                "reply": reply,
-                "error": Value::Null,
-                "pending_permissions": [],
-                "pending_user_inputs": [],
-            }));
+        if let Some(resp) = resolve_persisted_turn_response(session_id, tid, backend, ctx)? {
+            return Ok(resp);
         }
     }
 
     let outcome = ctx.scribe.wait_for_turn(session_id, target_turn_id, timeout);
+    if matches!(outcome, WaitOutcome::TimedOut { .. })
+        && let Some(tid) = target_turn_id
+    {
+        if let Some(record) = ctx.scribe.find_finished_turn(session_id, tid) {
+            return build_turn_state_response(
+                session_id,
+                Some(tid),
+                WaitOutcome::TurnFinished(record),
+                backend,
+            );
+        }
+        if let Some(resp) = resolve_persisted_turn_response(session_id, tid, backend, ctx)? {
+            return Ok(resp);
+        }
+    }
     build_turn_state_response(session_id, target_turn_id, outcome, backend)
 }
 
@@ -2939,27 +3060,18 @@ fn build_turn_state_response(
             (status, false, None, target_turn_id, None, Vec::new(), Vec::new())
         }
         WaitOutcome::TimedOut { snapshot } => {
-            let status = if let Some(tid) = target_turn_id {
-                if snapshot
+            let matches_target = target_turn_id.is_none_or(|tid| {
+                snapshot
                     .as_ref()
                     .is_some_and(|s| s.active_turn_id == Some(tid))
-                {
-                    "running"
-                } else {
-                    "timeout"
-                }
-            } else {
-                "running"
-            };
+            });
+            let status = if matches_target { "running" } else { "timeout" };
             let perms = snapshot
                 .as_ref()
                 .map(|s| {
                     s.pending_permissions
                         .iter()
-                        .filter(|p| {
-                            target_turn_id
-                                .is_none_or(|tid| p.turn_id.is_none() || p.turn_id == Some(tid))
-                        })
+                        .filter(|p| target_turn_id.is_none_or(|tid| p.turn_id == Some(tid)))
                         .map(format_pending_permission)
                         .collect()
                 })
@@ -2969,10 +3081,7 @@ fn build_turn_state_response(
                 .map(|s| {
                     s.pending_user_inputs
                         .iter()
-                        .filter(|q| {
-                            target_turn_id
-                                .is_none_or(|tid| q.turn_id.is_none() || q.turn_id == Some(tid))
-                        })
+                        .filter(|q| target_turn_id.is_none_or(|tid| q.turn_id == Some(tid)))
                         .map(format_pending_user_input)
                         .collect()
                 })
@@ -2980,13 +3089,21 @@ fn build_turn_state_response(
             (
                 status,
                 true,
-                snapshot.as_ref().map(|s| s.runtime_id),
+                if matches_target {
+                    snapshot.as_ref().map(|s| s.runtime_id)
+                } else {
+                    None
+                },
                 target_turn_id.or_else(|| {
                     snapshot
                         .as_ref()
                         .and_then(|s| s.active_turn_id.or(s.last_finished_turn_id))
                 }),
-                snapshot.and_then(|s| s.last_error),
+                if matches_target {
+                    snapshot.and_then(|s| s.last_error)
+                } else {
+                    None
+                },
                 perms,
                 inputs,
             )
@@ -3191,7 +3308,7 @@ mod tests {
     use crate::persistence::StateStore;
     use crate::server::{EventSink, serve};
     use crate::settings::DaemonSettingsStore;
-    use waku_protocol::{Command, Request, ResponsePayload, WireDriverEvent};
+    use waku_protocol::{Request, ResponsePayload};
 
     fn raw_http_exchange(addr: std::net::SocketAddr, request: &[u8]) -> String {
         let mut stream = TcpStream::connect(addr).unwrap();
@@ -4332,7 +4449,240 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
+        // Runtime/epoch change on a busy turn must also record a failed FinishedTurnRecord
+        // for the orphaned turn so waiters wake immediately instead of hanging.
+        let orphaned_outcome = scribe.wait_for_turn(sid, Some(tid_stale), Duration::from_secs(2));
+        assert!(
+            matches!(orphaned_outcome, WaitOutcome::TurnFinished(ref rec) if rec.turn_id == tid_stale && !rec.success),
+            "expected orphaned turn to finish as failed on epoch swap, got {orphaned_outcome:?}"
+        );
+
+        // Persisted TurnStatus::Running with no active runtime (simulating daemon restart
+        // mid-turn) must resolve immediately as "interrupted" instead of timing out.
+        let crash_sid = {
+            let mut sessions = backend.sessions.lock();
+            let project_id = backend.projects.lock()[0].id;
+            let mut crashed = AgentSession::new(project_id, ProviderKind::Codex);
+            crashed.title = "Crashed Mid-Turn".into();
+            crashed.begin_turn("Long running work");
+            let crash_sid = crashed.id;
+            sessions.push(crashed);
+            crash_sid
+        };
+        let crash_tid = backend
+            .sessions
+            .lock()
+            .iter()
+            .find(|s| s.id == crash_sid)
+            .unwrap()
+            .turns[0]
+            .id;
+        let started_crash = Instant::now();
+        let (_, _, crash_wait) = post_mcp(
+            addr,
+            token,
+            &json!({
+                "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                "params": {
+                    "name": "wait_for_turn",
+                    "arguments": {
+                        "session_id": crash_sid.to_string(),
+                        "turn_id": crash_tid.to_string(),
+                        "timeout_seconds": 10
+                    }
+                }
+            }),
+        );
+        assert!(
+            started_crash.elapsed() < Duration::from_secs(1),
+            "persisted Running turn after restart should resolve immediately"
+        );
+        let sc_crash = &crash_wait["result"]["structuredContent"];
+        assert_eq!(sc_crash["status"], "interrupted");
+        assert_eq!(sc_crash["timed_out"], false);
+
         shutdown.store(true, Ordering::Release);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn error_drain_budget_protects_authenticated_requests_under_unauth_flood() {
+        let token = "agm_flood_guard_token";
+        let backend = Arc::new(MockMcpBackend::new(RemoteMcpSettings {
+            enabled: true,
+            token: token.into(),
+            allow_send: true,
+            allow_approvals: false,
+        }));
+        let (addr, shutdown, server) =
+            start_test_server(backend.clone(), ServerOptions::default());
+
+        // Open 16 unauthenticated POSTs that declare 1 MiB bodies but stay silent.
+        // Because MAX_MCP_ERROR_DRAINS is capped at 8, excess connections skip draining
+        // and release shared listener slots immediately, keeping authorized /mcp fast.
+        let mut flood_streams = Vec::new();
+        for _ in 0..16 {
+            let mut s = TcpStream::connect(addr).unwrap();
+            let req = format!(
+                "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer bad\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n"
+            );
+            s.write_all(req.as_bytes()).unwrap();
+            s.flush().unwrap();
+            flood_streams.push(s);
+        }
+        std::thread::sleep(Duration::from_millis(80));
+
+        let started = Instant::now();
+        let (st, _, resp) = post_mcp(
+            addr,
+            token,
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "flood-test", "version": "1.0" } }
+            }),
+        );
+        assert_eq!(st, 200);
+        assert_eq!(resp["result"]["protocolVersion"], "2025-06-18");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "authorized initialize was starved by unauth drains: {:?}",
+            started.elapsed()
+        );
+
+        drop(flood_streams);
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn terminal_turn_publication_waits_for_backend_persistence() {
+        struct BarrierBackend {
+            inner: MockMcpBackend,
+            enter_tx: crossbeam_channel::Sender<()>,
+            release_rx: crossbeam_channel::Receiver<()>,
+        }
+
+        impl Backend for BarrierBackend {
+            fn handle(&self, req: Request, events: EventSink) -> anyhow::Result<ResponsePayload> {
+                self.inner.handle(req, events)
+            }
+            fn remote_mcp(&self) -> Option<&dyn RemoteMcpBackend> {
+                Some(self)
+            }
+        }
+
+        impl RemoteMcpBackend for BarrierBackend {
+            fn remote_mcp_settings(&self) -> RemoteMcpSettings {
+                self.inner.remote_mcp_settings()
+            }
+            fn list_projects_and_sessions(&self) -> anyhow::Result<(Vec<Project>, Vec<AgentSession>, PathBuf)> {
+                self.inner.list_projects_and_sessions()
+            }
+            fn hydrate_session_by_id(&self, session_id: Uuid) -> anyhow::Result<Option<AgentSession>> {
+                self.inner.hydrate_session_by_id(session_id)
+            }
+            fn resolve_legacy_session_id(&self, legacy_id: i64) -> anyhow::Result<Option<Uuid>> {
+                self.inner.resolve_legacy_session_id(legacy_id)
+            }
+            fn search_session_messages(&self, query: String, limit: usize) -> anyhow::Result<Vec<SessionMessageMatch>> {
+                self.inner.search_session_messages(query, limit)
+            }
+            fn create_session(&self, params: CreateSessionParams) -> anyhow::Result<(Project, AgentSession)> {
+                self.inner.create_session(params)
+            }
+            fn submit_prompt_in_mailbox(&self, session_id: Uuid, active_runtime_id: &mut Option<Uuid>, hub: &Arc<Hub>, params: SubmitPromptParams) -> anyhow::Result<SubmitPromptOutcome> {
+                self.inner.submit_prompt_in_mailbox(session_id, active_runtime_id, hub, params)
+            }
+            fn cancel_session_in_mailbox(&self, session_id: Uuid, active_runtime_id: Option<Uuid>, hub: &Arc<Hub>) -> anyhow::Result<bool> {
+                self.inner.cancel_session_in_mailbox(session_id, active_runtime_id, hub)
+            }
+            fn respond_permission_in_mailbox(&self, session_id: Uuid, runtime_id: Uuid, request_id: String, option_id: String, hub: &Arc<Hub>) -> anyhow::Result<()> {
+                self.inner.respond_permission_in_mailbox(session_id, runtime_id, request_id, option_id, hub)
+            }
+            fn respond_user_input_in_mailbox(&self, session_id: Uuid, runtime_id: Uuid, request_id: String, answers: Vec<UserInputAnswer>, hub: &Arc<Hub>) -> anyhow::Result<()> {
+                self.inner.respond_user_input_in_mailbox(session_id, runtime_id, request_id, answers, hub)
+            }
+            fn persist_scribe_event(&self, event: &SequencedEvent, driver_event: &DriverEvent, stream_phase: &mut Option<ScribeStreamPhase>, flush_now: bool) -> anyhow::Result<bool> {
+                if matches!(driver_event, DriverEvent::TurnFinished { .. }) {
+                    let _ = self.enter_tx.send(());
+                    let _ = self.release_rx.recv();
+                }
+                self.inner.persist_scribe_event(event, driver_event, stream_phase, flush_now)
+            }
+            fn flush_scribe_session(&self, session_id: Uuid) -> anyhow::Result<()> {
+                self.inner.flush_scribe_session(session_id)
+            }
+            fn active_runtime_for(&self, session_id: Uuid) -> Option<(Uuid, bool)> {
+                self.inner.active_runtime_for(session_id)
+            }
+        }
+
+        let (enter_tx, enter_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let backend = Arc::new(BarrierBackend {
+            inner: MockMcpBackend::new(RemoteMcpSettings::default()),
+            enter_tx,
+            release_rx,
+        });
+        let sid = backend.inner.sessions.lock()[0].id;
+        let hub = Arc::new(Hub::default());
+        let (obs_tx, obs_rx) = crossbeam_channel::unbounded();
+        let scribe = DaemonEventScribe::spawn(obs_rx, backend.clone(), hub);
+
+        let rid = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        let tid = Uuid::new_v4();
+        obs_tx
+            .send(HubObservation::Event(SequencedEvent {
+                session_id: sid,
+                runtime_id: rid,
+                epoch,
+                sequence: 1,
+                event: waku_protocol::event_to_wire(DriverEvent::PromptSubmitted {
+                    message: "Barrier".into(),
+                    turn_id: tid,
+                    message_id: Uuid::new_v4(),
+                })
+                .unwrap(),
+            }))
+            .unwrap();
+        obs_tx
+            .send(HubObservation::Event(SequencedEvent {
+                session_id: sid,
+                runtime_id: rid,
+                epoch,
+                sequence: 2,
+                event: waku_protocol::event_to_wire(DriverEvent::TurnStarted).unwrap(),
+            }))
+            .unwrap();
+        obs_tx
+            .send(HubObservation::Event(SequencedEvent {
+                session_id: sid,
+                runtime_id: rid,
+                epoch,
+                sequence: 3,
+                event: waku_protocol::event_to_wire(DriverEvent::TurnFinished {
+                    success: true,
+                    summary: None,
+                })
+                .unwrap(),
+            }))
+            .unwrap();
+
+        // Wait until scribe enters persist_scribe_event for TurnFinished.
+        enter_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("scribe did not enter persist_scribe_event");
+
+        // While terminal persistence is paused, FinishedTurnRecord MUST NOT be published yet.
+        assert!(
+            scribe.find_finished_turn(sid, tid).is_none(),
+            "finished_turns published before persist_scribe_event completed!"
+        );
+
+        // Release persistence and verify FinishedTurnRecord becomes visible immediately.
+        release_tx.send(()).unwrap();
+        let outcome = scribe.wait_for_turn(sid, Some(tid), Duration::from_secs(2));
+        assert!(matches!(outcome, WaitOutcome::TurnFinished(rec) if rec.turn_id == tid && rec.success));
     }
 }
