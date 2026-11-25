@@ -109,6 +109,19 @@ daemon.reveal_token: 显示令牌
 daemon.hide_token: 隐藏令牌
 daemon.regenerate_token: 重新生成
 daemon.security_warning: 此令牌可完全访问本机上的任务、文件、Git、附件和编程智能体。在私有网络之外请通过受信任的 TLS 代理使用 WSS。
+daemon.remote_mcp_title: 远程 MCP 服务（/mcp）
+daemon.remote_mcp_description: 开启 Streamable HTTP MCP 接口，让远程 MCP 客户端（Claude、Cursor、Codex、OpenClaw 等）使用独立 Bearer 令牌查看会话并发送消息。
+daemon.remote_mcp_status_on: 已开启
+daemon.remote_mcp_status_off: 未开启
+daemon.remote_mcp_allow_send: 允许发送消息与新建会话
+daemon.remote_mcp_allow_send_description: 允许远程 MCP 客户端新建会话、发送提示词、插话引导和取消任务；关闭则为只读查看模式。
+daemon.remote_mcp_allow_approvals: 允许远程审批权限与回答提问
+daemon.remote_mcp_allow_approvals_description: 允许远程 MCP 客户端代为审批权限弹窗和回答交互式问题（默认关闭以确保安全）。
+daemon.remote_mcp_endpoint: MCP 地址
+daemon.remote_mcp_token: MCP 令牌
+daemon.remote_mcp_copy_config: 复制配置 JSON
+daemon.remote_mcp_security_warning: 此令牌独立于守护进程 WebSocket 令牌，仅受上方 MCP 权限开关约束。在非私有网络环境下建议通过 Tailscale 或 HTTPS 反向代理访问。
+daemon.remote_mcp_local_only_hint: 请先在上方开启“暴露守护进程”，以便其他设备通过局域网或 Tailscale 访问 /mcp。当前仅本机客户端可连接。
 daemon.external_title: 外部守护进程
 daemon.external_description: 此桌面应用连接到由 Waku 之外管理的守护进程。请在对应主机上配置监听地址、浏览器来源和令牌。
 daemon.web_external_description: Waku Web 连接到由浏览器之外管理的守护进程。请在对应主机上配置监听地址、浏览器来源和令牌。

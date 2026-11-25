@@ -2,6 +2,7 @@
 import type { AgentOsMcpSettings } from "./AgentOsMcpSettings";
 import type { ComputerAppGrant } from "./ComputerAppGrant";
 import type { ProviderKind } from "./ProviderKind";
+import type { RemoteMcpSettings } from "./RemoteMcpSettings";
 import type { JsonValue } from "./serde_json/JsonValue";
 
-export type DaemonSettings = { computer_use_enabled: boolean, computer_use_allowed_apps: Array<ComputerAppGrant>, disabled_providers: Array<ProviderKind>, provider_binary_overrides: { [key in ProviderKind]?: string }, agentos_mcp: AgentOsMcpSettings, } & ({ [key in string]: number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null });
+export type DaemonSettings = { computer_use_enabled: boolean, computer_use_allowed_apps: Array<ComputerAppGrant>, disabled_providers: Array<ProviderKind>, provider_binary_overrides: { [key in ProviderKind]?: string }, agentos_mcp: AgentOsMcpSettings, remote_mcp: RemoteMcpSettings, } & ({ [key in string]: number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null });

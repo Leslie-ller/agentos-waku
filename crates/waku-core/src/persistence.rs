@@ -488,6 +488,7 @@ impl PersistedState {
             disabled_providers: self.disabled_providers.clone(),
             provider_binary_overrides: self.provider_binary_overrides.clone(),
             agentos_mcp: Default::default(),
+            remote_mcp: Default::default(),
             extra: self.daemon_settings_extra.clone(),
         }
     }

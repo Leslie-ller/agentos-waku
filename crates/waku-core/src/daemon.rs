@@ -59,6 +59,7 @@ pub struct WakuBackend {
     attachments: AttachmentStore,
     usage_scan_cache: Mutex<crate::usage_history::ScanCache>,
     checkpoint_capture_locks: Mutex<HashMap<(PathBuf, Uuid, usize), Arc<Mutex<()>>>>,
+    prompt_idempotency: crate::remote_mcp::PromptIdempotencyCache,
     usage_rates_dir: std::path::PathBuf,
     default_cwd: std::path::PathBuf,
 }
@@ -98,6 +99,7 @@ impl WakuBackend {
             attachments,
             usage_scan_cache: Mutex::new(HashMap::new()),
             checkpoint_capture_locks: Mutex::new(HashMap::new()),
+            prompt_idempotency: crate::remote_mcp::PromptIdempotencyCache::default(),
             usage_rates_dir,
             default_cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         })
@@ -838,323 +840,8 @@ impl Backend for WakuBackend {
                 Ok(ResponsePayload::Ack)
             }
             Command::Start { options } => {
-                let previous = self.sessions.lock().remove(&session_id);
-                drop(previous);
-                let provider = decode_enum(&options.provider)?;
-                let mut requested_cursor: Option<ProviderResumeCursor> = options
-                    .provider_cursor
-                    .map(serde_json::from_value)
-                    .transpose()
-                    .context("daemon received an invalid provider cursor")?;
-
-                // Reconcile cross-agent in-place handoff in daemon task state so
-                // Desktop, Web, and Mobile clients all park & restore native
-                // cursors consistently without cross-provider cursor errors.
-                {
-                    let mut state = self.task_state.lock();
-                    let mut switched = false;
-                    if let Some(stored_session) =
-                        state.sessions.iter_mut().find(|s| s.id == session_id)
-                    {
-                        let _ = self.task_store.hydrate(stored_session);
-                        if let Some(ref cur) = requested_cursor
-                            && cur.provider() != provider
-                            && stored_session.provider_cursor.is_none()
-                        {
-                            stored_session.provider_cursor = Some(cur.clone());
-                        }
-                        if stored_session.provider != provider {
-                            stored_session.switch_provider(provider);
-                            switched = true;
-                        }
-                        if requested_cursor
-                            .as_ref()
-                            .is_some_and(|cur| cur.provider() != provider)
-                        {
-                            requested_cursor = stored_session.provider_cursor.clone();
-                        } else if requested_cursor.is_none()
-                            && stored_session
-                                .provider_cursor
-                                .as_ref()
-                                .is_some_and(|cur| cur.provider() == provider)
-                        {
-                            requested_cursor = stored_session.provider_cursor.clone();
-                        }
-                    } else if requested_cursor
-                        .as_ref()
-                        .is_some_and(|cur| cur.provider() != provider)
-                    {
-                        requested_cursor = None;
-                    }
-                    if switched {
-                        state.mark_session_dirty(session_id);
-                        let _ = self.task_store.save(&mut state);
-                    }
-                }
-
-                let mcp_companion = crate::mcp_companion::companion_launch_for_session_with_provider(
-                    session_id,
-                    self.task_store.path(),
-                    &options.cwd,
-                    Some(provider),
-                    Some(self.settings.path()),
-                );
-                let cwd_for_loop = options.cwd.clone();
-                let settings_path_for_loop = self.settings.path().to_path_buf();
-                let auto_advisor_for_loop = self.auto_advisor.clone();
-                let scale_tracker_for_loop = self
-                    .scale_trackers
-                    .lock()
-                    .entry(session_id)
-                    .or_insert_with(|| {
-                        Arc::new(Mutex::new(
-                            crate::mcp_companion::SessionScaleTracker::new(),
-                        ))
-                    })
-                    .clone();
-                let options = DriverStartOptions {
-                    binary: options.binary,
-                    cwd: options.cwd,
-                    mode: decode_enum(&options.mode)?,
-                    model: options.model,
-                    reasoning_effort: options.reasoning_effort,
-                    service_tier: options.service_tier,
-                    context_window: options.context_window,
-                    agent_preset: options.agent_preset,
-                    computer_use_enabled: options.computer_use_enabled,
-                    provider_cursor: requested_cursor,
-                };
-                let (wake, _wake_events) = smol::channel::bounded(1);
-                let (event_sender, event_receiver) = driver::event_channel(wake);
-                let handle =
-                    driver::start_local_with_mcp(provider, options, mcp_companion, event_sender)?;
-                let supports_steer = handle.supports_steer();
-                let db_path_for_loop = self.task_store.path().to_path_buf();
-                // Keep a weak handle here so the event-forwarding thread cannot
-                // form an Arc cycle with the driver's event sender and keep
-                // child processes alive after CloseSession / Start / RemoveSession.
-                let driver_for_loop = handle.downgrade();
-                let turn_active = Arc::new(AtomicBool::new(false));
-                let turn_active_for_loop = turn_active.clone();
-                std::thread::Builder::new()
-                    .name(format!("waku-daemon-events-{session_id}"))
-                    .spawn(move || {
-                        let unix_now_secs = || {
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs() as i64
-                        };
-                        loop {
-                            if let Ok(claimed) = crate::mcp_companion::claim_pending_questions(
-                                &db_path_for_loop,
-                                session_id,
-                            ) {
-                                for (qid, questions) in claimed {
-                                    if let Ok(wire) = event_to_wire(DriverEvent::UserInputRequested {
-                                        request_id: format!(
-                                            "{}{qid}",
-                                            crate::mcp_companion::AGENTOS_QUESTION_PREFIX
-                                        ),
-                                        questions,
-                                    }) && events.send(wire).is_err()
-                                    {
-                                        return;
-                                    }
-                                }
-                            }
-                            match event_receiver.recv_timeout(std::time::Duration::from_millis(250))
-                            {
-                                Ok(event) => {
-                                    match &event {
-                                        DriverEvent::TurnStarted => {
-                                            turn_active_for_loop.store(true, Ordering::Release);
-                                            scale_tracker_for_loop.lock().observe_turn_started();
-                                        }
-                                        DriverEvent::TurnParked => {
-                                            scale_tracker_for_loop.lock().observe_turn_parked();
-                                        }
-                                        DriverEvent::TextDelta(delta) => {
-                                            scale_tracker_for_loop.lock().observe_text_delta(delta);
-                                        }
-                                        DriverEvent::Activity {
-                                            kind,
-                                            title,
-                                            complete: true,
-                                            ..
-                                        } => {
-                                            scale_tracker_for_loop.lock().observe_activity(
-                                                *kind,
-                                                None,
-                                                None,
-                                                title,
-                                                None,
-                                                false,
-                                                &[],
-                                                unix_now_secs(),
-                                            );
-                                        }
-                                        DriverEvent::RichActivity(item) if item.complete => {
-                                            let changes: Vec<(String, u64)> = item
-                                                .file_changes
-                                                .iter()
-                                                .map(|fc| {
-                                                    (
-                                                        fc.path.clone(),
-                                                        fc.additions
-                                                            .unwrap_or(0)
-                                                            .saturating_add(fc.deletions.unwrap_or(0)),
-                                                    )
-                                                })
-                                                .collect();
-                                            scale_tracker_for_loop.lock().observe_activity(
-                                                item.kind,
-                                                item.tool_name.as_deref(),
-                                                item.mcp_server.as_deref(),
-                                                &item.title,
-                                                item.display_target.as_deref(),
-                                                item.failed,
-                                                &changes,
-                                                unix_now_secs(),
-                                            );
-                                        }
-                                        DriverEvent::TurnFinished { .. } => {
-                                            turn_active_for_loop.store(false, Ordering::Release);
-                                        }
-                                        _ => {}
-                                    }
-                                    let turn_finished =
-                                        matches!(&event, DriverEvent::TurnFinished { .. });
-                                    let turn_succeeded = matches!(
-                                        &event,
-                                        DriverEvent::TurnFinished { success: true, .. }
-                                    );
-                                    let wire = event_to_wire(event).unwrap_or_else(|error| {
-                                        WireDriverEvent::new(
-                                            "error",
-                                            Value::String(format!(
-                                                "could not encode daemon event: {error}"
-                                            )),
-                                        )
-                                    });
-                                    if events.send(wire).is_err() {
-                                        break;
-                                    }
-                                    if turn_finished {
-                                        let mcp_settings = std::fs::read(&settings_path_for_loop)
-                                            .ok()
-                                            .and_then(|bytes| {
-                                                serde_json::from_slice::<
-                                                    waku_protocol::settings::DaemonSettings,
-                                                >(&bytes)
-                                                .ok()
-                                            })
-                                            .map(|s| s.agentos_mcp)
-                                            .unwrap_or_default();
-                                        let cooldown_secs = i64::from(
-                                            mcp_settings.advisor_auto_review_cooldown_minutes,
-                                        )
-                                        .saturating_mul(60);
-                                        if let Some(snapshot) = scale_tracker_for_loop
-                                            .lock()
-                                            .evaluate_on_turn_finished(
-                                                unix_now_secs(),
-                                                cooldown_secs,
-                                                turn_succeeded,
-                                            )
-                                            && mcp_settings.advisor_enabled
-                                            && mcp_settings.advisor_auto_review_enabled
-                                        {
-                                            auto_advisor_for_loop.enqueue(
-                                                crate::mcp_companion::AutoAdvisorReviewJob {
-                                                    session_id,
-                                                    db_path: db_path_for_loop.clone(),
-                                                    settings_path: settings_path_for_loop.clone(),
-                                                    cwd: cwd_for_loop.clone(),
-                                                    caller_provider: provider,
-                                                    snapshot,
-                                                },
-                                            );
-                                        }
-                                    }
-                                    if turn_succeeded
-                                        && let Some(driver) = driver_for_loop.upgrade()
-                                        && let Ok(Some((goal, next_prompt))) =
-                                            crate::mcp_companion::take_pending_goal_continuation(
-                                                &db_path_for_loop,
-                                                session_id,
-                                            )
-                                    {
-                                        if let Ok(goal_wire) =
-                                            event_to_wire(DriverEvent::GoalUpdated(Some(goal)))
-                                        {
-                                            let _ = events.send(goal_wire);
-                                        }
-                                        let mut continuation_prefixes = Vec::new();
-                                        if let Ok(Some(rot_pkg)) =
-                                            crate::mcp_companion::take_pending_context_rotation(
-                                                &db_path_for_loop,
-                                                session_id,
-                                            )
-                                        {
-                                            continuation_prefixes.push(rot_pkg);
-                                        }
-                                        if let Ok(Some(review_pkg)) =
-                                            crate::mcp_companion::take_pending_advisor_review(
-                                                &db_path_for_loop,
-                                                session_id,
-                                            )
-                                        {
-                                            continuation_prefixes.push(review_pkg);
-                                        }
-                                        let prompt_to_send = if continuation_prefixes.is_empty() {
-                                            next_prompt.clone()
-                                        } else {
-                                            format!(
-                                                "{}\n\n{next_prompt}",
-                                                continuation_prefixes.join("\n\n")
-                                            )
-                                        };
-                                        if let Ok(submit_wire) =
-                                            event_to_wire(DriverEvent::PromptSubmitted {
-                                                message: next_prompt,
-                                                turn_id: Uuid::new_v4(),
-                                                message_id: Uuid::new_v4(),
-                                            })
-                                        {
-                                            let _ = events.send(submit_wire);
-                                        }
-                                        scale_tracker_for_loop.lock().mark_goal_continuation();
-                                        turn_active_for_loop.store(true, Ordering::Release);
-                                        driver.prompt(prompt_to_send);
-                                    } else if turn_finished && provider != ProviderKind::Codex {
-                                        if let Ok(Some(goal)) =
-                                            crate::mcp_companion::current_session_goal(
-                                                &db_path_for_loop,
-                                                session_id,
-                                            )
-                                            && let Ok(goal_wire) =
-                                                event_to_wire(DriverEvent::GoalUpdated(Some(goal)))
-                                        {
-                                            let _ = events.send(goal_wire);
-                                        }
-                                    }
-                                }
-                                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                            }
-                        }
-                    })
-                    .context("could not start daemon event forwarding thread")?;
-                {
-                    let mut sessions = self.sessions.lock();
-                    if self.shutting_down.load(Ordering::Acquire) {
-                        drop(sessions);
-                        drop(handle);
-                        bail!("daemon is shutting down");
-                    }
-                    sessions.insert(session_id, (runtime_id, provider, handle, turn_active));
-                }
+                let supports_steer =
+                    self.start_session_driver(session_id, runtime_id, options, events)?;
                 Ok(ResponsePayload::Started { supports_steer })
             }
             Command::CloseSession => {
@@ -1195,7 +882,6 @@ impl Backend for WakuBackend {
                     }
                     (*active_provider, driver.clone(), turn_active.clone())
                 };
-                let mut command = command;
                 match &command {
                     Command::Cancel => {
                         turn_active.store(false, Ordering::Release);
@@ -1250,66 +936,18 @@ impl Backend for WakuBackend {
                     prompt,
                     turn_id,
                     message_id,
-                } = &mut command
+                } = command
                 {
-                    turn_active.store(true, Ordering::Release);
-                    self.scale_trackers
-                        .lock()
-                        .entry(session_id)
-                        .or_insert_with(|| {
-                            Arc::new(Mutex::new(
-                                crate::mcp_companion::SessionScaleTracker::new(),
-                            ))
-                        })
-                        .lock()
-                        .mark_human_prompt(prompt);
-                    // Publish the user's clean prompt into the runtime event
-                    // stream before prepending any one-shot cross-agent handoff
-                    // digest, context-rotation package, or background advisor review.
-                    events.send(event_to_wire(DriverEvent::PromptSubmitted {
-                        message: prompt.clone(),
-                        turn_id: turn_id.unwrap_or_else(Uuid::new_v4),
-                        message_id: message_id.unwrap_or_else(Uuid::new_v4),
-                    })?)?;
-
-                    let mut prefix_blocks = Vec::new();
-                    if let Ok(Some(rot_pkg)) = crate::mcp_companion::take_pending_context_rotation(
-                        self.task_store.path(),
+                    self.prepare_and_send_prompt(
                         session_id,
-                    ) {
-                        prefix_blocks.push(rot_pkg);
-                    }
-                    if let Ok(Some(review_pkg)) =
-                        crate::mcp_companion::take_pending_advisor_review(
-                            self.task_store.path(),
-                            session_id,
-                        )
-                    {
-                        prefix_blocks.push(review_pkg);
-                    }
-
-                    let handoff_seed = {
-                        let mut state = self.task_state.lock();
-                        if let Some(stored) =
-                            state.sessions.iter_mut().find(|s| s.id == session_id)
-                        {
-                            let _ = self.task_store.hydrate(stored);
-                            let taken = stored.take_pending_handoff_seed();
-                            if taken.is_some() {
-                                state.mark_session_dirty(session_id);
-                                let _ = self.task_store.save(&mut state);
-                            }
-                            taken
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some(seed) = handoff_seed {
-                        prefix_blocks.push(seed);
-                    }
-                    if !prefix_blocks.is_empty() {
-                        *prompt = format!("{}\n\n{prompt}", prefix_blocks.join("\n\n"));
-                    }
+                        &driver,
+                        &turn_active,
+                        &events,
+                        prompt,
+                        turn_id.unwrap_or_else(Uuid::new_v4),
+                        message_id.unwrap_or_else(Uuid::new_v4),
+                    )?;
+                    return Ok(ResponsePayload::Ack);
                 }
                 handle_driver_command(&driver, command)
             }
@@ -1326,6 +964,10 @@ impl Backend for WakuBackend {
         drop(sessions);
         let terminals = std::mem::take(&mut *self.terminals.lock());
         drop(terminals);
+    }
+
+    fn remote_mcp(&self) -> Option<&dyn crate::remote_mcp::RemoteMcpBackend> {
+        Some(self)
     }
 }
 
@@ -1351,7 +993,21 @@ fn session_projection_precedes(
         {
             incoming.sequence < existing.sequence
         }
-        (Some(_), None) if existing.status.is_busy() => true,
+        (Some(_), None)
+            if existing.status.is_busy()
+                || incoming.turns.len() < existing.turns.len()
+                || (incoming.turns.len() == existing.turns.len()
+                    && incoming.messages.len() < existing.messages.len()) =>
+        {
+            true
+        }
+        (Some(_), Some(_))
+            if incoming.turns.len() < existing.turns.len()
+                || (incoming.turns.len() == existing.turns.len()
+                    && incoming.messages.len() < existing.messages.len()) =>
+        {
+            true
+        }
         _ => incoming.updated_at < existing.updated_at,
     }
 }
@@ -2009,6 +1665,1255 @@ impl WakuBackend {
             .path
             .ok_or_else(|| anyhow!("{} is not installed on the daemon", provider.display_name()))
     }
+
+    fn start_session_driver(
+        &self,
+        session_id: Uuid,
+        runtime_id: Uuid,
+        options: crate::WireDriverStartOptions,
+        events: EventSink,
+    ) -> anyhow::Result<bool> {
+        let previous = self.sessions.lock().remove(&session_id);
+        drop(previous);
+        let provider = decode_enum(&options.provider)?;
+        let mut requested_cursor: Option<ProviderResumeCursor> = options
+            .provider_cursor
+            .map(serde_json::from_value)
+            .transpose()
+            .context("daemon received an invalid provider cursor")?;
+
+        // Reconcile cross-agent in-place handoff in daemon task state so
+        // Desktop, Web, and Mobile clients all park & restore native
+        // cursors consistently without cross-provider cursor errors.
+        {
+            let mut state = self.task_state.lock();
+            let mut switched = false;
+            if let Some(stored_session) =
+                state.sessions.iter_mut().find(|s| s.id == session_id)
+            {
+                let _ = self.task_store.hydrate(stored_session);
+                if let Some(ref cur) = requested_cursor
+                    && cur.provider() != provider
+                    && stored_session.provider_cursor.is_none()
+                {
+                    stored_session.provider_cursor = Some(cur.clone());
+                }
+                if stored_session.provider != provider {
+                    stored_session.switch_provider(provider);
+                    switched = true;
+                }
+                if requested_cursor
+                    .as_ref()
+                    .is_some_and(|cur| cur.provider() != provider)
+                {
+                    requested_cursor = stored_session.provider_cursor.clone();
+                } else if requested_cursor.is_none()
+                    && stored_session
+                        .provider_cursor
+                        .as_ref()
+                        .is_some_and(|cur| cur.provider() == provider)
+                {
+                    requested_cursor = stored_session.provider_cursor.clone();
+                }
+            } else if requested_cursor
+                .as_ref()
+                .is_some_and(|cur| cur.provider() != provider)
+            {
+                requested_cursor = None;
+            }
+            if switched {
+                state.mark_session_dirty(session_id);
+                let _ = self.task_store.save(&mut state);
+            }
+        }
+
+        let mcp_companion = crate::mcp_companion::companion_launch_for_session_with_provider(
+            session_id,
+            self.task_store.path(),
+            &options.cwd,
+            Some(provider),
+            Some(self.settings.path()),
+        );
+        let cwd_for_loop = options.cwd.clone();
+        let settings_path_for_loop = self.settings.path().to_path_buf();
+        let auto_advisor_for_loop = self.auto_advisor.clone();
+        let scale_tracker_for_loop = self
+            .scale_trackers
+            .lock()
+            .entry(session_id)
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(
+                    crate::mcp_companion::SessionScaleTracker::new(),
+                ))
+            })
+            .clone();
+        let options = DriverStartOptions {
+            binary: options.binary,
+            cwd: options.cwd,
+            mode: decode_enum(&options.mode)?,
+            model: options.model,
+            reasoning_effort: options.reasoning_effort,
+            service_tier: options.service_tier,
+            context_window: options.context_window,
+            agent_preset: options.agent_preset,
+            computer_use_enabled: options.computer_use_enabled,
+            provider_cursor: requested_cursor,
+        };
+        let (wake, _wake_events) = smol::channel::bounded(1);
+        let (event_sender, event_receiver) = driver::event_channel(wake);
+        let handle =
+            driver::start_local_with_mcp(provider, options, mcp_companion, event_sender)?;
+        let supports_steer = handle.supports_steer();
+        let db_path_for_loop = self.task_store.path().to_path_buf();
+        // Keep a weak handle here so the event-forwarding thread cannot
+        // form an Arc cycle with the driver's event sender and keep
+        // child processes alive after CloseSession / Start / RemoveSession.
+        let driver_for_loop = handle.downgrade();
+        let turn_active = Arc::new(AtomicBool::new(false));
+        let turn_active_for_loop = turn_active.clone();
+        std::thread::Builder::new()
+            .name(format!("waku-daemon-events-{session_id}"))
+            .spawn(move || {
+                let unix_now_secs = || {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64
+                };
+                loop {
+                    if let Ok(claimed) = crate::mcp_companion::claim_pending_questions(
+                        &db_path_for_loop,
+                        session_id,
+                    ) {
+                        for (qid, questions) in claimed {
+                            if let Ok(wire) = event_to_wire(DriverEvent::UserInputRequested {
+                                request_id: format!(
+                                    "{}{qid}",
+                                    crate::mcp_companion::AGENTOS_QUESTION_PREFIX
+                                ),
+                                questions,
+                            }) && events.send(wire).is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    match event_receiver.recv_timeout(std::time::Duration::from_millis(250)) {
+                        Ok(event) => {
+                            match &event {
+                                DriverEvent::TurnStarted => {
+                                    turn_active_for_loop.store(true, Ordering::Release);
+                                    scale_tracker_for_loop.lock().observe_turn_started();
+                                }
+                                DriverEvent::TurnParked => {
+                                    scale_tracker_for_loop.lock().observe_turn_parked();
+                                }
+                                DriverEvent::TextDelta(delta) => {
+                                    scale_tracker_for_loop.lock().observe_text_delta(delta);
+                                }
+                                DriverEvent::Activity {
+                                    kind,
+                                    title,
+                                    complete: true,
+                                    ..
+                                } => {
+                                    scale_tracker_for_loop.lock().observe_activity(
+                                        *kind,
+                                        None,
+                                        None,
+                                        title,
+                                        None,
+                                        false,
+                                        &[],
+                                        unix_now_secs(),
+                                    );
+                                }
+                                DriverEvent::RichActivity(item) if item.complete => {
+                                    let changes: Vec<(String, u64)> = item
+                                        .file_changes
+                                        .iter()
+                                        .map(|fc| {
+                                            (
+                                                fc.path.clone(),
+                                                fc.additions
+                                                    .unwrap_or(0)
+                                                    .saturating_add(fc.deletions.unwrap_or(0)),
+                                            )
+                                        })
+                                        .collect();
+                                    scale_tracker_for_loop.lock().observe_activity(
+                                        item.kind,
+                                        item.tool_name.as_deref(),
+                                        item.mcp_server.as_deref(),
+                                        &item.title,
+                                        item.display_target.as_deref(),
+                                        item.failed,
+                                        &changes,
+                                        unix_now_secs(),
+                                    );
+                                }
+                                DriverEvent::TurnFinished { .. } | DriverEvent::ProcessExited => {
+                                    turn_active_for_loop.store(false, Ordering::Release);
+                                }
+                                _ => {}
+                            }
+                            let turn_finished =
+                                matches!(&event, DriverEvent::TurnFinished { .. });
+                            let turn_succeeded = matches!(
+                                &event,
+                                DriverEvent::TurnFinished { success: true, .. }
+                            );
+                            let wire = event_to_wire(event).unwrap_or_else(|error| {
+                                WireDriverEvent::new(
+                                    "error",
+                                    Value::String(format!(
+                                        "could not encode daemon event: {error}"
+                                    )),
+                                )
+                            });
+                            if events.send(wire).is_err() {
+                                break;
+                            }
+                            if turn_finished {
+                                let mcp_settings = std::fs::read(&settings_path_for_loop)
+                                    .ok()
+                                    .and_then(|bytes| {
+                                        serde_json::from_slice::<
+                                            waku_protocol::settings::DaemonSettings,
+                                        >(&bytes)
+                                        .ok()
+                                    })
+                                    .map(|s| s.agentos_mcp)
+                                    .unwrap_or_default();
+                                let cooldown_secs = i64::from(
+                                    mcp_settings.advisor_auto_review_cooldown_minutes,
+                                )
+                                .saturating_mul(60);
+                                if let Some(snapshot) = scale_tracker_for_loop
+                                    .lock()
+                                    .evaluate_on_turn_finished(
+                                        unix_now_secs(),
+                                        cooldown_secs,
+                                        turn_succeeded,
+                                    )
+                                    && mcp_settings.advisor_enabled
+                                    && mcp_settings.advisor_auto_review_enabled
+                                {
+                                    auto_advisor_for_loop.enqueue(
+                                        crate::mcp_companion::AutoAdvisorReviewJob {
+                                            session_id,
+                                            db_path: db_path_for_loop.clone(),
+                                            settings_path: settings_path_for_loop.clone(),
+                                            cwd: cwd_for_loop.clone(),
+                                            caller_provider: provider,
+                                            snapshot,
+                                        },
+                                    );
+                                }
+                            }
+                            if turn_succeeded
+                                && let Some(driver) = driver_for_loop.upgrade()
+                                && let Ok(Some((goal, next_prompt))) =
+                                    crate::mcp_companion::take_pending_goal_continuation(
+                                        &db_path_for_loop,
+                                        session_id,
+                                    )
+                            {
+                                if let Ok(goal_wire) =
+                                    event_to_wire(DriverEvent::GoalUpdated(Some(goal)))
+                                {
+                                    let _ = events.send(goal_wire);
+                                }
+                                let mut continuation_prefixes = Vec::new();
+                                if let Ok(Some(rot_pkg)) =
+                                    crate::mcp_companion::take_pending_context_rotation(
+                                        &db_path_for_loop,
+                                        session_id,
+                                    )
+                                {
+                                    continuation_prefixes.push(rot_pkg);
+                                }
+                                if let Ok(Some(review_pkg)) =
+                                    crate::mcp_companion::take_pending_advisor_review(
+                                        &db_path_for_loop,
+                                        session_id,
+                                    )
+                                {
+                                    continuation_prefixes.push(review_pkg);
+                                }
+                                let prompt_to_send = if continuation_prefixes.is_empty() {
+                                    next_prompt.clone()
+                                } else {
+                                    format!(
+                                        "{}\n\n{next_prompt}",
+                                        continuation_prefixes.join("\n\n")
+                                    )
+                                };
+                                if let Ok(submit_wire) =
+                                    event_to_wire(DriverEvent::PromptSubmitted {
+                                        message: next_prompt,
+                                        turn_id: Uuid::new_v4(),
+                                        message_id: Uuid::new_v4(),
+                                    })
+                                {
+                                    let _ = events.send(submit_wire);
+                                }
+                                scale_tracker_for_loop.lock().mark_goal_continuation();
+                                turn_active_for_loop.store(true, Ordering::Release);
+                                driver.prompt(prompt_to_send);
+                            } else if turn_finished && provider != ProviderKind::Codex {
+                                if let Ok(Some(goal)) =
+                                    crate::mcp_companion::current_session_goal(
+                                        &db_path_for_loop,
+                                        session_id,
+                                    )
+                                    && let Ok(goal_wire) =
+                                        event_to_wire(DriverEvent::GoalUpdated(Some(goal)))
+                                {
+                                    let _ = events.send(goal_wire);
+                                }
+                            }
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            })
+            .context("could not start daemon event forwarding thread")?;
+        {
+            let mut sessions = self.sessions.lock();
+            if self.shutting_down.load(Ordering::Acquire) {
+                drop(sessions);
+                drop(handle);
+                bail!("daemon is shutting down");
+            }
+            sessions.insert(session_id, (runtime_id, provider, handle, turn_active));
+        }
+        Ok(supports_steer)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_and_send_prompt(
+        &self,
+        session_id: Uuid,
+        driver: &DriverHandle,
+        turn_active: &Arc<AtomicBool>,
+        events: &EventSink,
+        mut prompt: String,
+        turn_id: Uuid,
+        message_id: Uuid,
+    ) -> anyhow::Result<()> {
+        turn_active.store(true, Ordering::Release);
+        self.scale_trackers
+            .lock()
+            .entry(session_id)
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(
+                    crate::mcp_companion::SessionScaleTracker::new(),
+                ))
+            })
+            .lock()
+            .mark_human_prompt(&prompt);
+        // Publish the user's clean prompt into the runtime event stream before
+        // prepending any one-shot handoff digest, context-rotation package, or
+        // background advisor review.
+        events.send(event_to_wire(DriverEvent::PromptSubmitted {
+            message: prompt.clone(),
+            turn_id,
+            message_id,
+        })?)?;
+
+        let mut prefix_blocks = Vec::new();
+        if let Ok(Some(rot_pkg)) = crate::mcp_companion::take_pending_context_rotation(
+            self.task_store.path(),
+            session_id,
+        ) {
+            prefix_blocks.push(rot_pkg);
+        }
+        if let Ok(Some(review_pkg)) = crate::mcp_companion::take_pending_advisor_review(
+            self.task_store.path(),
+            session_id,
+        ) {
+            prefix_blocks.push(review_pkg);
+        }
+
+        let handoff_seed = {
+            let mut state = self.task_state.lock();
+            if let Some(stored) = state.sessions.iter_mut().find(|s| s.id == session_id) {
+                let _ = self.task_store.hydrate(stored);
+                let taken = stored.take_pending_handoff_seed();
+                if taken.is_some() {
+                    state.mark_session_dirty(session_id);
+                    let _ = self.task_store.save(&mut state);
+                }
+                taken
+            } else {
+                None
+            }
+        };
+        if let Some(seed) = handoff_seed {
+            prefix_blocks.push(seed);
+        }
+        if !prefix_blocks.is_empty() {
+            prompt = format!("{}\n\n{prompt}", prefix_blocks.join("\n\n"));
+        }
+        driver.prompt(prompt);
+        Ok(())
+    }
+}
+
+impl crate::remote_mcp::RemoteMcpBackend for WakuBackend {
+    fn remote_mcp_settings(&self) -> waku_protocol::settings::RemoteMcpSettings {
+        self.settings.get().remote_mcp
+    }
+
+    fn list_projects_and_sessions(&self) -> anyhow::Result<(Vec<Project>, Vec<AgentSession>, PathBuf)> {
+        let state = self.task_state.lock();
+        Ok((
+            state.projects.clone(),
+            state
+                .sessions
+                .iter()
+                .map(AgentSession::list_projection)
+                .collect(),
+            self.default_cwd.clone(),
+        ))
+    }
+
+    fn hydrate_session_by_id(&self, session_id: Uuid) -> anyhow::Result<Option<AgentSession>> {
+        let pinned = self.sessions.lock().keys().copied().collect();
+        let mut state = self.task_state.lock();
+        let session = if let Some(session) = state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        {
+            self.task_store.hydrate(session)?;
+            Some(session.clone())
+        } else {
+            None
+        };
+        trim_resident_transcripts(&mut state, &pinned);
+        Ok(session)
+    }
+
+    fn resolve_legacy_session_id(&self, legacy_id: i64) -> anyhow::Result<Option<Uuid>> {
+        use rusqlite::OptionalExtension as _;
+        let Ok(conn) = crate::mcp_companion::open_mcp_connection(self.task_store.path()) else {
+            return Ok(None);
+        };
+        let mapped: Option<String> = conn
+            .query_row(
+                "SELECT session_id FROM agentos_legacy_session_map WHERE legacy_id = ?1",
+                rusqlite::params![legacy_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(mapped.and_then(|s| Uuid::parse_str(&s).ok()))
+    }
+
+    fn search_session_messages(
+        &self,
+        query: String,
+        limit: usize,
+    ) -> anyhow::Result<Vec<waku_protocol::persistence::SessionMessageMatch>> {
+        self.task_store
+            .session_message_search(query, limit)()
+            .map_err(Into::into)
+    }
+
+    fn create_session(
+        &self,
+        params: crate::remote_mcp::CreateSessionParams,
+    ) -> anyhow::Result<(Project, AgentSession)> {
+        let pinned = self.sessions.lock().keys().copied().collect();
+        let mut state = self.task_state.lock();
+        let project = if let Some(pid) = params.project_id {
+            state
+                .projects
+                .iter()
+                .find(|p| p.id == pid)
+                .cloned()
+                .ok_or_else(|| anyhow!("project {pid} not found"))?
+        } else if let Some(path) = params.project_path {
+            if let Some(existing) = state.projects.iter().find(|p| p.path == path).cloned() {
+                existing
+            } else {
+                if !path.is_dir() {
+                    bail!("project_path {} does not exist or is not a directory", path.display());
+                }
+                let created = Project::from_path(path);
+                state.projects.push(created.clone());
+                created
+            }
+        } else if let Some(first) = state.projects.first().cloned() {
+            first
+        } else {
+            let created = Project::from_path(self.default_cwd.clone());
+            state.projects.push(created.clone());
+            created
+        };
+
+        let provider = params.provider.unwrap_or(ProviderKind::Codex);
+        let mut session = AgentSession::new(project.id, provider);
+        if let Some(model) = params.model {
+            session.model = Some(model);
+        }
+        if let Some(mode) = params.runtime_mode {
+            session.runtime_mode = mode;
+        }
+        if let Some(title) = params.title {
+            session.title = title;
+        }
+        state.push_session(session.clone());
+        self.task_store
+            .save(&mut state)
+            .context("could not save newly created session")?;
+        trim_resident_transcripts(&mut state, &pinned);
+        Ok((project, session))
+    }
+
+    fn submit_prompt_in_mailbox(
+        &self,
+        session_id: Uuid,
+        active_runtime_id: &mut Option<Uuid>,
+        hub: &Arc<crate::server::Hub>,
+        params: crate::remote_mcp::SubmitPromptParams,
+    ) -> anyhow::Result<crate::remote_mcp::SubmitPromptOutcome> {
+        if let Some(ref key) = params.idempotency_key
+            && let Some(cached) = self.prompt_idempotency.get(session_id, key)
+        {
+            return Ok(cached);
+        }
+
+        let existing = {
+            let sessions = self.sessions.lock();
+            sessions
+                .get(&session_id)
+                .map(|(rid, _, driver, turn_active)| (*rid, driver.clone(), turn_active.clone()))
+        };
+
+        let (runtime_id, driver, turn_active) = if let Some((rid, driver, turn_active)) = existing {
+            *active_runtime_id = Some(rid);
+            if turn_active.load(Ordering::Acquire) {
+                if params.steer {
+                    if !driver.supports_steer() {
+                        return Ok(crate::remote_mcp::SubmitPromptOutcome {
+                            session_id,
+                            runtime_id: rid,
+                            turn_id: None,
+                            message_id: None,
+                            status: "busy".into(),
+                            accepted: false,
+                            deduplicated: false,
+                            detail: Some(
+                                "session is busy and its provider does not support steering".into(),
+                            ),
+                        });
+                    }
+                    driver.steer(params.prompt);
+                    let outcome = crate::remote_mcp::SubmitPromptOutcome {
+                        session_id,
+                        runtime_id: rid,
+                        turn_id: None,
+                        message_id: None,
+                        status: "steered".into(),
+                        accepted: true,
+                        deduplicated: false,
+                        detail: None,
+                    };
+                    if let Some(key) = params.idempotency_key {
+                        self.prompt_idempotency
+                            .insert(session_id, key, outcome.clone());
+                    }
+                    return Ok(outcome);
+                }
+                return Ok(crate::remote_mcp::SubmitPromptOutcome {
+                    session_id,
+                    runtime_id: rid,
+                    turn_id: None,
+                    message_id: None,
+                    status: "busy".into(),
+                    accepted: false,
+                    deduplicated: false,
+                    detail: Some(
+                        "session is currently running a turn; pass steer=true, call wait_for_turn, or cancel_session"
+                            .into(),
+                    ),
+                });
+            }
+            (rid, driver, turn_active)
+        } else {
+            let (session, cwd) = {
+                let mut state = self.task_state.lock();
+                let Some(idx) = state.sessions.iter().position(|s| s.id == session_id) else {
+                    bail!("session {session_id} not found");
+                };
+                self.task_store.hydrate(&mut state.sessions[idx])?;
+                let session = state.sessions[idx].clone();
+                let project = state
+                    .projects
+                    .iter()
+                    .find(|p| p.id == session.project_id)
+                    .ok_or_else(|| anyhow!("project for session {session_id} not found"))?;
+                let cwd = session.workspace.path().unwrap_or(&project.path).to_owned();
+                (session, cwd)
+            };
+
+            let binary = self.provider_binary(session.provider)?;
+            let new_runtime_id = Uuid::new_v4();
+            let wire_options = crate::WireDriverStartOptions {
+                provider: encode_enum(session.provider)?,
+                binary,
+                cwd,
+                mode: encode_enum(session.runtime_mode)?,
+                model: session.model.clone(),
+                reasoning_effort: session.reasoning_effort.clone(),
+                service_tier: session.service_tier.clone(),
+                context_window: session.context_window.clone(),
+                agent_preset: session.agent_preset.clone(),
+                computer_use_enabled: false,
+                provider_cursor: session
+                    .provider_cursor
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()?,
+            };
+            hub.begin_runtime(session_id, new_runtime_id);
+            if let Err(error) = self.start_session_driver(
+                session_id,
+                new_runtime_id,
+                wire_options,
+                hub.event_sink(session_id, new_runtime_id),
+            ) {
+                hub.end_runtime(session_id, Some(new_runtime_id));
+                return Err(error);
+            }
+            *active_runtime_id = Some(new_runtime_id);
+            let sessions = self.sessions.lock();
+            let (rid, _, driver, turn_active) = sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("session runtime disappeared immediately after start"))?;
+            (*rid, driver.clone(), turn_active.clone())
+        };
+
+        let turn_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        // Make the accepted user prompt durable in SQLite before acknowledging.
+        {
+            let pinned = self.sessions.lock().keys().copied().collect();
+            let mut state = self.task_state.lock();
+            if let Some(stored) = state.sessions.iter_mut().find(|s| s.id == session_id) {
+                let _ = self.task_store.hydrate(stored);
+                if stored.adopt_submitted_prompt(&params.prompt, turn_id, message_id) {
+                    state.mark_session_dirty(session_id);
+                    let _ = self.task_store.save(&mut state);
+                }
+            }
+            trim_resident_transcripts(&mut state, &pinned);
+        }
+        hub.broadcast_task_state_changed_all();
+
+        let events = hub.event_sink(session_id, runtime_id);
+        self.prepare_and_send_prompt(
+            session_id,
+            &driver,
+            &turn_active,
+            &events,
+            params.prompt,
+            turn_id,
+            message_id,
+        )?;
+
+        let outcome = crate::remote_mcp::SubmitPromptOutcome {
+            session_id,
+            runtime_id,
+            turn_id: Some(turn_id),
+            message_id: Some(message_id),
+            status: "running".into(),
+            accepted: true,
+            deduplicated: false,
+            detail: None,
+        };
+        if let Some(key) = params.idempotency_key {
+            self.prompt_idempotency
+                .insert(session_id, key, outcome.clone());
+        }
+        Ok(outcome)
+    }
+
+    fn cancel_session_in_mailbox(
+        &self,
+        session_id: Uuid,
+        _active_runtime_id: Option<Uuid>,
+        hub: &Arc<crate::server::Hub>,
+    ) -> anyhow::Result<bool> {
+        let found = {
+            let sessions = self.sessions.lock();
+            sessions
+                .get(&session_id)
+                .map(|(rid, provider, driver, turn_active)| {
+                    (*rid, *provider, driver.clone(), turn_active.clone())
+                })
+        };
+        let Some((runtime_id, provider, driver, turn_active)) = found else {
+            return Ok(false);
+        };
+        turn_active.store(false, Ordering::Release);
+        let _ = crate::mcp_companion::cancel_pending_questions(self.task_store.path(), session_id);
+        if let Ok(Some(paused_goal)) =
+            crate::mcp_companion::pause_active_goal_on_cancel(self.task_store.path(), session_id)
+            && provider != ProviderKind::Codex
+        {
+            let events = hub.event_sink(session_id, runtime_id);
+            let _ = events.send(event_to_wire(DriverEvent::GoalUpdated(Some(paused_goal)))?);
+        }
+        driver.cancel();
+        Ok(true)
+    }
+
+    fn respond_permission_in_mailbox(
+        &self,
+        session_id: Uuid,
+        runtime_id: Uuid,
+        request_id: String,
+        option_id: String,
+        _hub: &Arc<crate::server::Hub>,
+    ) -> anyhow::Result<()> {
+        let driver = {
+            let sessions = self.sessions.lock();
+            let (active_runtime_id, _, driver, _) = sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("daemon session {session_id} is not running"))?;
+            if *active_runtime_id != runtime_id {
+                bail!(
+                    "daemon session {session_id} belongs to runtime {active_runtime_id}, not {runtime_id}"
+                );
+            }
+            driver.clone()
+        };
+        driver.respond(request_id, option_id);
+        Ok(())
+    }
+
+    fn respond_user_input_in_mailbox(
+        &self,
+        session_id: Uuid,
+        runtime_id: Uuid,
+        request_id: String,
+        answers: Vec<waku_protocol::model::UserInputAnswer>,
+        _hub: &Arc<crate::server::Hub>,
+    ) -> anyhow::Result<()> {
+        let driver = {
+            let sessions = self.sessions.lock();
+            let (active_runtime_id, _, driver, _) = sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("daemon session {session_id} is not running"))?;
+            if *active_runtime_id != runtime_id {
+                bail!(
+                    "daemon session {session_id} belongs to runtime {active_runtime_id}, not {runtime_id}"
+                );
+            }
+            driver.clone()
+        };
+        if let Some(qid) = request_id.strip_prefix(crate::mcp_companion::AGENTOS_QUESTION_PREFIX) {
+            crate::mcp_companion::resolve_pending_question(self.task_store.path(), qid, &answers)?;
+            return Ok(());
+        }
+        driver.respond_user_input(request_id, answers);
+        Ok(())
+    }
+
+    fn persist_scribe_event(
+        &self,
+        event: &crate::SequencedEvent,
+        driver_event: &DriverEvent,
+        stream_phase: &mut Option<crate::remote_mcp::ScribeStreamPhase>,
+        flush_now: bool,
+    ) -> anyhow::Result<bool> {
+        let pinned = self.sessions.lock().keys().copied().collect();
+        let mut state = self.task_state.lock();
+        let Some(idx) = state
+            .sessions
+            .iter()
+            .position(|session| session.id == event.session_id)
+        else {
+            return Ok(false);
+        };
+        let _ = self.task_store.hydrate(&mut state.sessions[idx]);
+        let session = &mut state.sessions[idx];
+
+        let catalog_changed = apply_scribe_driver_event(session, driver_event, stream_phase);
+        session.runtime_event_cursor = Some(waku_protocol::model::RuntimeEventCursor {
+            runtime_id: event.runtime_id,
+            epoch: event.epoch,
+            sequence: event.sequence,
+        });
+        state.mark_session_dirty(event.session_id);
+        if flush_now {
+            self.task_store.save(&mut state)?;
+            trim_resident_transcripts(&mut state, &pinned);
+        }
+        Ok(catalog_changed)
+    }
+
+    fn flush_scribe_session(&self, _session_id: Uuid) -> anyhow::Result<()> {
+        let pinned = self.sessions.lock().keys().copied().collect();
+        let mut state = self.task_state.lock();
+        self.task_store.save(&mut state)?;
+        trim_resident_transcripts(&mut state, &pinned);
+        Ok(())
+    }
+
+    fn active_runtime_for(&self, session_id: Uuid) -> Option<(Uuid, bool)> {
+        self.sessions
+            .lock()
+            .get(&session_id)
+            .map(|(rid, _, _, turn_active)| (*rid, turn_active.load(Ordering::Acquire)))
+    }
+}
+
+fn scribe_unix_time() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn scribe_unix_time_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn scribe_finish_streaming_assistant(session: &mut AgentSession) {
+    for message in &mut session.messages {
+        if message.role == crate::model::MessageRole::Assistant && message.streaming {
+            message.streaming = false;
+        }
+    }
+}
+
+fn scribe_complete_reasoning_activity(session: &mut AgentSession) {
+    if let Some(reasoning) = session
+        .transcript_blocks
+        .iter_mut()
+        .rev()
+        .flat_map(|block| block.activities.iter_mut().rev())
+        .find(|activity| activity.reasoning.is_some() && !activity.complete)
+    {
+        reasoning.complete = true;
+        session.updated_at = scribe_unix_time();
+    }
+}
+
+fn scribe_complete_turn_blocks(session: &mut AgentSession) {
+    for block in &mut session.transcript_blocks {
+        for activity in &mut block.activities {
+            activity.complete = true;
+        }
+    }
+}
+
+fn scribe_push_activity(
+    session: &mut AgentSession,
+    item: crate::model::ActivityItem,
+    continuing_work: bool,
+) {
+    let after_message = session.messages.len();
+    let turn_id = session.active_turn_id();
+    if continuing_work
+        && let Some(block) = session.transcript_blocks.last_mut()
+        && block.after_message == after_message
+        && block.turn_id == turn_id
+    {
+        block.activities.push(item);
+    } else {
+        session.transcript_blocks.push(crate::model::TranscriptBlock {
+            after_message,
+            turn_id,
+            activities: vec![item],
+        });
+    }
+}
+
+fn scribe_session_accepts_output(session: &mut AgentSession) -> bool {
+    if session.active_turn_id().is_none() || !session.status.is_busy() {
+        return false;
+    }
+    session.mark_active_turn_provider_started();
+    if session.status == SessionStatus::Connecting {
+        session.status = SessionStatus::Working;
+    }
+    true
+}
+
+fn scribe_turn_has_assistant_message(session: &AgentSession) -> bool {
+    let Some(turn_id) = session.active_turn_id() else {
+        return false;
+    };
+    session.messages.iter().any(|message| {
+        message.role == crate::model::MessageRole::Assistant && message.turn_id == Some(turn_id)
+    })
+}
+
+/// Mirror Desktop's `handle_driver_event` session-state reducer on the daemon
+/// so headless turns started or continued without an attached UI persist the
+/// exact same transcript structure, cursors, and status transitions.
+fn apply_scribe_driver_event(
+    session: &mut AgentSession,
+    event: &DriverEvent,
+    stream_phase: &mut Option<crate::remote_mcp::ScribeStreamPhase>,
+) -> bool {
+    use crate::model::{ActivityItem, ContextUsage, Message, MessageRole, ReasoningBlock, TurnStatus};
+    use crate::remote_mcp::ScribeStreamPhase;
+
+    let mut catalog_changed = false;
+    match event {
+        DriverEvent::Connected { provider_cursor } => {
+            if let Some(ProviderResumeCursor::Claude {
+                resume_at: Some(message_id),
+                ..
+            }) = provider_cursor
+            {
+                session.mark_active_turn_provider_resume_at(message_id.clone());
+            }
+            session.provider_cursor = provider_cursor.clone();
+            if session.status == SessionStatus::Connecting {
+                session.status = SessionStatus::Working;
+                catalog_changed = true;
+            }
+        }
+        DriverEvent::AgentPresetSelected(preset) => {
+            session.agent_preset = preset.clone();
+        }
+        DriverEvent::AutoTitleUpdated(title) => {
+            session.set_auto_title(title.clone());
+            catalog_changed = true;
+        }
+        DriverEvent::AvailableCommands(names) => {
+            session.available_commands = names.clone();
+        }
+        DriverEvent::PromptSubmitted {
+            message,
+            turn_id,
+            message_id,
+        } => {
+            if session.adopt_submitted_prompt(message, *turn_id, *message_id) {
+                catalog_changed = true;
+            }
+        }
+        DriverEvent::TurnStarted => {
+            if session.active_turn_id().is_some() {
+                session.mark_active_turn_provider_started();
+                if session.status != SessionStatus::Working {
+                    session.status = SessionStatus::Working;
+                    catalog_changed = true;
+                }
+            } else if matches!(
+                session.provider,
+                ProviderKind::Codex
+                    | ProviderKind::Claude
+                    | ProviderKind::OpenCode
+                    | ProviderKind::Antigravity
+            ) {
+                session.begin_provider_turn();
+                session.mark_active_turn_provider_started();
+                session.status = SessionStatus::Working;
+                catalog_changed = true;
+            }
+        }
+        DriverEvent::TurnParked => {
+            if session.active_turn_id().is_some() {
+                scribe_finish_streaming_assistant(session);
+                scribe_complete_turn_blocks(session);
+                *stream_phase = None;
+                session.status = SessionStatus::Background;
+                session.updated_at = scribe_unix_time();
+                catalog_changed = true;
+            }
+        }
+        DriverEvent::TextDelta(delta) => {
+            if scribe_session_accepts_output(session) {
+                let prev = *stream_phase;
+                if prev == Some(ScribeStreamPhase::Reasoning) {
+                    scribe_complete_reasoning_activity(session);
+                }
+                let continuing = prev == Some(ScribeStreamPhase::Text);
+                if !continuing {
+                    scribe_finish_streaming_assistant(session);
+                }
+                let existing = continuing.then(|| {
+                    session
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| m.role == MessageRole::Assistant && m.streaming)
+                });
+                if let Some(Some(message)) = existing {
+                    message.content.push_str(delta);
+                } else {
+                    let mut message = session
+                        .active_turn_id()
+                        .map(|tid| Message::new_for_turn(MessageRole::Assistant, delta.clone(), tid))
+                        .unwrap_or_else(|| Message::new(MessageRole::Assistant, delta.clone()))
+                        .with_provider(Some(session.provider));
+                    message.streaming = true;
+                    session.messages.push(message);
+                }
+                session.updated_at = scribe_unix_time();
+                *stream_phase = Some(ScribeStreamPhase::Text);
+            }
+        }
+        DriverEvent::ReasoningDelta(delta) => {
+            if scribe_session_accepts_output(session) {
+                let prev = *stream_phase;
+                let continuing = prev == Some(ScribeStreamPhase::Reasoning);
+                if continuing || !delta.trim().is_empty() {
+                    let now = scribe_unix_time_millis();
+                    if !continuing {
+                        scribe_finish_streaming_assistant(session);
+                    }
+                    if continuing
+                        && let Some(reasoning) = session
+                            .transcript_blocks
+                            .last_mut()
+                            .and_then(|b| b.activities.last_mut())
+                            .and_then(|a| a.reasoning.as_mut())
+                    {
+                        reasoning.content.push_str(delta);
+                        reasoning.finished_at_ms = now;
+                    } else {
+                        scribe_push_activity(
+                            session,
+                            ActivityItem::from_reasoning(
+                                ReasoningBlock {
+                                    content: delta.clone(),
+                                    started_at_ms: now,
+                                    finished_at_ms: now,
+                                },
+                                false,
+                            ),
+                            matches!(
+                                prev,
+                                Some(ScribeStreamPhase::Reasoning | ScribeStreamPhase::Activity)
+                            ),
+                        );
+                    }
+                    session.updated_at = scribe_unix_time();
+                    *stream_phase = Some(ScribeStreamPhase::Reasoning);
+                }
+            }
+        }
+        DriverEvent::Activity {
+            id,
+            kind,
+            title,
+            detail,
+            complete,
+        } => {
+            if scribe_session_accepts_output(session) {
+                let item = ActivityItem::new(
+                    id.clone(),
+                    *kind,
+                    title.clone(),
+                    detail.clone(),
+                    *complete,
+                );
+                scribe_upsert_activity(session, stream_phase, item);
+            }
+        }
+        DriverEvent::RichActivity(item) => {
+            if scribe_session_accepts_output(session) {
+                scribe_upsert_activity(session, stream_phase, item.clone());
+            }
+        }
+        DriverEvent::Permission { .. } => {
+            if scribe_session_accepts_output(session) && session.status != SessionStatus::Waiting {
+                session.status = SessionStatus::Waiting;
+                catalog_changed = true;
+            }
+        }
+        DriverEvent::UserInputRequested { questions, .. } => {
+            if scribe_session_accepts_output(session)
+                && !questions.is_empty()
+                && session.status != SessionStatus::Waiting
+            {
+                session.status = SessionStatus::Waiting;
+                catalog_changed = true;
+            }
+        }
+        DriverEvent::SteerAccepted { message } => {
+            session.push_user_message_with_presentation(message.clone(), None, Vec::new());
+            session.updated_at = scribe_unix_time();
+        }
+        DriverEvent::GoalUpdated(goal) => {
+            if let Some(goal) = goal
+                && session.messages.is_empty()
+            {
+                session.set_title_from_prompt(&goal.objective);
+                catalog_changed = true;
+            }
+            session.thread_goal = goal.clone();
+        }
+        DriverEvent::UsageUpdated {
+            context_tokens,
+            context_window,
+        } => {
+            let usage = session.context_usage.get_or_insert(ContextUsage::default());
+            if let Some(tokens) = context_tokens {
+                usage.tokens = *tokens;
+            }
+            if let Some(window) = context_window {
+                usage.window = Some(*window);
+            }
+        }
+        DriverEvent::TurnFinished { success, summary } => {
+            if session.active_turn_id().is_some() {
+                scribe_finish_streaming_assistant(session);
+                scribe_complete_turn_blocks(session);
+                *stream_phase = None;
+                let needs_fallback = !scribe_turn_has_assistant_message(session);
+                session.status = if *success {
+                    SessionStatus::Idle
+                } else {
+                    SessionStatus::Failed
+                };
+                if needs_fallback {
+                    session.push_message(
+                        MessageRole::Assistant,
+                        summary.clone().unwrap_or_else(|| {
+                            if *success {
+                                "Turn completed.".into()
+                            } else {
+                                "Stopped before response.".into()
+                            }
+                        }),
+                    );
+                }
+                session.finish_active_turn(if *success {
+                    TurnStatus::Completed
+                } else {
+                    TurnStatus::Failed
+                });
+                session.updated_at = scribe_unix_time();
+                catalog_changed = true;
+            }
+        }
+        DriverEvent::Error(error) => {
+            if session.active_turn_id().is_some() && session.status != SessionStatus::Working {
+                let needs_fallback = !scribe_turn_has_assistant_message(session);
+                session.status = SessionStatus::Failed;
+                if needs_fallback {
+                    session.push_message(MessageRole::Assistant, error.clone());
+                }
+                session.updated_at = scribe_unix_time();
+                catalog_changed = true;
+            }
+        }
+        DriverEvent::ProcessExited => {
+            scribe_finish_streaming_assistant(session);
+            scribe_complete_turn_blocks(session);
+            *stream_phase = None;
+            if session.status.is_busy() {
+                let needs_fallback = !scribe_turn_has_assistant_message(session);
+                session.status = SessionStatus::Failed;
+                session.updated_at = scribe_unix_time();
+                if needs_fallback {
+                    session.push_message(
+                        MessageRole::Assistant,
+                        "Provider process exited before completing the response.",
+                    );
+                }
+                session.finish_active_turn(TurnStatus::Failed);
+                catalog_changed = true;
+            }
+        }
+        DriverEvent::RuntimeEventCursorAdvanced(_)
+        | DriverEvent::BackgroundWork(_)
+        | DriverEvent::ComputerUseUpdated(_)
+        | DriverEvent::SteerRejected { .. }
+        | DriverEvent::PlanUsageUpdated(_) => {}
+    }
+    catalog_changed
+}
+
+fn scribe_upsert_activity(
+    session: &mut AgentSession,
+    stream_phase: &mut Option<crate::remote_mcp::ScribeStreamPhase>,
+    item: crate::model::ActivityItem,
+) {
+    use crate::remote_mcp::ScribeStreamPhase;
+
+    let prev = *stream_phase;
+    if prev == Some(ScribeStreamPhase::Text) {
+        scribe_finish_streaming_assistant(session);
+    }
+    if prev == Some(ScribeStreamPhase::Reasoning) {
+        scribe_complete_reasoning_activity(session);
+    }
+    let continuing_work = matches!(
+        prev,
+        Some(ScribeStreamPhase::Reasoning | ScribeStreamPhase::Activity)
+    );
+    for block in session.transcript_blocks.iter_mut().rev() {
+        let matching = block.activities.iter_mut().rev().find(|activity| {
+            item.source_id
+                .as_ref()
+                .is_some_and(|id| activity.source_id.as_ref() == Some(id))
+                || (item.source_id.is_none()
+                    && activity.title == item.title
+                    && !activity.complete)
+        });
+        if let Some(activity) = matching {
+            let has_arguments = item.arguments.is_some();
+            activity.kind = item.kind;
+            activity.title = item.title;
+            if item.tool_name.is_some() {
+                activity.tool_name = item.tool_name;
+            }
+            if item.mcp_server.is_some() {
+                activity.mcp_server = item.mcp_server;
+            }
+            activity.complete = item.complete;
+            activity.failed = item.failed;
+            if item.detail.is_some() {
+                activity.detail = item.detail;
+            }
+            if item.arguments.is_some() {
+                activity.arguments = item.arguments;
+            }
+            if item.output.is_some() {
+                activity.output = item.output;
+            }
+            if !item.image_urls.is_empty() {
+                activity.image_urls = item.image_urls;
+            }
+            if !item.file_changes.is_empty() {
+                activity.file_changes = item.file_changes;
+            }
+            if item.display_target.is_some()
+                && (activity.display_target.is_none() || has_arguments)
+            {
+                activity.display_target = item.display_target;
+            }
+            if item.display_description.is_some()
+                && (activity.display_description.is_none() || has_arguments)
+            {
+                activity.display_description = item.display_description;
+            }
+            if item.reasoning.is_some() {
+                activity.reasoning = item.reasoning;
+            }
+            session.updated_at = scribe_unix_time();
+            *stream_phase = Some(ScribeStreamPhase::Activity);
+            return;
+        }
+    }
+    scribe_push_activity(session, item, continuing_work);
+    session.updated_at = scribe_unix_time();
+    *stream_phase = Some(ScribeStreamPhase::Activity);
 }
 
 fn validate_message_rewind(source: &AgentSession, turn_count: usize) -> anyhow::Result<()> {
@@ -2610,6 +3515,36 @@ mod tests {
         assert_eq!(existing.title, "Renamed elsewhere");
         assert_eq!(existing.messages.len(), 1);
         assert_eq!(existing.runtime_event_cursor.unwrap().sequence, 10);
+    }
+
+    #[test]
+    fn stale_unattached_client_cannot_erase_completed_headless_turn() {
+        let mut existing = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        existing.begin_turn("first");
+        existing.push_message(crate::model::MessageRole::Assistant, "first reply");
+        existing.finish_active_turn(crate::model::TurnStatus::Completed);
+
+        let mut stale_desktop = existing.clone();
+        stale_desktop.runtime_event_cursor = None;
+        stale_desktop.title = "Edited title on desktop".into();
+
+        // Now a headless Remote MCP turn runs and completes on the daemon.
+        existing.begin_turn("remote follow-up");
+        existing.push_message(crate::model::MessageRole::Assistant, "remote reply");
+        existing.finish_active_turn(crate::model::TurnStatus::Completed);
+        existing.status = SessionStatus::Idle;
+        existing.runtime_event_cursor = Some(crate::model::RuntimeEventCursor {
+            runtime_id: Uuid::new_v4(),
+            epoch: Uuid::new_v4(),
+            sequence: 8,
+        });
+        stale_desktop.updated_at = existing.updated_at.saturating_add(10);
+
+        assert!(session_projection_precedes(&existing, &stale_desktop, None));
+        merge_stale_session_metadata(&mut existing, stale_desktop);
+        assert_eq!(existing.title, "Edited title on desktop");
+        assert_eq!(existing.turns.len(), 2);
+        assert_eq!(existing.messages.len(), 4);
     }
 
     #[test]

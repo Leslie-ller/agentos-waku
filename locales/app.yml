@@ -222,6 +222,32 @@ daemon.regenerate_token:
   en: Regenerate
 daemon.security_warning:
   en: The token grants full access to tasks, files, Git, attachments, and coding agents on this machine. Use WSS through a trusted TLS proxy outside a private network.
+daemon.remote_mcp_title:
+  en: Remote MCP Server (/mcp)
+daemon.remote_mcp_description:
+  en: Expose a Streamable HTTP MCP endpoint so external MCP clients (Claude, Cursor, Codex, OpenClaw) can inspect sessions and send messages using a dedicated bearer token.
+daemon.remote_mcp_status_on:
+  en: Enabled
+daemon.remote_mcp_status_off:
+  en: Disabled
+daemon.remote_mcp_allow_send:
+  en: Allow sending messages & creating sessions
+daemon.remote_mcp_allow_send_description:
+  en: Permit remote MCP clients to create sessions, send prompts, steer, and cancel turns. Turn off for read-only session viewing.
+daemon.remote_mcp_allow_approvals:
+  en: Allow remote permission & question responses
+daemon.remote_mcp_allow_approvals_description:
+  en: Permit remote MCP clients to approve tool permission prompts and answer interactive questions (off by default).
+daemon.remote_mcp_endpoint:
+  en: MCP Endpoint
+daemon.remote_mcp_token:
+  en: MCP Token
+daemon.remote_mcp_copy_config:
+  en: Copy Config JSON
+daemon.remote_mcp_security_warning:
+  en: This token is separate from the daemon WebSocket token and scoped to the MCP toggles above. Prefer Tailscale or HTTPS over untrusted networks.
+daemon.remote_mcp_local_only_hint:
+  en: Enable “Expose daemon” above to reach /mcp from other devices over LAN or Tailscale. Currently only local clients on this machine can connect.
 daemon.external_title:
   en: External daemon
 daemon.external_description:

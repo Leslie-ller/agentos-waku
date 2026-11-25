@@ -82,6 +82,10 @@ pub trait Backend: Send + Sync + 'static {
     fn handle(&self, request: Request, events: EventSink) -> anyhow::Result<ResponsePayload>;
 
     fn shutdown(&self) {}
+
+    fn remote_mcp(&self) -> Option<&dyn crate::remote_mcp::RemoteMcpBackend> {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -133,11 +137,20 @@ impl Subscriber {
     }
 }
 
+pub(crate) enum HubObservation {
+    Event(SequencedEvent),
+    RuntimeEnded {
+        session_id: Uuid,
+        runtime_id: Option<Uuid>,
+    },
+}
+
 #[derive(Default)]
 struct HubState {
     next_subscriber_id: u64,
     task_state_revision: u64,
     subscribers: HashMap<u64, Subscriber>,
+    event_observer: Option<Sender<HubObservation>>,
     active_runtimes: HashMap<Uuid, Uuid>,
     next_sequences: HashMap<(Uuid, Uuid), u64>,
     journal: HashMap<(Uuid, Uuid), VecDeque<SequencedEvent>>,
@@ -191,7 +204,7 @@ impl From<&AgentSession> for SessionCatalogEntry {
     }
 }
 
-struct Hub {
+pub(crate) struct Hub {
     epoch: Uuid,
     state: Mutex<HubState>,
 }
@@ -211,14 +224,22 @@ struct DispatchedRequest {
     source_subscriber_id: u64,
 }
 
-struct RuntimeMailbox {
-    id: Uuid,
-    sender: Sender<DispatchedRequest>,
+type MailboxCustomFn = Box<dyn FnOnce(&Arc<dyn Backend>, &Arc<Hub>, &mut Option<Uuid>) + Send>;
+
+enum MailboxItem {
+    Request(DispatchedRequest),
+    Custom(MailboxCustomFn),
 }
 
-struct RequestDispatcher {
+struct RuntimeMailbox {
+    id: Uuid,
+    sender: Sender<MailboxItem>,
+}
+
+pub(crate) struct RequestDispatcher {
     backend: Arc<dyn Backend>,
     hub: Arc<Hub>,
+    scribe: Arc<crate::remote_mcp::DaemonEventScribe>,
     /// A live provider runtime is an actor owned by the daemon, not by any
     /// particular WebSocket connection. One mailbox per session preserves
     /// lifecycle order across desktop and web clients without serializing
@@ -227,7 +248,13 @@ struct RequestDispatcher {
 }
 
 impl Hub {
-    fn event_sink(self: &Arc<Self>, session_id: Uuid, runtime_id: Uuid) -> EventSink {
+    pub(crate) fn install_observer(&self) -> Receiver<HubObservation> {
+        let (tx, rx) = unbounded();
+        self.state.lock().event_observer = Some(tx);
+        rx
+    }
+
+    pub(crate) fn event_sink(self: &Arc<Self>, session_id: Uuid, runtime_id: Uuid) -> EventSink {
         EventSink {
             session_id,
             runtime_id,
@@ -235,7 +262,7 @@ impl Hub {
         }
     }
 
-    fn begin_runtime(&self, session_id: Uuid, runtime_id: Uuid) {
+    pub(crate) fn begin_runtime(&self, session_id: Uuid, runtime_id: Uuid) {
         let mut state = self.state.lock();
         state.active_runtimes.insert(session_id, runtime_id);
         state
@@ -246,7 +273,7 @@ impl Hub {
             .retain(|(candidate, _), _| *candidate != session_id);
     }
 
-    fn end_runtime(&self, session_id: Uuid, runtime_id: Option<Uuid>) {
+    pub(crate) fn end_runtime(&self, session_id: Uuid, runtime_id: Option<Uuid>) {
         let mut state = self.state.lock();
         let matches_active = runtime_id
             .is_none_or(|runtime_id| state.active_runtimes.get(&session_id) == Some(&runtime_id));
@@ -260,6 +287,12 @@ impl Hub {
         state
             .journal
             .retain(|(candidate, _), _| *candidate != session_id);
+        if let Some(observer) = &state.event_observer {
+            let _ = observer.send(HubObservation::RuntimeEnded {
+                session_id,
+                runtime_id,
+            });
+        }
     }
 
     fn emit(&self, session_id: Uuid, runtime_id: Uuid, event: WireDriverEvent, replayable: bool) {
@@ -285,6 +318,9 @@ impl Hub {
             while journal.len() > MAX_REPLAY_EVENTS_PER_SESSION {
                 journal.pop_front();
             }
+        }
+        if let Some(observer) = &state.event_observer {
+            let _ = observer.send(HubObservation::Event(event.clone()));
         }
         Self::broadcast(&mut state, &ServerMessage::Event(event), None);
     }
@@ -404,6 +440,15 @@ impl Hub {
         Self::broadcast(state, &message, Some(source_subscriber_id));
     }
 
+    pub(crate) fn broadcast_task_state_changed_all(&self) {
+        let mut state = self.state.lock();
+        state.task_state_revision = state.task_state_revision.saturating_add(1);
+        let message = ServerMessage::TaskStateChanged {
+            revision: state.task_state_revision,
+        };
+        Self::broadcast(&mut state, &message, None);
+    }
+
     fn cached_response(&self, request_id: Uuid) -> Option<ResponseOutcome> {
         self.state
             .lock()
@@ -445,12 +490,42 @@ impl Hub {
 }
 
 impl RequestDispatcher {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn new(backend: Arc<dyn Backend>, hub: Arc<Hub>) -> Self {
+        Self::with_scribe(
+            backend,
+            hub,
+            Arc::new(crate::remote_mcp::DaemonEventScribe::default()),
+        )
+    }
+
+    fn with_scribe(
+        backend: Arc<dyn Backend>,
+        hub: Arc<Hub>,
+        scribe: Arc<crate::remote_mcp::DaemonEventScribe>,
+    ) -> Self {
         Self {
             backend,
             hub,
+            scribe,
             runtime_mailboxes: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub(crate) fn run_on_session<T, F>(&self, session_id: Uuid, f: F) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Arc<dyn Backend>, &Arc<Hub>, &mut Option<Uuid>) -> anyhow::Result<T>
+            + Send
+            + 'static,
+    {
+        let (tx, rx) = bounded(1);
+        let item = MailboxItem::Custom(Box::new(move |backend, hub, active_runtime_id| {
+            let _ = tx.send(f(backend, hub, active_runtime_id));
+        }));
+        self.enqueue_runtime_item(session_id, item)?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("session runtime mailbox closed before replying"))?
     }
 
     fn dispatch(
@@ -500,18 +575,29 @@ impl RequestDispatcher {
         let session_id = request.session_id;
         let failed_request_id = request.request_id;
         let failed_outgoing = outgoing.clone();
-        let mut dispatched = DispatchedRequest {
+        let item = MailboxItem::Request(DispatchedRequest {
             request,
             outgoing,
             source_subscriber_id,
-        };
+        });
+        if let Err(error) = self.enqueue_runtime_item(session_id, item) {
+            send_dispatch_error(
+                failed_request_id,
+                failed_outgoing,
+                &self.hub,
+                format!("could not start runtime worker: {error}"),
+            );
+        }
+    }
+
+    fn enqueue_runtime_item(&self, session_id: Uuid, mut item: MailboxItem) -> anyhow::Result<()> {
         loop {
             let mut mailboxes = self.runtime_mailboxes.lock();
             if let Some(mailbox) = mailboxes.get(&session_id) {
-                match mailbox.sender.send(dispatched) {
-                    Ok(()) => return,
+                match mailbox.sender.send(item) {
+                    Ok(()) => return Ok(()),
                     Err(error) => {
-                        dispatched = error.0;
+                        item = error.0;
                         mailboxes.remove(&session_id);
                         continue;
                     }
@@ -521,7 +607,7 @@ impl RequestDispatcher {
             let mailbox_id = Uuid::new_v4();
             let (sender, requests) = unbounded();
             sender
-                .send(dispatched)
+                .send(item)
                 .expect("a new runtime mailbox still has its receiver");
             mailboxes.insert(
                 session_id,
@@ -533,6 +619,7 @@ impl RequestDispatcher {
 
             let backend = self.backend.clone();
             let hub = self.hub.clone();
+            let scribe = self.scribe.clone();
             let mailbox_registry = Arc::downgrade(&self.runtime_mailboxes);
             let worker = std::thread::Builder::new()
                 .name(format!("waku-daemon-runtime-{session_id}"))
@@ -544,6 +631,7 @@ impl RequestDispatcher {
                         mailbox_registry,
                         backend,
                         hub,
+                        scribe,
                     );
                 });
             if let Err(error) = worker {
@@ -553,15 +641,9 @@ impl RequestDispatcher {
                 {
                     mailboxes.remove(&session_id);
                 }
-                drop(mailboxes);
-                send_dispatch_error(
-                    failed_request_id,
-                    failed_outgoing,
-                    &self.hub,
-                    format!("could not start runtime worker: {error}"),
-                );
+                return Err(error.into());
             }
-            return;
+            return Ok(());
         }
     }
 }
@@ -577,7 +659,18 @@ pub fn serve(
         .set_nonblocking(true)
         .context("could not configure Waku daemon listener")?;
     let hub = Arc::new(Hub::default());
-    let dispatcher = Arc::new(RequestDispatcher::new(backend.clone(), hub.clone()));
+    let observations = hub.install_observer();
+    let scribe = crate::remote_mcp::DaemonEventScribe::spawn(
+        observations,
+        backend.clone(),
+        hub.clone(),
+    );
+    let mcp_budget = Arc::new(crate::remote_mcp::McpBudget::default());
+    let dispatcher = Arc::new(RequestDispatcher::with_scribe(
+        backend.clone(),
+        hub.clone(),
+        scribe.clone(),
+    ));
     let options = Arc::new(options);
     let active_connections = Arc::new(AtomicUsize::new(0));
     while !shutdown.load(Ordering::Acquire) {
@@ -593,17 +686,28 @@ pub fn serve(
                 }
                 let connection_permit = ConnectionPermit(active_connections.clone());
                 let token = token.clone();
+                let backend = backend.clone();
                 let dispatcher = dispatcher.clone();
                 let hub = hub.clone();
+                let scribe = scribe.clone();
+                let mcp_budget = mcp_budget.clone();
                 let shutdown = shutdown.clone();
                 let options = options.clone();
                 std::thread::Builder::new()
                     .name("waku-daemon-connection".into())
                     .spawn(move || {
                         let _connection_permit = connection_permit;
-                        if let Err(error) =
-                            handle_connection(stream, &token, dispatcher, hub, shutdown, &options)
-                        {
+                        if let Err(error) = handle_connection(
+                            stream,
+                            &token,
+                            backend,
+                            dispatcher,
+                            hub,
+                            scribe,
+                            mcp_budget,
+                            shutdown,
+                            &options,
+                        ) {
                             eprintln!("waku-daemon connection ended: {error:#}");
                         }
                     })
@@ -620,11 +724,15 @@ pub fn serve(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_connection(
     mut stream: TcpStream,
     expected_token: &str,
+    backend: Arc<dyn Backend>,
     dispatcher: Arc<RequestDispatcher>,
     hub: Arc<Hub>,
+    scribe: Arc<crate::remote_mcp::DaemonEventScribe>,
+    mcp_budget: Arc<crate::remote_mcp::McpBudget>,
     shutdown: Arc<AtomicBool>,
     options: &ServerOptions,
 ) -> anyhow::Result<()> {
@@ -633,7 +741,17 @@ fn handle_connection(
     // get their bounded polling behavior from SO_RCVTIMEO below.
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    if try_handle_plain_http(&mut stream, options)? {
+    if try_handle_plain_http(
+        &mut stream,
+        crate::remote_mcp::RemoteMcpHttpContext {
+            backend,
+            dispatcher: dispatcher.clone(),
+            hub: hub.clone(),
+            scribe,
+            budget: mcp_budget,
+            options,
+        },
+    )? {
         return Ok(());
     }
     let config = WebSocketConfig::default()
@@ -785,7 +903,7 @@ fn validate_handshake(
     Ok(response)
 }
 
-fn origin_matches_host(origin: &str, host_header: Option<&HeaderValue>) -> bool {
+pub(crate) fn origin_matches_host(origin: &str, host_header: Option<&HeaderValue>) -> bool {
     let Some(host_header) = host_header.and_then(|val| val.to_str().ok()) else {
         return false;
     };
@@ -817,7 +935,11 @@ fn origin_matches_host(origin: &str, host_header: Option<&HeaderValue>) -> bool 
 
 const MAX_PLAIN_HTTP_HEADER_BYTES: usize = 16 * 1024;
 
-fn try_handle_plain_http(stream: &mut TcpStream, options: &ServerOptions) -> anyhow::Result<bool> {
+fn try_handle_plain_http(
+    stream: &mut TcpStream,
+    mcp_ctx: crate::remote_mcp::RemoteMcpHttpContext<'_>,
+) -> anyhow::Result<bool> {
+    let options = mcp_ctx.options;
     let mut buf = [0u8; MAX_PLAIN_HTTP_HEADER_BYTES];
     let deadline = Instant::now() + Duration::from_secs(5);
     let header_end = loop {
@@ -884,6 +1006,20 @@ fn try_handle_plain_http(stream: &mut TcpStream, options: &ServerOptions) -> any
     stream.read_exact(&mut consumed)?;
     stream.set_write_timeout(Some(SOCKET_WRITE_STALL_TIMEOUT))?;
 
+    let raw_path = raw_target.split('?').next().unwrap_or("/");
+    if crate::remote_mcp::is_remote_mcp_path(raw_path)
+        || crate::remote_mcp::is_well_known_path(raw_path)
+    {
+        crate::remote_mcp::handle_mcp_http_request(
+            stream,
+            method,
+            raw_target,
+            header_text,
+            mcp_ctx,
+        )?;
+        return Ok(true);
+    }
+
     if method != "GET" && method != "HEAD" {
         write_http_response(
             stream,
@@ -896,13 +1032,20 @@ fn try_handle_plain_http(stream: &mut TcpStream, options: &ServerOptions) -> any
         return Ok(true);
     }
 
-    let raw_path = raw_target.split('?').next().unwrap_or("/");
     if raw_path == "/healthz" {
+        let remote_mcp_enabled = mcp_ctx
+            .backend
+            .remote_mcp()
+            .is_some_and(|mcp| {
+                let s = mcp.remote_mcp_settings();
+                s.enabled && !s.token.trim().is_empty()
+            });
         let body = serde_json::json!({
             "status": "ok",
             "protocolVersion": PROTOCOL_VERSION,
             "daemonVersion": env!("CARGO_PKG_VERSION"),
             "webUi": options.web_dist_dir.is_some(),
+            "remoteMcp": remote_mcp_enabled,
         })
         .to_string();
         write_http_response(
@@ -1127,7 +1270,7 @@ fn handshake_error(status: StatusCode, message: &str) -> ErrorResponse {
         .expect("static WebSocket rejection is valid")
 }
 
-fn token_matches(expected: &str, candidate: &str) -> bool {
+pub(crate) fn token_matches(expected: &str, candidate: &str) -> bool {
     expected.as_bytes().ct_eq(candidate.as_bytes()).into()
 }
 
@@ -1163,73 +1306,91 @@ fn command_targets_runtime(command: &Command) -> bool {
 fn run_runtime_mailbox(
     session_id: Uuid,
     mailbox_id: Uuid,
-    requests: Receiver<DispatchedRequest>,
+    requests: Receiver<MailboxItem>,
     mailbox_registry: Weak<Mutex<HashMap<Uuid, RuntimeMailbox>>>,
     backend: Arc<dyn Backend>,
     hub: Arc<Hub>,
+    scribe: Arc<crate::remote_mcp::DaemonEventScribe>,
 ) {
     let mut active_runtime_id = None;
     let mut pending = None;
     loop {
-        let dispatched = match pending.take() {
-            Some(request) => request,
+        let item = match pending.take() {
+            Some(item) => item,
             None => match requests.recv() {
-                Ok(request) => request,
+                Ok(item) => item,
                 Err(_) => return,
             },
         };
-        let runtime_id = dispatched.request.runtime_id;
-        let starts_runtime = matches!(
-            &dispatched.request.command,
-            Command::Start { .. } | Command::OpenTerminal { .. }
-        );
-        let closes_runtime = matches!(
-            &dispatched.request.command,
-            Command::CloseSession | Command::CloseTerminal | Command::RemoveSession
-        );
-        let removes_session = matches!(&dispatched.request.command, Command::RemoveSession);
-        let handled = handle_request(
-            dispatched.request,
-            dispatched.outgoing,
-            dispatched.source_subscriber_id,
-            backend.clone(),
-            hub.clone(),
-        );
+        match item {
+            MailboxItem::Custom(task) => {
+                task(&backend, &hub, &mut active_runtime_id);
+            }
+            MailboxItem::Request(dispatched) => {
+                let runtime_id = dispatched.request.runtime_id;
+                let starts_runtime = matches!(
+                    &dispatched.request.command,
+                    Command::Start { .. } | Command::OpenTerminal { .. }
+                );
+                let closes_runtime = matches!(
+                    &dispatched.request.command,
+                    Command::CloseSession | Command::CloseTerminal | Command::RemoveSession
+                );
+                let removes_session = matches!(&dispatched.request.command, Command::RemoveSession);
+                let resolved_pending_id = match &dispatched.request.command {
+                    Command::Respond { request_id, .. }
+                    | Command::RespondUserInput { request_id, .. } => Some(request_id.clone()),
+                    _ => None,
+                };
+                let handled = handle_request(
+                    dispatched.request,
+                    dispatched.outgoing,
+                    dispatched.source_subscriber_id,
+                    backend.clone(),
+                    hub.clone(),
+                );
 
-        if handled.executed {
-            if starts_runtime {
-                active_runtime_id =
-                    matches!(&handled.outcome, ResponseOutcome::Ok { .. }).then_some(runtime_id);
-            } else if let ResponseOutcome::Ok {
-                payload:
-                    ResponsePayload::SessionRuntime {
-                        runtime_id: Some(attached_runtime_id),
-                        ..
-                    },
-            } = &handled.outcome
-            {
-                // A replacement mailbox can rediscover a provider runtime
-                // that survived its previous actor worker.
-                active_runtime_id = Some(*attached_runtime_id);
-            } else if closes_runtime {
-                if (removes_session || active_runtime_id == Some(runtime_id))
-                    && matches!(&handled.outcome, ResponseOutcome::Ok { .. })
-                {
-                    hub.end_runtime(session_id, (!removes_session).then_some(runtime_id));
-                    active_runtime_id = None;
-                }
-            } else if active_runtime_id.is_none()
-                && !matches!(
-                    &handled.outcome,
-                    ResponseOutcome::Ok {
-                        payload: ResponsePayload::SessionRuntime { .. }
+                if handled.executed {
+                    if let Some(ref req_id) = resolved_pending_id
+                        && matches!(&handled.outcome, ResponseOutcome::Ok { .. })
+                    {
+                        scribe.clear_pending_request(session_id, req_id);
                     }
-                )
-                && matches!(&handled.outcome, ResponseOutcome::Ok { .. })
-            {
-                // Recover the supervisor state if a previous mailbox worker
-                // exited unexpectedly while the backend runtime stayed alive.
-                active_runtime_id = Some(runtime_id);
+                    if starts_runtime {
+                        active_runtime_id = matches!(&handled.outcome, ResponseOutcome::Ok { .. })
+                            .then_some(runtime_id);
+                    } else if let ResponseOutcome::Ok {
+                        payload:
+                            ResponsePayload::SessionRuntime {
+                                runtime_id: Some(attached_runtime_id),
+                                ..
+                            },
+                    } = &handled.outcome
+                    {
+                        // A replacement mailbox can rediscover a provider runtime
+                        // that survived its previous actor worker.
+                        active_runtime_id = Some(*attached_runtime_id);
+                    } else if closes_runtime {
+                        if (removes_session || active_runtime_id == Some(runtime_id))
+                            && matches!(&handled.outcome, ResponseOutcome::Ok { .. })
+                        {
+                            hub.end_runtime(session_id, (!removes_session).then_some(runtime_id));
+                            active_runtime_id = None;
+                        }
+                    } else if active_runtime_id.is_none()
+                        && !matches!(
+                            &handled.outcome,
+                            ResponseOutcome::Ok {
+                                payload: ResponsePayload::SessionRuntime { .. }
+                            }
+                        )
+                        && matches!(&handled.outcome, ResponseOutcome::Ok { .. })
+                    {
+                        // Recover the supervisor state if a previous mailbox worker
+                        // exited unexpectedly while the backend runtime stayed alive.
+                        active_runtime_id = Some(runtime_id);
+                    }
+                }
             }
         }
 
@@ -1246,9 +1407,9 @@ fn run_runtime_mailbox(
 fn take_queued_request_or_retire(
     session_id: Uuid,
     mailbox_id: Uuid,
-    requests: &Receiver<DispatchedRequest>,
+    requests: &Receiver<MailboxItem>,
     mailbox_registry: &Weak<Mutex<HashMap<Uuid, RuntimeMailbox>>>,
-) -> Option<DispatchedRequest> {
+) -> Option<MailboxItem> {
     let Some(mailbox_registry) = mailbox_registry.upgrade() else {
         return requests.try_recv().ok();
     };

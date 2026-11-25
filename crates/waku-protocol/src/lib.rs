@@ -57,5 +57,5 @@ pub use protocol::{
     Request, ResponseOutcome, ResponsePayload, RpcError, SequencedEvent, ServerMessage,
     WireComputerToolRequest, WireDriverEvent, WireDriverStartOptions, WireSessionOptions,
 };
-pub use settings::DaemonSettings;
+pub use settings::{AgentOsMcpSettings, DaemonSettings, RemoteMcpSettings};
 pub use workspace::{WorkspaceOperation, WorkspaceResult};

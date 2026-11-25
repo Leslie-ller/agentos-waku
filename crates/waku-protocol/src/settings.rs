@@ -73,6 +73,58 @@ impl Default for AgentOsMcpSettings {
     }
 }
 
+/// Configuration for the daemon's Remote Streamable HTTP MCP endpoint (`/mcp`).
+///
+/// Uses a dedicated, revocable bearer token separate from the master daemon
+/// WebSocket token so remote MCP clients can inspect sessions and send messages
+/// without gaining shell/terminal or full daemon control.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RemoteMcpSettings {
+    /// Explicit opt-in toggle for exposing `/mcp` on the daemon HTTP listener.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Dedicated bearer token required via `Authorization: Bearer <token>`.
+    #[serde(default)]
+    pub token: String,
+    /// Allow remote MCP clients to create sessions, send messages, and cancel turns.
+    #[serde(default = "default_true")]
+    pub allow_send: bool,
+    /// Allow remote MCP clients to approve permission prompts and answer
+    /// interactive user-input questions (disabled by default for safety).
+    #[serde(default)]
+    pub allow_approvals: bool,
+}
+
+impl Default for RemoteMcpSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            token: String::new(),
+            allow_send: true,
+            allow_approvals: false,
+        }
+    }
+}
+
+impl RemoteMcpSettings {
+    pub fn new_token() -> String {
+        format!(
+            "agm_{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        )
+    }
+
+    pub fn ensure_token(&mut self) -> bool {
+        if !self.token.trim().is_empty() {
+            return false;
+        }
+        self.token = Self::new_token();
+        true
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
 #[serde(default)]
 pub struct DaemonSettings {
@@ -83,6 +135,8 @@ pub struct DaemonSettings {
     pub provider_binary_overrides: HashMap<ProviderKind, String>,
     #[serde(default)]
     pub agentos_mcp: AgentOsMcpSettings,
+    #[serde(default)]
+    pub remote_mcp: RemoteMcpSettings,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -95,6 +149,7 @@ impl Default for DaemonSettings {
             disabled_providers: Vec::new(),
             provider_binary_overrides: HashMap::new(),
             agentos_mcp: AgentOsMcpSettings::default(),
+            remote_mcp: RemoteMcpSettings::default(),
             extra: BTreeMap::new(),
         }
     }

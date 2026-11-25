@@ -64,6 +64,7 @@ export type { ProviderSessionSummary } from "./ProviderSessionSummary";
 export type { ProviderSlice } from "./ProviderSlice";
 export type { QueuedMessage } from "./QueuedMessage";
 export type { ReasoningBlock } from "./ReasoningBlock";
+export type { RemoteMcpSettings } from "./RemoteMcpSettings";
 export type { ReplayCursor } from "./ReplayCursor";
 export type { ReportedCommand } from "./ReportedCommand";
 export type { Request } from "./Request";

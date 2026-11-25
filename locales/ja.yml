@@ -113,6 +113,19 @@ daemon.reveal_token: トークンを表示
 daemon.hide_token: トークンを隠す
 daemon.regenerate_token: 再生成
 daemon.security_warning: このトークンは、このマシン上のタスク、ファイル、Git、添付ファイル、コーディングエージェントへの完全なアクセス権を持ちます。プライベートネットワーク外では信頼できる TLS プロキシ経由で WSS を使用してください。
+daemon.remote_mcp_title: リモート MCP サーバー（/mcp）
+daemon.remote_mcp_description: Streamable HTTP MCP エンドポイントを公開し、外部 MCP クライアントから専用の Bearer トークンでセッション閲覧とメッセージ送信を行えるようにします。
+daemon.remote_mcp_status_on: 有効
+daemon.remote_mcp_status_off: 無効
+daemon.remote_mcp_allow_send: メッセージ送信とセッション作成を許可
+daemon.remote_mcp_allow_send_description: リモート MCP クライアントによるセッション作成・プロンプト送信・キャンセルを許可します。オフにすると読み取り専用になります。
+daemon.remote_mcp_allow_approvals: リモート権限承認と質問回答を許可
+daemon.remote_mcp_allow_approvals_description: リモート MCP クライアントによる権限承認や対話型質問への回答を許可します（安全のためデフォルトでオフ）。
+daemon.remote_mcp_endpoint: MCP エンドポイント
+daemon.remote_mcp_token: MCP トークン
+daemon.remote_mcp_copy_config: 設定 JSON をコピー
+daemon.remote_mcp_security_warning: このトークンはデーモン WebSocket トークンとは独立しており、上の MCP スコープに従います。信頼できないネットワークでは Tailscale または HTTPS を使用してください。
+daemon.remote_mcp_local_only_hint: LAN や Tailscale 経由で他のデバイスから /mcp に接続するには、上の「デーモンを公開」を有効にしてください。現在はローカル接続のみ可能です。
 daemon.external_title: 外部デーモン
 daemon.external_description: このデスクトップは Waku の外部で管理されているデーモンに接続しています。リスナー、ブラウザオリジン、トークンは接続先ホストで設定してください。
 daemon.web_external_description: Waku Web はブラウザの外部で管理されているデーモンに接続します。リスナー、ブラウザオリジン、トークンは接続先ホストで設定してください。

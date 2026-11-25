@@ -80,6 +80,9 @@ function fixture(options: { attached?: boolean } = {}) {
               askUserEnabled: true,
               delegationEnabled: true, sessionInfoEnabled: true,
             },
+            remote_mcp: {
+              enabled: false, token: '', allowSend: true, allowApprovals: false,
+            },
           } };
         case 'loadTaskState':
           return {

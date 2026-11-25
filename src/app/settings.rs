@@ -1425,6 +1425,13 @@ impl Waku {
             );
         }
 
+        let mcp_url = if enabled {
+            selected_endpoint.mcp_url(port)
+        } else {
+            format!("http://127.0.0.1:{port}/mcp")
+        };
+        let remote_mcp_card = self.render_remote_mcp_card(enabled, mcp_url, theme, cx);
+
         div()
             .mt(px(15.0))
             .w_full()
@@ -1824,6 +1831,525 @@ impl Waku {
                                         .text_color(theme.text_secondary)
                                         .child(tr!("daemon.security_warning")),
                                 ),
+                        ),
+                )
+            })
+            .child(remote_mcp_card)
+            .into_any_element()
+    }
+
+    fn render_remote_mcp_card(
+        &self,
+        daemon_exposed: bool,
+        mcp_url: String,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let remote = self.state.remote_mcp.clone();
+        let enabled = remote.enabled;
+        let token = remote.token.clone();
+        let token_revealed = self.remote_mcp_token_revealed;
+
+        let enable_toggle = toggle_switch(
+            "remote-mcp-enabled-toggle",
+            enabled,
+            false,
+            theme,
+            cx,
+            {
+                let next = !enabled;
+                move |this, _, cx| {
+                    this.state.remote_mcp.enabled = next;
+                    if next {
+                        this.state.remote_mcp.ensure_token();
+                    } else {
+                        this.remote_mcp_token_revealed = false;
+                    }
+                    this.save();
+                    cx.notify();
+                }
+            },
+        );
+
+        let allow_send_toggle = toggle_switch(
+            "remote-mcp-allow-send-toggle",
+            remote.allow_send,
+            false,
+            theme,
+            cx,
+            {
+                let next = !remote.allow_send;
+                move |this, _, cx| {
+                    this.state.remote_mcp.allow_send = next;
+                    this.save();
+                    cx.notify();
+                }
+            },
+        );
+
+        let allow_approvals_toggle = toggle_switch(
+            "remote-mcp-allow-approvals-toggle",
+            remote.allow_approvals,
+            false,
+            theme,
+            cx,
+            {
+                let next = !remote.allow_approvals;
+                move |this, _, cx| {
+                    this.state.remote_mcp.allow_approvals = next;
+                    this.save();
+                    cx.notify();
+                }
+            },
+        );
+
+        let copy_url_feedback_id = "remote-mcp-url";
+        let url_copied = self.control_was_copied(copy_url_feedback_id);
+        let click_url = mcp_url.clone();
+        let key_url = mcp_url.clone();
+        let copy_url_button = div()
+            .id("copy-remote-mcp-url")
+            .tab_index(0)
+            .h(px(27.0))
+            .px(px(9.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .cursor_default()
+            .text_size(sp(12.5))
+            .text_color(theme.text_secondary)
+            .focus_visible(|style| style.border_color(theme.accent))
+            .hover(|element| element.bg(theme.overlay))
+            .child(icon(
+                if url_copied {
+                    "icons/check.svg"
+                } else {
+                    "icons/copy.svg"
+                },
+                11.0,
+                theme.text_tertiary,
+            ))
+            .child(if url_copied {
+                tr!("common.copied")
+            } else {
+                tr!("common.copy")
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(click_url.clone()));
+                this.show_control_copied(copy_url_feedback_id, cx);
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    cx.write_to_clipboard(ClipboardItem::new_string(key_url.clone()));
+                    this.show_control_copied(copy_url_feedback_id, cx);
+                    cx.stop_propagation();
+                }
+            }));
+
+        let reveal_token_button = div()
+            .id("reveal-remote-mcp-token")
+            .tab_index(0)
+            .size(px(27.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_default()
+            .text_color(theme.text_secondary)
+            .focus_visible(|style| style.border_color(theme.accent))
+            .hover(|element| element.bg(theme.overlay))
+            .active(|element| element.bg(theme.overlay_strong))
+            .child(icon(
+                if token_revealed {
+                    "icons/eye-off.svg"
+                } else {
+                    "icons/eye.svg"
+                },
+                12.0,
+                theme.text_tertiary,
+            ))
+            .tooltip(Tooltip::text(if token_revealed {
+                tr!("daemon.hide_token")
+            } else {
+                tr!("daemon.reveal_token")
+            }))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.remote_mcp_token_revealed = !this.remote_mcp_token_revealed;
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    this.remote_mcp_token_revealed = !this.remote_mcp_token_revealed;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }));
+
+        let copy_token_feedback_id = "remote-mcp-token";
+        let token_copied = self.control_was_copied(copy_token_feedback_id);
+        let click_token = token.clone();
+        let key_token = token.clone();
+        let copy_token_button = div()
+            .id("copy-remote-mcp-token")
+            .tab_index(0)
+            .h(px(27.0))
+            .px(px(9.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .cursor_default()
+            .text_size(sp(12.5))
+            .text_color(theme.text_secondary)
+            .focus_visible(|style| style.border_color(theme.accent))
+            .hover(|element| element.bg(theme.overlay))
+            .child(icon(
+                if token_copied {
+                    "icons/check.svg"
+                } else {
+                    "icons/copy.svg"
+                },
+                11.0,
+                theme.text_tertiary,
+            ))
+            .child(if token_copied {
+                tr!("common.copied")
+            } else {
+                tr!("common.copy")
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(click_token.clone()));
+                this.show_control_copied(copy_token_feedback_id, cx);
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    cx.write_to_clipboard(ClipboardItem::new_string(key_token.clone()));
+                    this.show_control_copied(copy_token_feedback_id, cx);
+                    cx.stop_propagation();
+                }
+            }));
+
+        let regenerate_token_button = div()
+            .id("regenerate-remote-mcp-token")
+            .tab_index(0)
+            .h(px(27.0))
+            .px(px(9.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .flex()
+            .items_center()
+            .cursor_default()
+            .text_size(sp(12.5))
+            .text_color(theme.text_secondary)
+            .focus_visible(|style| style.border_color(theme.accent))
+            .hover(|element| element.bg(theme.overlay))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.state.remote_mcp.token =
+                    waku_protocol::settings::RemoteMcpSettings::new_token();
+                this.remote_mcp_token_revealed = false;
+                this.save();
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    this.state.remote_mcp.token =
+                        waku_protocol::settings::RemoteMcpSettings::new_token();
+                    this.remote_mcp_token_revealed = false;
+                    this.save();
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .child(tr!("daemon.regenerate_token"));
+
+        let mcp_config_json = serde_json::to_string_pretty(&serde_json::json!({
+            "mcpServers": {
+                "agentos": {
+                    "type": "http",
+                    "url": mcp_url,
+                    "headers": {
+                        "Authorization": format!("Bearer {token}")
+                    }
+                }
+            }
+        }))
+        .unwrap_or_default();
+        let copy_config_feedback_id = "remote-mcp-config";
+        let config_copied = self.control_was_copied(copy_config_feedback_id);
+        let click_config = mcp_config_json.clone();
+        let key_config = mcp_config_json;
+        let copy_config_button = div()
+            .id("copy-remote-mcp-config")
+            .tab_index(0)
+            .h(px(27.0))
+            .px(px(10.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .cursor_default()
+            .text_size(sp(12.5))
+            .text_color(theme.text_secondary)
+            .focus_visible(|style| style.border_color(theme.accent))
+            .hover(|element| element.bg(theme.overlay))
+            .child(icon(
+                if config_copied {
+                    "icons/check.svg"
+                } else {
+                    "icons/copy.svg"
+                },
+                11.0,
+                theme.text_tertiary,
+            ))
+            .child(if config_copied {
+                tr!("common.copied")
+            } else {
+                tr!("daemon.remote_mcp_copy_config")
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(click_config.clone()));
+                this.show_control_copied(copy_config_feedback_id, cx);
+            }))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.modified()
+                    && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                {
+                    cx.write_to_clipboard(ClipboardItem::new_string(key_config.clone()));
+                    this.show_control_copied(copy_config_feedback_id, cx);
+                    cx.stop_propagation();
+                }
+            }));
+
+        div()
+            .px(px(20.0))
+            .py(px(15.0))
+            .rounded(px(13.0))
+            .bg(theme.raised)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(24.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(7.0))
+                                    .child(
+                                        div()
+                                            .text_size(sp(13.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme.text)
+                                            .child(tr!("daemon.remote_mcp_title")),
+                                    )
+                                    .child(
+                                        div()
+                                            .px(px(6.0))
+                                            .py(px(2.0))
+                                            .rounded_full()
+                                            .text_size(sp(12.0))
+                                            .text_color(if enabled {
+                                                theme.success
+                                            } else {
+                                                theme.text_tertiary
+                                            })
+                                            .bg(theme.overlay)
+                                            .child(if enabled {
+                                                tr!("daemon.remote_mcp_status_on")
+                                            } else {
+                                                tr!("daemon.remote_mcp_status_off")
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(4.0))
+                                    .min_w_0()
+                                    .whitespace_normal()
+                                    .text_size(sp(12.5))
+                                    .line_height(sp(17.0))
+                                    .text_color(theme.text_secondary)
+                                    .child(tr!("daemon.remote_mcp_description")),
+                            ),
+                    )
+                    .child(enable_toggle),
+            )
+            .when(enabled, |card| {
+                card.child(
+                    div()
+                        .mt(px(12.0))
+                        .pt(px(10.0))
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .flex()
+                        .items_center()
+                        .gap(px(20.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .text_size(sp(13.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme.text)
+                                        .child(tr!("daemon.remote_mcp_allow_send")),
+                                )
+                                .child(
+                                    div()
+                                        .mt(px(3.0))
+                                        .text_size(sp(12.0))
+                                        .line_height(sp(16.0))
+                                        .whitespace_normal()
+                                        .text_color(theme.text_secondary)
+                                        .child(tr!("daemon.remote_mcp_allow_send_description")),
+                                ),
+                        )
+                        .child(allow_send_toggle),
+                )
+                .child(
+                    div()
+                        .mt(px(10.0))
+                        .pt(px(10.0))
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .flex()
+                        .items_center()
+                        .gap(px(20.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .text_size(sp(13.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme.text)
+                                        .child(tr!("daemon.remote_mcp_allow_approvals")),
+                                )
+                                .child(
+                                    div()
+                                        .mt(px(3.0))
+                                        .text_size(sp(12.0))
+                                        .line_height(sp(16.0))
+                                        .whitespace_normal()
+                                        .text_color(theme.text_secondary)
+                                        .child(tr!("daemon.remote_mcp_allow_approvals_description")),
+                                ),
+                        )
+                        .child(allow_approvals_toggle),
+                )
+                .child(
+                    div()
+                        .mt(px(12.0))
+                        .py(px(8.0))
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .w(px(92.0))
+                                .flex_none()
+                                .text_size(sp(12.5))
+                                .text_color(theme.text_tertiary)
+                                .child(tr!("daemon.remote_mcp_endpoint")),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_family(".SystemUIFontMonospaced")
+                                .text_size(sp(12.5))
+                                .text_color(theme.text)
+                                .child(SharedString::from(mcp_url)),
+                        )
+                        .child(copy_url_button)
+                        .child(copy_config_button),
+                )
+                .child(
+                    div()
+                        .py(px(8.0))
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .w(px(92.0))
+                                .flex_none()
+                                .text_size(sp(12.5))
+                                .text_color(theme.text_tertiary)
+                                .child(tr!("daemon.remote_mcp_token")),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_family(".SystemUIFontMonospaced")
+                                .text_size(sp(12.5))
+                                .text_color(theme.text)
+                                .child(SharedString::from(if token_revealed {
+                                    token.clone()
+                                } else {
+                                    "••••••••••••••••••••••••••••••••".to_owned()
+                                })),
+                        )
+                        .child(reveal_token_button)
+                        .child(copy_token_button)
+                        .child(regenerate_token_button),
+                )
+                .child(
+                    div()
+                        .mt(px(7.0))
+                        .px(px(10.0))
+                        .py(px(8.0))
+                        .rounded(px(8.0))
+                        .bg(theme.inset)
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .gap(px(8.0))
+                        .child(icon("icons/alert.svg", 13.0, theme.warning))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .whitespace_normal()
+                                .text_size(sp(12.0))
+                                .line_height(sp(16.0))
+                                .text_color(theme.text_secondary)
+                                .child(if daemon_exposed {
+                                    tr!("daemon.remote_mcp_security_warning")
+                                } else {
+                                    tr!("daemon.remote_mcp_local_only_hint")
+                                }),
                         ),
                 )
             })

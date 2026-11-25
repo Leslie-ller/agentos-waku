@@ -414,6 +414,8 @@ pub struct PersistedState {
     pub provider_binary_overrides: HashMap<ProviderKind, String>,
     #[serde(default)]
     pub agentos_mcp: waku_protocol::settings::AgentOsMcpSettings,
+    #[serde(default)]
+    pub remote_mcp: waku_protocol::settings::RemoteMcpSettings,
     #[serde(skip)]
     daemon_settings_extra: BTreeMap<String, serde_json::Value>,
     #[serde(skip)]
@@ -513,6 +515,7 @@ impl PersistedState {
             disabled_providers: Vec::new(),
             provider_binary_overrides: HashMap::new(),
             agentos_mcp: waku_protocol::settings::AgentOsMcpSettings::default(),
+            remote_mcp: waku_protocol::settings::RemoteMcpSettings::default(),
             daemon_settings_extra: BTreeMap::new(),
             dirty_sessions: HashSet::new(),
         }
@@ -603,6 +606,7 @@ impl PersistedState {
             disabled_providers: self.disabled_providers.clone(),
             provider_binary_overrides: self.provider_binary_overrides.clone(),
             agentos_mcp: self.agentos_mcp.clone(),
+            remote_mcp: self.remote_mcp.clone(),
             extra: self.daemon_settings_extra.clone(),
         }
     }
@@ -617,6 +621,7 @@ impl PersistedState {
         self.disabled_providers = settings.disabled_providers;
         self.provider_binary_overrides = settings.provider_binary_overrides;
         self.agentos_mcp = settings.agentos_mcp;
+        self.remote_mcp = settings.remote_mcp;
         self.daemon_settings_extra = settings.extra;
     }
 

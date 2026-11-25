@@ -33,6 +33,10 @@ impl DaemonNetworkEndpoint {
     pub fn pairing_url(&self, port: u16, token: &str) -> String {
         format!("http://{}:{port}/#token={token}", self.host)
     }
+
+    pub fn mcp_url(&self, port: u16) -> String {
+        format!("http://{}:{port}/mcp", self.host)
+    }
 }
 
 /// Classify a non-loopback IPv4 address for mobile/remote pairing.
@@ -300,5 +304,6 @@ mod tests {
             ep.pairing_url(34123, "abc123"),
             "http://100.84.159.56:34123/#token=abc123"
         );
+        assert_eq!(ep.mcp_url(34123), "http://100.84.159.56:34123/mcp");
     }
 }
