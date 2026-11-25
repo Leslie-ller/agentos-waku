@@ -11,7 +11,7 @@
 //! persists transcripts to SQLite even when no Desktop or Web client is
 //! attached.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read as _, Write as _};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use waku_protocol::model::{
     AgentSession, DriverEvent, MessageRole, PermissionOption, Project, ProviderKind, RuntimeMode,
-    SessionStatus, UserInputAnswer, UserInputQuestion,
+    SessionStatus, TurnStatus, UserInputAnswer, UserInputQuestion,
 };
 use waku_protocol::persistence::SessionMessageMatch;
 use waku_protocol::settings::RemoteMcpSettings;
@@ -42,6 +42,11 @@ pub const REMOTE_MCP_SERVER_NAME: &str = "agentos-remote-mcp";
 pub const MAX_MCP_CONNECTIONS: usize = 12;
 pub const MAX_MCP_CONCURRENT_WAITS: usize = 6;
 const MAX_MCP_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_FINISHED_TURNS: usize = 512;
+const MAX_EARLY_ERROR_DRAIN_BYTES: usize = 4 * 1024 * 1024;
+const UNKNOWN_LEN_ERROR_DRAIN_BYTES: usize = 512 * 1024;
+const EARLY_ERROR_DRAIN_DEADLINE: Duration = Duration::from_millis(1500);
+const EARLY_ERROR_DRAIN_SLICE: Duration = Duration::from_millis(50);
 const HTTP_BODY_READ_DEADLINE: Duration = Duration::from_secs(15);
 const STREAM_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 30;
@@ -67,6 +72,7 @@ pub enum ScribeStreamPhase {
 #[derive(Clone, Debug)]
 pub struct PendingPermissionRecord {
     pub runtime_id: Uuid,
+    pub turn_id: Option<Uuid>,
     pub request_id: String,
     pub title: String,
     pub detail: String,
@@ -77,9 +83,38 @@ pub struct PendingPermissionRecord {
 #[derive(Clone, Debug)]
 pub struct PendingUserInputRecord {
     pub runtime_id: Uuid,
+    pub turn_id: Option<Uuid>,
     pub request_id: String,
     pub questions: Vec<UserInputQuestion>,
     pub created_at: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct FinishedTurnRecord {
+    pub session_id: Uuid,
+    pub runtime_id: Uuid,
+    pub turn_id: Uuid,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub enum WaitOutcome {
+    TurnFinished(FinishedTurnRecord),
+    AwaitingPermission {
+        snapshot: LiveSessionSnapshot,
+        permissions: Vec<PendingPermissionRecord>,
+    },
+    AwaitingUserInput {
+        snapshot: LiveSessionSnapshot,
+        user_inputs: Vec<PendingUserInputRecord>,
+    },
+    Parked(LiveSessionSnapshot),
+    SessionSettled(LiveSessionSnapshot),
+    NoActiveRuntime,
+    TimedOut {
+        snapshot: Option<LiveSessionSnapshot>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -229,19 +264,44 @@ pub trait RemoteMcpBackend: Send + Sync + 'static {
     fn active_runtime_for(&self, session_id: Uuid) -> Option<(Uuid, bool)>;
 }
 
+#[derive(Default)]
+struct ScribeState {
+    live: HashMap<Uuid, LiveSessionEntry>,
+    finished_turns: VecDeque<FinishedTurnRecord>,
+}
+
+impl ScribeState {
+    fn record_finished_turn(&mut self, record: FinishedTurnRecord) {
+        self.finished_turns
+            .retain(|existing| !(existing.session_id == record.session_id && existing.turn_id == record.turn_id));
+        self.finished_turns.push_back(record);
+        while self.finished_turns.len() > MAX_FINISHED_TURNS {
+            self.finished_turns.pop_front();
+        }
+    }
+
+    fn find_finished_turn(&self, session_id: Uuid, turn_id: Uuid) -> Option<FinishedTurnRecord> {
+        self.finished_turns
+            .iter()
+            .rev()
+            .find(|record| record.session_id == session_id && record.turn_id == turn_id)
+            .cloned()
+    }
+}
+
 /// Daemon-owned observer attached directly to `Hub::emit` / `Hub::end_runtime`.
 ///
 /// Unlike WebSocket subscribers, the scribe receives every event through an
 /// unbounded internal channel and is never dropped for backpressure.
 pub struct DaemonEventScribe {
-    live: StdMutex<HashMap<Uuid, LiveSessionEntry>>,
+    state: StdMutex<ScribeState>,
     notify: Condvar,
 }
 
 impl Default for DaemonEventScribe {
     fn default() -> Self {
         Self {
-            live: StdMutex::new(HashMap::new()),
+            state: StdMutex::new(ScribeState::default()),
             notify: Condvar::new(),
         }
     }
@@ -279,12 +339,26 @@ impl DaemonEventScribe {
                     runtime_id,
                 } => {
                     let should_flush = {
-                        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
-                        let matches = live.get(&session_id).is_some_and(|entry| {
+                        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        let matches = state.live.get(&session_id).is_some_and(|entry| {
                             runtime_id.is_none_or(|rid| entry.runtime_id == rid)
                         });
                         if matches {
-                            let removed = live.remove(&session_id);
+                            let removed = state.live.remove(&session_id);
+                            if let Some(ref entry) = removed
+                                && entry.status.is_busy()
+                                && let Some(active_tid) = entry.active_turn_id
+                            {
+                                state.record_finished_turn(FinishedTurnRecord {
+                                    session_id,
+                                    runtime_id: entry.runtime_id,
+                                    turn_id: active_tid,
+                                    success: false,
+                                    error: entry.last_error.clone().or_else(|| {
+                                        Some("runtime ended before turn finished".into())
+                                    }),
+                                });
+                            }
                             removed.is_some_and(|e| e.dirty_unflushed)
                         } else {
                             false
@@ -309,14 +383,18 @@ impl DaemonEventScribe {
         let instant_now = Instant::now();
 
         let (mut stream_phase, flush_now, should_wake) = {
-            let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
-            let entry = live
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut newly_finished: Option<FinishedTurnRecord> = None;
+            let entry = state
+                .live
                 .entry(sequenced.session_id)
                 .and_modify(|existing| {
                     if existing.runtime_id != sequenced.runtime_id || existing.epoch != sequenced.epoch
                     {
                         existing.runtime_id = sequenced.runtime_id;
                         existing.epoch = sequenced.epoch;
+                        existing.status = SessionStatus::Idle;
+                        existing.active_turn_id = None;
                         existing.pending_permissions.clear();
                         existing.pending_user_inputs.clear();
                         existing.stream_phase = None;
@@ -381,6 +459,7 @@ impl DaemonEventScribe {
                         .retain(|item| item.request_id != *request_id);
                     entry.pending_permissions.push(PendingPermissionRecord {
                         runtime_id: sequenced.runtime_id,
+                        turn_id: entry.active_turn_id,
                         request_id: request_id.clone(),
                         title: title.clone(),
                         detail: detail.clone(),
@@ -401,6 +480,7 @@ impl DaemonEventScribe {
                             .retain(|item| item.request_id != *request_id);
                         entry.pending_user_inputs.push(PendingUserInputRecord {
                             runtime_id: sequenced.runtime_id,
+                            turn_id: entry.active_turn_id,
                             request_id: request_id.clone(),
                             questions: questions.clone(),
                             created_at: now,
@@ -423,6 +503,17 @@ impl DaemonEventScribe {
                     };
                     if let Some(tid) = entry.active_turn_id.take() {
                         entry.last_finished_turn_id = Some(tid);
+                        newly_finished = Some(FinishedTurnRecord {
+                            session_id: sequenced.session_id,
+                            runtime_id: sequenced.runtime_id,
+                            turn_id: tid,
+                            success: *success,
+                            error: if *success {
+                                None
+                            } else {
+                                entry.last_error.clone()
+                            },
+                        });
                     }
                     entry.last_turn_success = Some(*success);
                     entry.pending_permissions.clear();
@@ -441,6 +532,15 @@ impl DaemonEventScribe {
                         entry.status = SessionStatus::Failed;
                         if let Some(tid) = entry.active_turn_id.take() {
                             entry.last_finished_turn_id = Some(tid);
+                            newly_finished = Some(FinishedTurnRecord {
+                                session_id: sequenced.session_id,
+                                runtime_id: sequenced.runtime_id,
+                                turn_id: tid,
+                                success: false,
+                                error: entry.last_error.clone().or_else(|| {
+                                    Some("agent process exited before turn finished".into())
+                                }),
+                            });
                         }
                         entry.last_turn_success = Some(false);
                     }
@@ -466,7 +566,11 @@ impl DaemonEventScribe {
             } else {
                 entry.dirty_unflushed = true;
             }
-            (entry.stream_phase, flush, wake)
+            let phase = entry.stream_phase;
+            if let Some(record) = newly_finished {
+                state.record_finished_turn(record);
+            }
+            (phase, flush, wake)
         };
 
         if let Some(mcp_backend) = backend.remote_mcp() {
@@ -479,8 +583,8 @@ impl DaemonEventScribe {
             {
                 hub.broadcast_task_state_changed_all();
             }
-            let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(entry) = live.get_mut(&sequenced.session_id)
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = state.live.get_mut(&sequenced.session_id)
                 && entry.runtime_id == sequenced.runtime_id
             {
                 entry.stream_phase = stream_phase;
@@ -493,8 +597,8 @@ impl DaemonEventScribe {
     }
 
     pub fn clear_pending_request(&self, session_id: Uuid, request_id: &str) {
-        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = live.get_mut(&session_id) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = state.live.get_mut(&session_id) {
             let before = entry.pending_permissions.len() + entry.pending_user_inputs.len();
             entry
                 .pending_permissions
@@ -511,19 +615,28 @@ impl DaemonEventScribe {
     }
 
     pub fn snapshot(&self, session_id: Uuid) -> Option<LiveSessionSnapshot> {
-        self.live
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .live
             .get(&session_id)
             .map(|entry| entry.snapshot(session_id))
+    }
+
+    pub fn find_finished_turn(&self, session_id: Uuid, turn_id: Uuid) -> Option<FinishedTurnRecord> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .find_finished_turn(session_id, turn_id)
     }
 
     pub fn all_pending_requests(
         &self,
     ) -> Vec<(Uuid, Vec<PendingPermissionRecord>, Vec<PendingUserInputRecord>)> {
-        self.live
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .live
             .iter()
             .filter(|(_, entry)| {
                 !entry.pending_permissions.is_empty() || !entry.pending_user_inputs.is_empty()
@@ -539,64 +652,118 @@ impl DaemonEventScribe {
     }
 
     /// Block until the given session's turn reaches a terminal or blocked state
-    /// (`Idle`, `Failed`, `Background`, `Waiting` with pending requests, or
-    /// `turn_id` completed), or until `timeout` elapses.
+    /// (`Idle`, `Failed`, `Background`, `Waiting` with matching pending requests,
+    /// or `turn_id` completed), or until `timeout` elapses.
     pub fn wait_for_turn(
         &self,
         session_id: Uuid,
         target_turn_id: Option<Uuid>,
         timeout: Duration,
-    ) -> Option<LiveSessionSnapshot> {
+    ) -> WaitOutcome {
         let deadline = Instant::now() + timeout;
-        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if let Some(entry) = live.get(&session_id) {
-                let done = is_wait_settled(entry, target_turn_id);
-                if done {
-                    return Some(entry.snapshot(session_id));
-                }
-            } else if target_turn_id.is_none() {
-                return None;
+            if let Some(outcome) = evaluate_wait_state(&state, session_id, target_turn_id) {
+                return outcome;
             }
             let now = Instant::now();
             if now >= deadline {
-                return live.get(&session_id).map(|e| e.snapshot(session_id));
+                return WaitOutcome::TimedOut {
+                    snapshot: state.live.get(&session_id).map(|e| e.snapshot(session_id)),
+                };
             }
             let remaining = deadline.saturating_duration_since(now);
             let (guard, timeout_res) = self
                 .notify
-                .wait_timeout(live, remaining.min(Duration::from_millis(500)))
+                .wait_timeout(state, remaining.min(Duration::from_millis(500)))
                 .unwrap_or_else(|e| e.into_inner());
-            live = guard;
+            state = guard;
             if timeout_res.timed_out() && Instant::now() >= deadline {
-                return live.get(&session_id).map(|e| e.snapshot(session_id));
+                if let Some(outcome) = evaluate_wait_state(&state, session_id, target_turn_id) {
+                    return outcome;
+                }
+                return WaitOutcome::TimedOut {
+                    snapshot: state.live.get(&session_id).map(|e| e.snapshot(session_id)),
+                };
             }
         }
     }
 }
 
-fn is_wait_settled(entry: &LiveSessionEntry, target_turn_id: Option<Uuid>) -> bool {
-    if !entry.pending_permissions.is_empty() || !entry.pending_user_inputs.is_empty() {
-        return true;
-    }
+fn evaluate_wait_state(
+    state: &ScribeState,
+    session_id: Uuid,
+    target_turn_id: Option<Uuid>,
+) -> Option<WaitOutcome> {
     if let Some(target) = target_turn_id {
-        if entry.last_finished_turn_id == Some(target) {
-            return true;
+        if let Some(record) = state.find_finished_turn(session_id, target) {
+            return Some(WaitOutcome::TurnFinished(record));
         }
-        if entry.active_turn_id == Some(target) {
-            return matches!(
-                entry.status,
-                SessionStatus::Idle | SessionStatus::Failed | SessionStatus::Background
-            );
+        if let Some(entry) = state.live.get(&session_id)
+            && entry.active_turn_id == Some(target)
+        {
+            let matching_permissions: Vec<PendingPermissionRecord> = entry
+                .pending_permissions
+                .iter()
+                .filter(|p| p.turn_id.is_none() || p.turn_id == Some(target))
+                .cloned()
+                .collect();
+            if !matching_permissions.is_empty() {
+                return Some(WaitOutcome::AwaitingPermission {
+                    snapshot: entry.snapshot(session_id),
+                    permissions: matching_permissions,
+                });
+            }
+            let matching_inputs: Vec<PendingUserInputRecord> = entry
+                .pending_user_inputs
+                .iter()
+                .filter(|q| q.turn_id.is_none() || q.turn_id == Some(target))
+                .cloned()
+                .collect();
+            if !matching_inputs.is_empty() {
+                return Some(WaitOutcome::AwaitingUserInput {
+                    snapshot: entry.snapshot(session_id),
+                    user_inputs: matching_inputs,
+                });
+            }
+            if entry.status == SessionStatus::Background {
+                return Some(WaitOutcome::Parked(entry.snapshot(session_id)));
+            }
+            if entry.status == SessionStatus::Failed {
+                return Some(WaitOutcome::TurnFinished(FinishedTurnRecord {
+                    session_id,
+                    runtime_id: entry.runtime_id,
+                    turn_id: target,
+                    success: false,
+                    error: entry.last_error.clone(),
+                }));
+            }
         }
-        // Target turn may not have emitted PromptSubmitted to the scribe yet;
-        // keep waiting briefly unless runtime already failed.
-        return false;
+        return None;
     }
-    matches!(
-        entry.status,
-        SessionStatus::Idle | SessionStatus::Failed | SessionStatus::Background
-    )
+
+    let Some(entry) = state.live.get(&session_id) else {
+        return Some(WaitOutcome::NoActiveRuntime);
+    };
+    if !entry.pending_permissions.is_empty() {
+        return Some(WaitOutcome::AwaitingPermission {
+            snapshot: entry.snapshot(session_id),
+            permissions: entry.pending_permissions.clone(),
+        });
+    }
+    if !entry.pending_user_inputs.is_empty() {
+        return Some(WaitOutcome::AwaitingUserInput {
+            snapshot: entry.snapshot(session_id),
+            user_inputs: entry.pending_user_inputs.clone(),
+        });
+    }
+    match entry.status {
+        SessionStatus::Background => Some(WaitOutcome::Parked(entry.snapshot(session_id))),
+        SessionStatus::Idle | SessionStatus::Failed => {
+            Some(WaitOutcome::SessionSettled(entry.snapshot(session_id)))
+        }
+        SessionStatus::Connecting | SessionStatus::Working | SessionStatus::Waiting => None,
+    }
 }
 
 #[derive(Default)]
@@ -752,56 +919,58 @@ pub(crate) fn handle_mcp_http_request(
 ) -> anyhow::Result<()> {
     let raw_path = raw_target.split('?').next().unwrap_or("/");
     if is_well_known_path(raw_path) {
-        write_mcp_response(
+        let drain = if matches!(method, "GET" | "HEAD" | "OPTIONS" | "DELETE") {
+            EarlyDrainHint::None
+        } else {
+            EarlyDrainHint::Unknown
+        };
+        write_mcp_error_and_drain(
             stream,
             "404 Not Found",
             "application/json; charset=utf-8",
             br#"{"error":"not_found"}"#,
             &[],
             method == "HEAD",
+            drain,
         )?;
         return Ok(());
     }
-
-    let Some(_conn_permit) = ctx.budget.try_acquire_connection() else {
-        write_mcp_response(
-            stream,
-            "503 Service Unavailable",
-            "application/json; charset=utf-8",
-            br#"{"error":"remote MCP concurrency limit reached; retry shortly"}"#,
-            &[("Retry-After", "2")],
-            method == "HEAD",
-        )?;
-        return Ok(());
-    };
 
     let headers = match ParsedHeaders::parse(header_text) {
         Ok(h) => h,
         Err(reason) => {
             let body = json!({ "error": reason }).to_string();
-            write_mcp_response(
+            let drain = if matches!(method, "GET" | "HEAD" | "OPTIONS" | "DELETE") {
+                EarlyDrainHint::None
+            } else {
+                EarlyDrainHint::Unknown
+            };
+            write_mcp_error_and_drain(
                 stream,
                 "400 Bad Request",
                 "application/json; charset=utf-8",
                 body.as_bytes(),
                 &[],
                 false,
+                drain,
             )?;
             return Ok(());
         }
     };
+    let early_drain = EarlyDrainHint::from_headers(method, &headers);
 
     // Origin validation (DNS-rebinding protection per MCP Streamable HTTP spec).
     let mut cors_headers: Vec<(&str, String)> = Vec::new();
     if let Some(ref origin) = headers.origin {
         if !is_origin_allowed(origin, headers.host.as_deref(), ctx.options) {
-            write_mcp_response(
+            write_mcp_error_and_drain(
                 stream,
                 "403 Forbidden",
                 "application/json; charset=utf-8",
                 br#"{"error":"origin is not allowed"}"#,
                 &[],
                 false,
+                early_drain,
             )?;
             return Ok(());
         }
@@ -828,13 +997,14 @@ pub(crate) fn handle_mcp_http_request(
     }
 
     let Some(mcp_backend) = ctx.backend.remote_mcp() else {
-        write_mcp_response(
+        write_mcp_error_and_drain(
             stream,
             "503 Service Unavailable",
             "application/json; charset=utf-8",
             br#"{"error":"remote MCP backend is unavailable"}"#,
             &[],
             false,
+            early_drain,
         )?;
         return Ok(());
     };
@@ -842,13 +1012,14 @@ pub(crate) fn handle_mcp_http_request(
     let settings = mcp_backend.remote_mcp_settings();
     if !settings.enabled || settings.token.trim().is_empty() {
         let extra: Vec<(&str, &str)> = cors_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        write_mcp_response(
+        write_mcp_error_and_drain(
             stream,
             "403 Forbidden",
             "application/json; charset=utf-8",
             br#"{"error":"remote MCP is disabled in AgentOS settings"}"#,
             &extra,
             method == "HEAD",
+            early_drain,
         )?;
         return Ok(());
     }
@@ -867,13 +1038,14 @@ pub(crate) fn handle_mcp_http_request(
         for (k, v) in &cors_headers {
             extra.push((*k, v.as_str()));
         }
-        write_mcp_response(
+        write_mcp_error_and_drain(
             stream,
             "401 Unauthorized",
             "application/json; charset=utf-8",
             br#"{"error":"query-parameter tokens are not accepted; use Authorization: Bearer <token>"}"#,
             &extra,
             method == "HEAD",
+            early_drain,
         )?;
         return Ok(());
     }
@@ -889,16 +1061,36 @@ pub(crate) fn handle_mcp_http_request(
         for (k, v) in &cors_headers {
             extra.push((*k, v.as_str()));
         }
-        write_mcp_response(
+        write_mcp_error_and_drain(
             stream,
             "401 Unauthorized",
             "application/json; charset=utf-8",
             br#"{"error":"unauthorized; valid Authorization: Bearer <token> header required"}"#,
             &extra,
             method == "HEAD",
+            early_drain,
         )?;
         return Ok(());
     }
+
+    // Acquire a concurrency slot only after auth/origin checks so unauthenticated
+    // callers (and their early-error body drains) cannot exhaust MCP slots.
+    let Some(conn_permit) = ctx.budget.try_acquire_connection() else {
+        let mut extra: Vec<(&str, &str)> = vec![("Retry-After", "2")];
+        for (k, v) in &cors_headers {
+            extra.push((*k, v.as_str()));
+        }
+        write_mcp_error_and_drain(
+            stream,
+            "503 Service Unavailable",
+            "application/json; charset=utf-8",
+            br#"{"error":"remote MCP concurrency limit reached; retry shortly"}"#,
+            &extra,
+            method == "HEAD",
+            early_drain,
+        )?;
+        return Ok(());
+    };
 
     let session_header_value = headers
         .mcp_session_id
@@ -915,6 +1107,7 @@ pub(crate) fn handle_mcp_http_request(
             for (k, v) in &cors_headers {
                 extra.push((*k, v.as_str()));
             }
+            drop(conn_permit);
             write_mcp_response(
                 stream,
                 "405 Method Not Allowed",
@@ -931,6 +1124,7 @@ pub(crate) fn handle_mcp_http_request(
             for (k, v) in &cors_headers {
                 extra.push((*k, v.as_str()));
             }
+            drop(conn_permit);
             write_mcp_response(
                 stream,
                 "204 No Content",
@@ -947,13 +1141,15 @@ pub(crate) fn handle_mcp_http_request(
             for (k, v) in &cors_headers {
                 extra.push((*k, v.as_str()));
             }
-            write_mcp_response(
+            drop(conn_permit);
+            write_mcp_error_and_drain(
                 stream,
                 "405 Method Not Allowed",
                 "application/json; charset=utf-8",
                 br#"{"error":"method not allowed"}"#,
                 &extra,
                 false,
+                early_drain,
             )?;
             return Ok(());
         }
@@ -964,37 +1160,43 @@ pub(crate) fn handle_mcp_http_request(
         && len > MAX_MCP_BODY_BYTES
     {
         let extra: Vec<(&str, &str)> = cors_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        write_mcp_response(
+        drop(conn_permit);
+        write_mcp_error_and_drain(
             stream,
             "413 Payload Too Large",
             "application/json; charset=utf-8",
             br#"{"error":"request body exceeds 2 MiB limit"}"#,
             &extra,
             false,
+            early_drain,
         )?;
         return Ok(());
     }
     if headers.transfer_encoding_present && !headers.transfer_encoding_chunked {
         let extra: Vec<(&str, &str)> = cors_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        write_mcp_response(
+        drop(conn_permit);
+        write_mcp_error_and_drain(
             stream,
             "501 Not Implemented",
             "application/json; charset=utf-8",
             br#"{"error":"unsupported Transfer-Encoding"}"#,
             &extra,
             false,
+            early_drain,
         )?;
         return Ok(());
     }
     if !headers.transfer_encoding_chunked && headers.content_length.is_none() {
         let extra: Vec<(&str, &str)> = cors_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        write_mcp_response(
+        drop(conn_permit);
+        write_mcp_error_and_drain(
             stream,
             "411 Length Required",
             "application/json; charset=utf-8",
             br#"{"error":"Content-Length or chunked Transfer-Encoding required"}"#,
             &extra,
             false,
+            early_drain,
         )?;
         return Ok(());
     }
@@ -1014,19 +1216,22 @@ pub(crate) fn handle_mcp_http_request(
         Err(BodyReadError::TooLarge) => {
             let extra: Vec<(&str, &str)> =
                 cors_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            write_mcp_response(
+            drop(conn_permit);
+            write_mcp_error_and_drain(
                 stream,
                 "413 Payload Too Large",
                 "application/json; charset=utf-8",
                 br#"{"error":"request body exceeds 2 MiB limit"}"#,
                 &extra,
                 false,
+                EarlyDrainHint::Unknown,
             )?;
             return Ok(());
         }
         Err(BodyReadError::Timeout) => {
             let extra: Vec<(&str, &str)> =
                 cors_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            drop(conn_permit);
             write_mcp_response(
                 stream,
                 "408 Request Timeout",
@@ -1041,17 +1246,21 @@ pub(crate) fn handle_mcp_http_request(
             let extra: Vec<(&str, &str)> =
                 cors_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
             let body = json!({ "error": msg }).to_string();
-            write_mcp_response(
+            drop(conn_permit);
+            write_mcp_error_and_drain(
                 stream,
                 "400 Bad Request",
                 "application/json; charset=utf-8",
                 body.as_bytes(),
                 &extra,
                 false,
+                EarlyDrainHint::Unknown,
             )?;
             return Ok(());
         }
     };
+
+    let _conn_permit = conn_permit;
 
     let payload: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
@@ -1361,6 +1570,39 @@ fn read_crlf_line(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum EarlyDrainHint {
+    None,
+    ExpectContinueUnacknowledged,
+    ExpectedBytes(usize),
+    Unknown,
+}
+
+impl EarlyDrainHint {
+    fn from_headers(method: &str, headers: &ParsedHeaders) -> Self {
+        if matches!(method, "GET" | "HEAD" | "OPTIONS" | "DELETE")
+            && headers.content_length.unwrap_or(0) == 0
+            && !headers.transfer_encoding_present
+        {
+            return Self::None;
+        }
+        if headers.expect_continue {
+            return Self::ExpectContinueUnacknowledged;
+        }
+        if let Some(len) = headers.content_length {
+            if len == 0 {
+                Self::None
+            } else {
+                Self::ExpectedBytes(len)
+            }
+        } else if headers.transfer_encoding_present {
+            Self::Unknown
+        } else {
+            Self::None
+        }
+    }
+}
+
 fn write_mcp_response(
     stream: &mut TcpStream,
     status: &str,
@@ -1384,19 +1626,72 @@ fn write_mcp_response(
     if !head_only && !body.is_empty() {
         stream.write_all(body)?;
     }
-    stream.flush()?;
+    stream.flush()
+}
+
+fn write_mcp_error_and_drain(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+    head_only: bool,
+    drain: EarlyDrainHint,
+) -> io::Result<()> {
+    write_mcp_response(stream, status, content_type, body, extra_headers, head_only)?;
+    let (limit, deadline) = match drain {
+        EarlyDrainHint::None => return Ok(()),
+        EarlyDrainHint::ExpectContinueUnacknowledged => {
+            (4 * 1024, Instant::now() + EARLY_ERROR_DRAIN_SLICE)
+        }
+        EarlyDrainHint::ExpectedBytes(len) => (
+            len.min(MAX_EARLY_ERROR_DRAIN_BYTES),
+            Instant::now() + EARLY_ERROR_DRAIN_DEADLINE,
+        ),
+        EarlyDrainHint::Unknown => (
+            UNKNOWN_LEN_ERROR_DRAIN_BYTES,
+            Instant::now() + EARLY_ERROR_DRAIN_DEADLINE,
+        ),
+    };
     // RFC 7230 §6.6 graceful half-close: closing a socket while unread request
     // body bytes sit in the kernel receive buffer emits TCP RST on macOS/BSD
-    // and Windows, causing HTTP clients to hit ECONNRESET while reading 401/403
-    // error responses. Signal FIN on the write half and drain a bounded prefix.
+    // and Windows, causing HTTP clients to hit ECONNRESET while reading early
+    // 401/403/413 responses. Signal FIN on the write half and drain unread bytes
+    // within a bounded byte cap and overall deadline.
     let _ = stream.shutdown(std::net::Shutdown::Write);
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-    let mut discard = [0u8; 4096];
+    let mut discard = [0u8; 8192];
     let mut drained = 0usize;
-    while drained < 64 * 1024 {
-        match stream.read(&mut discard) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => drained += n,
+    let mut last_read_at: Option<Instant> = None;
+    while drained < limit {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let _ = stream.set_read_timeout(Some(remaining.min(EARLY_ERROR_DRAIN_SLICE)));
+        let to_read = discard.len().min(limit - drained);
+        match stream.read(&mut discard[..to_read]) {
+            Ok(0) => break,
+            Ok(n) => {
+                drained += n;
+                last_read_at = Some(Instant::now());
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                if matches!(drain, EarlyDrainHint::Unknown)
+                    && last_read_at
+                        .is_some_and(|t| t.elapsed() >= Duration::from_millis(200))
+                {
+                    break;
+                }
+            }
+            Err(_) => break,
         }
     }
     Ok(())
@@ -1586,7 +1881,7 @@ fn remote_mcp_tool_definitions(settings: &RemoteMcpSettings) -> Vec<Value> {
                         "message": { "type": "string", "description": "Optional initial user prompt to send immediately after creating the session." },
                         "wait": { "type": "boolean", "description": "When `message` is provided, wait for the turn to settle or pause (default false)." },
                         "timeout_seconds": { "type": "integer", "description": "Wait timeout in seconds when `wait: true` (default 30, max 60)." },
-                        "idempotency_key": { "type": "string", "description": "Optional caller-defined key to prevent duplicate submissions on retry." }
+                        "idempotency_key": { "type": "string", "description": "Optional caller-defined key to prevent duplicate submissions on retry (in-memory, up to 256 recent keys for the running daemon process)." }
                     },
                     "required": []
                 }
@@ -1603,7 +1898,7 @@ fn remote_mcp_tool_definitions(settings: &RemoteMcpSettings) -> Vec<Value> {
                         "steer": { "type": "boolean", "description": "If the session is currently mid-turn and supports steering, steer the active turn instead of returning busy (default false)." },
                         "wait": { "type": "boolean", "description": "Wait for the turn to finish, park, or pause for approval (default false)." },
                         "timeout_seconds": { "type": "integer", "description": "Max seconds to wait when `wait: true` (default 30, max 60)." },
-                        "idempotency_key": { "type": "string", "description": "Optional caller-defined key to deduplicate retries." }
+                        "idempotency_key": { "type": "string", "description": "Optional caller-defined key to deduplicate retries (in-memory, up to 256 recent keys for the running daemon process)." }
                     },
                     "required": ["session_id", "message"]
                 }
@@ -2213,10 +2508,13 @@ fn call_remote_mcp_tool(
             let Some(_wait_guard) = ctx.budget.try_acquire_wait() else {
                 bail!("too many concurrent wait requests; retry shortly or poll get_session");
             };
-            let live = ctx
-                .scribe
-                .wait_for_turn(session_id, turn_id, Duration::from_secs(timeout_secs));
-            build_turn_state_response(session_id, turn_id, live, backend)
+            wait_for_turn_with_persistence(
+                session_id,
+                turn_id,
+                Duration::from_secs(timeout_secs),
+                backend,
+                ctx,
+            )
         }
 
         "cancel_session" => {
@@ -2456,95 +2754,257 @@ fn execute_send_message(
         }));
     };
 
-    let live = ctx.scribe.wait_for_turn(
+    let mut response = wait_for_turn_with_persistence(
         session_id,
         outcome.turn_id,
         Duration::from_secs(timeout_secs),
-    );
-    let mut response = build_turn_state_response(session_id, outcome.turn_id, live, backend)?;
+        backend,
+        ctx,
+    )?;
     response["accepted"] = json!(true);
     response["deduplicated"] = json!(outcome.deduplicated);
-    response["runtime_id"] = json!(outcome.runtime_id.to_string());
+    if response["runtime_id"].is_null() {
+        response["runtime_id"] = json!(outcome.runtime_id.to_string());
+    }
     response["message_id"] = json!(outcome.message_id.map(|id| id.to_string()));
     Ok(response)
+}
+
+fn wait_for_turn_with_persistence(
+    session_id: Uuid,
+    target_turn_id: Option<Uuid>,
+    timeout: Duration,
+    backend: &dyn RemoteMcpBackend,
+    ctx: &RemoteMcpHttpContext<'_>,
+) -> anyhow::Result<Value> {
+    if let Some(tid) = target_turn_id {
+        if let Some(record) = ctx.scribe.find_finished_turn(session_id, tid) {
+            return build_turn_state_response(
+                session_id,
+                Some(tid),
+                WaitOutcome::TurnFinished(record),
+                backend,
+            );
+        }
+        let is_currently_active = ctx
+            .scribe
+            .snapshot(session_id)
+            .is_some_and(|snap| snap.active_turn_id == Some(tid));
+        if !is_currently_active
+            && let Some(session) = backend.hydrate_session_by_id(session_id)?
+            && let Some(persisted_turn) = session.turns.iter().find(|t| t.id == tid)
+            && persisted_turn.status != TurnStatus::Running
+        {
+            let status_label = match persisted_turn.status {
+                TurnStatus::Completed => "completed",
+                TurnStatus::Failed => "failed",
+                TurnStatus::Interrupted => "interrupted",
+                TurnStatus::Running => "running",
+            };
+            let reply = extract_assistant_reply(&session, Some(tid));
+            return Ok(json!({
+                "session_id": session_id.to_string(),
+                "turn_id": tid.to_string(),
+                "runtime_id": Value::Null,
+                "status": status_label,
+                "timed_out": false,
+                "reply": reply,
+                "error": Value::Null,
+                "pending_permissions": [],
+                "pending_user_inputs": [],
+            }));
+        }
+    }
+
+    let outcome = ctx.scribe.wait_for_turn(session_id, target_turn_id, timeout);
+    build_turn_state_response(session_id, target_turn_id, outcome, backend)
+}
+
+fn extract_assistant_reply(session: &AgentSession, target_turn_id: Option<Uuid>) -> Option<String> {
+    let iter = session
+        .messages
+        .iter()
+        .filter(|m| m.role == MessageRole::Assistant);
+    let texts: Vec<&str> = if let Some(tid) = target_turn_id {
+        iter.filter(|m| m.turn_id == Some(tid))
+            .map(|m| m.content.as_str())
+            .collect()
+    } else {
+        iter.last()
+            .map(|m| vec![m.content.as_str()])
+            .unwrap_or_default()
+    };
+    if texts.is_empty() {
+        None
+    } else {
+        Some(texts.join("\n\n"))
+    }
 }
 
 fn build_turn_state_response(
     session_id: Uuid,
     target_turn_id: Option<Uuid>,
-    live: Option<LiveSessionSnapshot>,
+    outcome: WaitOutcome,
     backend: &dyn RemoteMcpBackend,
 ) -> anyhow::Result<Value> {
     let session = backend.hydrate_session_by_id(session_id)?;
-    let pending_permissions: Vec<Value> = live
-        .as_ref()
-        .map(|l| {
-            l.pending_permissions
-                .iter()
-                .map(format_pending_permission)
-                .collect()
-        })
-        .unwrap_or_default();
-    let pending_user_inputs: Vec<Value> = live
-        .as_ref()
-        .map(|l| {
-            l.pending_user_inputs
-                .iter()
-                .map(format_pending_user_input)
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let status_label = if !pending_permissions.is_empty() {
-        "awaiting_permission"
-    } else if !pending_user_inputs.is_empty() {
-        "awaiting_user_input"
-    } else if let Some(ref l) = live {
-        match l.status {
-            SessionStatus::Idle => "completed",
-            SessionStatus::Failed => "failed",
-            SessionStatus::Background => "background",
-            SessionStatus::Waiting => "waiting",
-            SessionStatus::Connecting | SessionStatus::Working => "running",
+    let (
+        status_label,
+        timed_out,
+        runtime_id,
+        resolved_turn_id,
+        error,
+        pending_permissions,
+        pending_user_inputs,
+    ) = match outcome {
+        WaitOutcome::TurnFinished(record) => (
+            if record.success {
+                "completed"
+            } else {
+                "failed"
+            },
+            false,
+            Some(record.runtime_id),
+            Some(record.turn_id),
+            record.error,
+            Vec::new(),
+            Vec::new(),
+        ),
+        WaitOutcome::AwaitingPermission {
+            snapshot,
+            permissions,
+        } => (
+            "awaiting_permission",
+            false,
+            Some(snapshot.runtime_id),
+            target_turn_id
+                .or(snapshot.active_turn_id)
+                .or(snapshot.last_finished_turn_id),
+            snapshot.last_error,
+            permissions.iter().map(format_pending_permission).collect(),
+            Vec::new(),
+        ),
+        WaitOutcome::AwaitingUserInput {
+            snapshot,
+            user_inputs,
+        } => (
+            "awaiting_user_input",
+            false,
+            Some(snapshot.runtime_id),
+            target_turn_id
+                .or(snapshot.active_turn_id)
+                .or(snapshot.last_finished_turn_id),
+            snapshot.last_error,
+            Vec::new(),
+            user_inputs.iter().map(format_pending_user_input).collect(),
+        ),
+        WaitOutcome::Parked(snapshot) => (
+            "background",
+            false,
+            Some(snapshot.runtime_id),
+            target_turn_id
+                .or(snapshot.active_turn_id)
+                .or(snapshot.last_finished_turn_id),
+            snapshot.last_error,
+            Vec::new(),
+            Vec::new(),
+        ),
+        WaitOutcome::SessionSettled(snapshot) => (
+            match snapshot.status {
+                SessionStatus::Failed => "failed",
+                SessionStatus::Background => "background",
+                _ => "completed",
+            },
+            false,
+            Some(snapshot.runtime_id),
+            target_turn_id
+                .or(snapshot.last_finished_turn_id)
+                .or(snapshot.active_turn_id),
+            snapshot.last_error,
+            Vec::new(),
+            Vec::new(),
+        ),
+        WaitOutcome::NoActiveRuntime => {
+            let status = if let Some(ref s) = session {
+                match s.status {
+                    SessionStatus::Idle => "completed",
+                    SessionStatus::Failed => "failed",
+                    SessionStatus::Background => "background",
+                    SessionStatus::Waiting => "waiting",
+                    SessionStatus::Connecting | SessionStatus::Working => "running",
+                }
+            } else {
+                "unknown"
+            };
+            (status, false, None, target_turn_id, None, Vec::new(), Vec::new())
         }
-    } else if let Some(ref s) = session {
-        match s.status {
-            SessionStatus::Idle => "completed",
-            SessionStatus::Failed => "failed",
-            SessionStatus::Background => "background",
-            SessionStatus::Waiting => "waiting",
-            SessionStatus::Connecting | SessionStatus::Working => "running",
+        WaitOutcome::TimedOut { snapshot } => {
+            let status = if let Some(tid) = target_turn_id {
+                if snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.active_turn_id == Some(tid))
+                {
+                    "running"
+                } else {
+                    "timeout"
+                }
+            } else {
+                "running"
+            };
+            let perms = snapshot
+                .as_ref()
+                .map(|s| {
+                    s.pending_permissions
+                        .iter()
+                        .filter(|p| {
+                            target_turn_id
+                                .is_none_or(|tid| p.turn_id.is_none() || p.turn_id == Some(tid))
+                        })
+                        .map(format_pending_permission)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let inputs = snapshot
+                .as_ref()
+                .map(|s| {
+                    s.pending_user_inputs
+                        .iter()
+                        .filter(|q| {
+                            target_turn_id
+                                .is_none_or(|tid| q.turn_id.is_none() || q.turn_id == Some(tid))
+                        })
+                        .map(format_pending_user_input)
+                        .collect()
+                })
+                .unwrap_or_default();
+            (
+                status,
+                true,
+                snapshot.as_ref().map(|s| s.runtime_id),
+                target_turn_id.or_else(|| {
+                    snapshot
+                        .as_ref()
+                        .and_then(|s| s.active_turn_id.or(s.last_finished_turn_id))
+                }),
+                snapshot.and_then(|s| s.last_error),
+                perms,
+                inputs,
+            )
         }
-    } else {
-        "unknown"
     };
 
-    let assistant_reply = session.as_ref().and_then(|s| {
-        let iter = s
-            .messages
-            .iter()
-            .filter(|m| m.role == MessageRole::Assistant);
-        let texts: Vec<&str> = if let Some(tid) = target_turn_id {
-            iter.filter(|m| m.turn_id == Some(tid))
-                .map(|m| m.content.as_str())
-                .collect()
-        } else {
-            iter.last().map(|m| vec![m.content.as_str()]).unwrap_or_default()
-        };
-        if texts.is_empty() {
-            None
-        } else {
-            Some(texts.join("\n\n"))
-        }
-    });
+    let assistant_reply = session
+        .as_ref()
+        .and_then(|s| extract_assistant_reply(s, target_turn_id));
 
     Ok(json!({
         "session_id": session_id.to_string(),
-        "turn_id": target_turn_id.or_else(|| live.as_ref().and_then(|l| l.active_turn_id.or(l.last_finished_turn_id))).map(|id| id.to_string()),
-        "runtime_id": live.as_ref().map(|l| l.runtime_id.to_string()),
+        "turn_id": resolved_turn_id.map(|id| id.to_string()),
+        "runtime_id": runtime_id.map(|id| id.to_string()),
         "status": status_label,
+        "timed_out": timed_out,
         "reply": assistant_reply,
-        "error": live.as_ref().and_then(|l| l.last_error.clone()),
+        "error": error,
         "pending_permissions": pending_permissions,
         "pending_user_inputs": pending_user_inputs,
     }))
@@ -2611,6 +3071,7 @@ fn format_pending_permission(p: &PendingPermissionRecord) -> Value {
     json!({
         "kind": "permission",
         "runtime_id": p.runtime_id.to_string(),
+        "turn_id": p.turn_id.map(|id| id.to_string()),
         "request_id": p.request_id,
         "title": p.title,
         "detail": p.detail,
@@ -2627,6 +3088,7 @@ fn format_pending_user_input(q: &PendingUserInputRecord) -> Value {
     json!({
         "kind": "user_input",
         "runtime_id": q.runtime_id.to_string(),
+        "turn_id": q.turn_id.map(|id| id.to_string()),
         "request_id": q.request_id,
         "questions": q.questions,
         "created_at": q.created_at,
@@ -2722,7 +3184,6 @@ impl PromptIdempotencyCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::atomic::AtomicBool;
 
@@ -2740,6 +3201,19 @@ mod tests {
         stream.flush().unwrap();
         let mut response = Vec::new();
         let _ = stream.read_to_end(&mut response);
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    fn strict_http_exchange(addr: std::net::SocketAddr, request: &[u8]) -> String {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.write_all(request).unwrap();
+        stream.flush().unwrap();
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .expect("expected clean HTTP response EOF without ECONNRESET");
         String::from_utf8_lossy(&response).into_owned()
     }
 
@@ -3601,5 +4075,264 @@ mod tests {
         shutdown.store(true, Ordering::Release);
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn early_error_responses_survive_large_bodies_and_expect_continue_without_rst() {
+        let token = "agm_large_drain_token";
+        let backend = Arc::new(MockMcpBackend::new(RemoteMcpSettings {
+            enabled: true,
+            token: token.into(),
+            allow_send: true,
+            allow_approvals: false,
+        }));
+        let (addr, shutdown, server) =
+            start_test_server(backend.clone(), ServerOptions::default());
+
+        // (a) 1 MiB POST with a bad token must yield a readable 401 JSON body (no TCP RST).
+        let payload_1m = vec![b'x'; 1024 * 1024];
+        let mut req_401 = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer wrong_token\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload_1m.len()
+        )
+        .into_bytes();
+        req_401.extend_from_slice(&payload_1m);
+        let raw_401 = strict_http_exchange(addr, &req_401);
+        let (st_401, _, body_401) = split_http_response(&raw_401);
+        assert_eq!(st_401, 401);
+        let json_401: Value = serde_json::from_str(&body_401).unwrap();
+        assert!(json_401["error"].as_str().unwrap().contains("unauthorized"));
+
+        // (b) Declared 3 MiB POST with valid token must yield a readable 413 JSON body.
+        let payload_3m = vec![b'y'; 3 * 1024 * 1024];
+        let mut req_413 = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload_3m.len()
+        )
+        .into_bytes();
+        req_413.extend_from_slice(&payload_3m);
+        let raw_413 = strict_http_exchange(addr, &req_413);
+        let (st_413, _, body_413) = split_http_response(&raw_413);
+        assert_eq!(st_413, 413);
+        let json_413: Value = serde_json::from_str(&body_413).unwrap();
+        assert!(json_413["error"].as_str().unwrap().contains("2 MiB"));
+
+        // (c) Expect: 100-continue with a bad token gets 401 immediately and NO 100 Continue.
+        let req_expect = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer wrong_token\r\nExpect: 100-continue\r\nContent-Type: application/json\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n"
+        );
+        let raw_expect = strict_http_exchange(addr, req_expect.as_bytes());
+        assert!(
+            !raw_expect.contains("100 Continue"),
+            "must not emit 100 Continue for rejected auth: {raw_expect:?}"
+        );
+        let (st_expect, _, body_expect) = split_http_response(&raw_expect);
+        assert_eq!(st_expect, 401);
+        let json_expect: Value = serde_json::from_str(&body_expect).unwrap();
+        assert!(json_expect["error"].as_str().unwrap().contains("unauthorized"));
+
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn wait_for_turn_isolates_concurrent_turns_runtime_end_and_timeouts() {
+        let token = "agm_turn_isolation_token";
+        let backend = Arc::new(MockMcpBackend::new(RemoteMcpSettings {
+            enabled: true,
+            token: token.into(),
+            allow_send: true,
+            allow_approvals: false,
+        }));
+        let (addr, shutdown, server) =
+            start_test_server(backend.clone(), ServerOptions::default());
+
+        let sid = backend.sessions.lock()[0].id;
+
+        // Turn 1 runs and completes normally.
+        let (_, _, send1) = post_mcp(
+            addr,
+            token,
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "send_message",
+                    "arguments": { "session_id": sid.to_string(), "message": "Turn one", "wait": true, "timeout_seconds": 5 }
+                }
+            }),
+        );
+        let turn1_id = send1["result"]["structuredContent"]["turn_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(send1["result"]["structuredContent"]["status"], "completed");
+        assert_eq!(send1["result"]["structuredContent"]["timed_out"], false);
+
+        // Immediately start Turn 2 which pauses on a permission request.
+        backend
+            .emit_permission_on_prompt
+            .store(true, Ordering::Release);
+        let (_, _, send2) = post_mcp(
+            addr,
+            token,
+            &json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {
+                    "name": "send_message",
+                    "arguments": { "session_id": sid.to_string(), "message": "Turn two", "wait": true, "timeout_seconds": 5 }
+                }
+            }),
+        );
+        assert_eq!(
+            send2["result"]["structuredContent"]["status"],
+            "awaiting_permission"
+        );
+
+        // Querying Turn 1 while Turn 2 is awaiting permission must still report Turn 1 completed
+        // with empty pending_permissions and Turn 1's reply (no Turn 2 state bleed).
+        let (_, _, wait1) = post_mcp(
+            addr,
+            token,
+            &json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {
+                    "name": "wait_for_turn",
+                    "arguments": { "session_id": sid.to_string(), "turn_id": turn1_id, "timeout_seconds": 5 }
+                }
+            }),
+        );
+        let sc1 = &wait1["result"]["structuredContent"];
+        assert_eq!(sc1["status"], "completed");
+        assert_eq!(sc1["timed_out"], false);
+        assert_eq!(sc1["pending_permissions"].as_array().unwrap().len(), 0);
+        assert_eq!(sc1["reply"], "Echo: Turn one");
+
+        // Waiting for an unknown turn_id on a live session must time out explicitly (never "completed").
+        let unknown_tid = Uuid::new_v4();
+        let (_, _, wait_unknown) = post_mcp(
+            addr,
+            token,
+            &json!({
+                "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": {
+                    "name": "wait_for_turn",
+                    "arguments": { "session_id": sid.to_string(), "turn_id": unknown_tid.to_string(), "timeout_seconds": 1 }
+                }
+            }),
+        );
+        let scu = &wait_unknown["result"]["structuredContent"];
+        assert_eq!(scu["status"], "timeout");
+        assert_eq!(scu["timed_out"], true);
+
+        // Direct DaemonEventScribe test: finished_turns survives RuntimeEnded, and epoch change
+        // resets stale Working status + active_turn_id.
+        let hub = Arc::new(Hub::default());
+        let (obs_tx, obs_rx) = crossbeam_channel::unbounded();
+        let scribe = DaemonEventScribe::spawn(obs_rx, backend.clone(), hub.clone());
+        let rid1 = Uuid::new_v4();
+        let epoch1 = Uuid::new_v4();
+        let tid_direct = Uuid::new_v4();
+        let mid_direct = Uuid::new_v4();
+        obs_tx
+            .send(HubObservation::Event(SequencedEvent {
+                session_id: sid,
+                runtime_id: rid1,
+                epoch: epoch1,
+                sequence: 1,
+                event: waku_protocol::event_to_wire(DriverEvent::PromptSubmitted {
+                    message: "Direct".into(),
+                    turn_id: tid_direct,
+                    message_id: mid_direct,
+                })
+                .unwrap(),
+            }))
+            .unwrap();
+        obs_tx
+            .send(HubObservation::Event(SequencedEvent {
+                session_id: sid,
+                runtime_id: rid1,
+                epoch: epoch1,
+                sequence: 2,
+                event: waku_protocol::event_to_wire(DriverEvent::TurnStarted).unwrap(),
+            }))
+            .unwrap();
+        obs_tx
+            .send(HubObservation::Event(SequencedEvent {
+                session_id: sid,
+                runtime_id: rid1,
+                epoch: epoch1,
+                sequence: 3,
+                event: waku_protocol::event_to_wire(DriverEvent::TurnFinished {
+                    success: true,
+                    summary: None,
+                })
+                .unwrap(),
+            }))
+            .unwrap();
+        obs_tx
+            .send(HubObservation::RuntimeEnded {
+                session_id: sid,
+                runtime_id: Some(rid1),
+            })
+            .unwrap();
+
+        // Wait must resolve immediately from finished_turns even after RuntimeEnded removed live[sid].
+        let started = Instant::now();
+        let outcome = scribe.wait_for_turn(sid, Some(tid_direct), Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(outcome, WaitOutcome::TurnFinished(rec) if rec.turn_id == tid_direct && rec.success));
+
+        // Epoch change must reset stale Working status + active_turn_id.
+        let tid_stale = Uuid::new_v4();
+        obs_tx
+            .send(HubObservation::Event(SequencedEvent {
+                session_id: sid,
+                runtime_id: rid1,
+                epoch: epoch1,
+                sequence: 4,
+                event: waku_protocol::event_to_wire(DriverEvent::PromptSubmitted {
+                    message: "Stale".into(),
+                    turn_id: tid_stale,
+                    message_id: Uuid::new_v4(),
+                })
+                .unwrap(),
+            }))
+            .unwrap();
+        obs_tx
+            .send(HubObservation::Event(SequencedEvent {
+                session_id: sid,
+                runtime_id: rid1,
+                epoch: epoch1,
+                sequence: 5,
+                event: waku_protocol::event_to_wire(DriverEvent::TurnStarted).unwrap(),
+            }))
+            .unwrap();
+        let epoch2 = Uuid::new_v4();
+        obs_tx
+            .send(HubObservation::Event(SequencedEvent {
+                session_id: sid,
+                runtime_id: rid1,
+                epoch: epoch2,
+                sequence: 1,
+                event: waku_protocol::event_to_wire(DriverEvent::Connected {
+                    provider_cursor: None,
+                })
+                .unwrap(),
+            }))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(snap) = scribe.snapshot(sid)
+                && snap.active_turn_id.is_none()
+                && snap.status == SessionStatus::Idle
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "epoch change did not reset stale Working status");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        shutdown.store(true, Ordering::Release);
+        server.join().unwrap();
     }
 }
