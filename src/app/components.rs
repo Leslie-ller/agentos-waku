@@ -1139,10 +1139,28 @@ fn activity_tool_display_name(activity: &ActivityItem) -> String {
     tr!("activity.tool")
 }
 
+const MAX_ACTIVITY_LABEL_CHARS: usize = 240;
+
+/// Collapse provider-supplied activity header/row labels into a single bounded
+/// line without hard newlines. GPUI's `.truncate()` prevents soft wrapping, but
+/// explicit `\n`/`\r` breaks still paint multiple vertical lines that overflow
+/// fixed-height headers.
+fn compact_activity_label(text: &str) -> String {
+    let compact = single_line_label(text);
+    if compact.chars().count() <= MAX_ACTIVITY_LABEL_CHARS {
+        return compact;
+    }
+    compact
+        .chars()
+        .take(MAX_ACTIVITY_LABEL_CHARS - 1)
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
 pub(super) fn activity_display_title(activity: &ActivityItem) -> String {
     use crate::model::ActivityKind;
 
-    match activity.kind {
+    let title = match activity.kind {
         ActivityKind::FileChange => {
             let subject = match activity.file_changes.as_slice() {
                 [change] => Some(change.display_name().to_owned()),
@@ -1154,15 +1172,18 @@ pub(super) fn activity_display_title(activity: &ActivityItem) -> String {
             if subject.is_none()
                 && !crate::model::is_generic_activity_title(activity.kind, &activity.title)
             {
-                return activity.title.clone();
-            }
-            match (activity.complete, activity.failed, subject) {
-                (false, _, Some(file)) => tr!("activity.editing_named_file", file = file),
-                (true, false, Some(file)) => tr!("activity.edited_named_file", file = file),
-                (true, true, Some(file)) => tr!("activity.edit_failed_named_file", file = file),
-                (false, _, None) => tr!("activity.editing_files"),
-                (true, false, None) => tr!("activity.edited_files"),
-                (true, true, None) => tr!("activity.edit_failed"),
+                activity.title.clone()
+            } else {
+                match (activity.complete, activity.failed, subject) {
+                    (false, _, Some(file)) => tr!("activity.editing_named_file", file = file),
+                    (true, false, Some(file)) => tr!("activity.edited_named_file", file = file),
+                    (true, true, Some(file)) => {
+                        tr!("activity.edit_failed_named_file", file = file)
+                    }
+                    (false, _, None) => tr!("activity.editing_files"),
+                    (true, false, None) => tr!("activity.edited_files"),
+                    (true, true, None) => tr!("activity.edit_failed"),
+                }
             }
         }
         ActivityKind::FileRead => {
@@ -1170,15 +1191,18 @@ pub(super) fn activity_display_title(activity: &ActivityItem) -> String {
             if file.is_none()
                 && !crate::model::is_generic_activity_title(activity.kind, &activity.title)
             {
-                return activity.title.clone();
-            }
-            match (activity.complete, activity.failed, file) {
-                (false, _, Some(file)) => tr!("activity.reading_named_file", file = file),
-                (true, false, Some(file)) => tr!("activity.read_named_file", file = file),
-                (true, true, Some(file)) => tr!("activity.read_named_file_failed", file = file),
-                (false, _, None) => tr!("activity.reading_file"),
-                (true, false, None) => tr!("activity.read_file_completed"),
-                (true, true, None) => tr!("activity.read_file_failed"),
+                activity.title.clone()
+            } else {
+                match (activity.complete, activity.failed, file) {
+                    (false, _, Some(file)) => tr!("activity.reading_named_file", file = file),
+                    (true, false, Some(file)) => tr!("activity.read_named_file", file = file),
+                    (true, true, Some(file)) => {
+                        tr!("activity.read_named_file_failed", file = file)
+                    }
+                    (false, _, None) => tr!("activity.reading_file"),
+                    (true, false, None) => tr!("activity.read_file_completed"),
+                    (true, true, None) => tr!("activity.read_file_failed"),
+                }
             }
         }
         ActivityKind::FileSearch => {
@@ -1186,15 +1210,22 @@ pub(super) fn activity_display_title(activity: &ActivityItem) -> String {
             if query.is_none()
                 && !crate::model::is_generic_activity_title(activity.kind, &activity.title)
             {
-                return activity.title.clone();
-            }
-            match (activity.complete, activity.failed, query) {
-                (false, _, Some(query)) => tr!("activity.searching_files_for", query = query),
-                (true, false, Some(query)) => tr!("activity.searched_files_for", query = query),
-                (true, true, Some(query)) => tr!("activity.file_search_failed_for", query = query),
-                (false, _, None) => tr!("activity.searching_files"),
-                (true, false, None) => tr!("activity.searched_files"),
-                (true, true, None) => tr!("activity.file_search_failed"),
+                activity.title.clone()
+            } else {
+                match (activity.complete, activity.failed, query) {
+                    (false, _, Some(query)) => {
+                        tr!("activity.searching_files_for", query = query)
+                    }
+                    (true, false, Some(query)) => {
+                        tr!("activity.searched_files_for", query = query)
+                    }
+                    (true, true, Some(query)) => {
+                        tr!("activity.file_search_failed_for", query = query)
+                    }
+                    (false, _, None) => tr!("activity.searching_files"),
+                    (true, false, None) => tr!("activity.searched_files"),
+                    (true, true, None) => tr!("activity.file_search_failed"),
+                }
             }
         }
         ActivityKind::FileList => {
@@ -1202,26 +1233,27 @@ pub(super) fn activity_display_title(activity: &ActivityItem) -> String {
             if directory.is_none()
                 && !crate::model::is_generic_activity_title(activity.kind, &activity.title)
             {
-                return activity.title.clone();
-            }
-            match (activity.complete, activity.failed, directory) {
-                (false, _, Some(directory)) => {
-                    tr!("activity.listing_files_in", directory = directory)
+                activity.title.clone()
+            } else {
+                match (activity.complete, activity.failed, directory) {
+                    (false, _, Some(directory)) => {
+                        tr!("activity.listing_files_in", directory = directory)
+                    }
+                    (true, false, Some(directory)) => {
+                        tr!("activity.listed_files_in", directory = directory)
+                    }
+                    (true, true, Some(directory)) => {
+                        tr!("activity.file_list_failed_in", directory = directory)
+                    }
+                    (false, _, None) => tr!("activity.listing_files"),
+                    (true, false, None) => tr!("activity.listed_files"),
+                    (true, true, None) => tr!("activity.file_list_failed"),
                 }
-                (true, false, Some(directory)) => {
-                    tr!("activity.listed_files_in", directory = directory)
-                }
-                (true, true, Some(directory)) => {
-                    tr!("activity.file_list_failed_in", directory = directory)
-                }
-                (false, _, None) => tr!("activity.listing_files"),
-                (true, false, None) => tr!("activity.listed_files"),
-                (true, true, None) => tr!("activity.file_list_failed"),
             }
         }
         ActivityKind::Command => {
             if let Some(description) = activity.display_description.as_deref() {
-                return match (activity.complete, activity.failed) {
+                match (activity.complete, activity.failed) {
                     (false, _) => {
                         tr!(
                             "activity.running_described_command",
@@ -1237,54 +1269,55 @@ pub(super) fn activity_display_title(activity: &ActivityItem) -> String {
                             description = description
                         )
                     }
-                };
-            }
-            if let Some(command) = activity.display_target.as_deref() {
-                return match (activity.complete, activity.failed) {
+                }
+            } else if let Some(command) = activity.display_target.as_deref() {
+                match (activity.complete, activity.failed) {
                     (false, _) => tr!("activity.running_named_command", command = command),
                     (true, false) => tr!("activity.ran_named_command", command = command),
                     (true, true) => tr!("activity.named_command_failed", command = command),
-                };
-            }
-            if !crate::model::is_generic_activity_title(activity.kind, &activity.title) {
-                return activity.title.clone();
-            }
-            match (activity.complete, activity.failed) {
-                (false, _) => tr!("activity.running_command"),
-                (true, false) => tr!("activity.ran_command"),
-                (true, true) => tr!("activity.command_failed"),
+                }
+            } else if !crate::model::is_generic_activity_title(activity.kind, &activity.title) {
+                activity.title.clone()
+            } else {
+                match (activity.complete, activity.failed) {
+                    (false, _) => tr!("activity.running_command"),
+                    (true, false) => tr!("activity.ran_command"),
+                    (true, true) => tr!("activity.command_failed"),
+                }
             }
         }
         ActivityKind::Search => {
             if let Some(query) = activity.display_target.as_deref() {
-                return match (activity.complete, activity.failed) {
+                match (activity.complete, activity.failed) {
                     (false, _) => tr!("activity.searching_web_for", query = query),
                     (true, false) => tr!("activity.searched_web_for", query = query),
                     (true, true) => tr!("activity.web_search_failed_for", query = query),
-                };
-            }
-            if ActivityKind::from_tool_name(&activity.title) == ActivityKind::Search {
-                return match (activity.complete, activity.failed) {
+                }
+            } else if ActivityKind::from_tool_name(&activity.title) == ActivityKind::Search {
+                match (activity.complete, activity.failed) {
                     (false, _) => tr!("activity.searching_web"),
                     (true, false) => tr!("activity.searched_the_web"),
                     (true, true) => tr!("activity.web_search_failed"),
-                };
+                }
+            } else {
+                activity.title.clone()
             }
-            activity.title.clone()
         }
         ActivityKind::Plan => {
             if !crate::model::is_generic_activity_title(activity.kind, &activity.title) {
-                return activity.title.clone();
-            }
-            match (activity.complete, activity.failed) {
-                (false, _) => tr!("activity.updating_plan"),
-                (true, false) => tr!("activity.updated_plan"),
-                (true, true) => tr!("activity.plan_update_failed"),
+                activity.title.clone()
+            } else {
+                match (activity.complete, activity.failed) {
+                    (false, _) => tr!("activity.updating_plan"),
+                    (true, false) => tr!("activity.updated_plan"),
+                    (true, true) => tr!("activity.plan_update_failed"),
+                }
             }
         }
         ActivityKind::Tool => activity_tool_display_name(activity),
         ActivityKind::Reasoning => activity.title.clone(),
-    }
+    };
+    compact_activity_label(&title)
 }
 
 pub(super) fn activity_action_label(activity: &ActivityItem) -> String {
@@ -1310,7 +1343,7 @@ pub(super) fn activity_row_detail(activity: &ActivityItem, reasoning_live: bool)
         (!crate::model::is_generic_activity_title(activity.kind, &activity.title))
             .then(|| activity.title.clone())
     };
-    match activity.kind {
+    let detail = match activity.kind {
         ActivityKind::Reasoning => activity.reasoning.as_ref().map_or_else(
             || activity.title.clone(),
             |reasoning| reasoning_activity_title(reasoning, reasoning_live),
@@ -1351,7 +1384,8 @@ pub(super) fn activity_row_detail(activity: &ActivityItem, reasoning_live: bool)
                 .then(|| activity_tool_display_name(activity))
                 .unwrap_or_default()
         }
-    }
+    };
+    compact_activity_label(&detail)
 }
 
 pub(super) fn reasoning_activity_title(reasoning: &ReasoningBlock, live: bool) -> String {
@@ -1474,10 +1508,17 @@ pub(super) fn activity_disclosure_sections(
     }
     let metadata_count = sections.len();
     if activity.kind == ActivityKind::Command {
+        let multiline_or_long_title =
+            (!crate::model::is_generic_activity_title(activity.kind, &activity.title)
+                && (activity.title.contains('\n')
+                    || activity.title.contains('\r')
+                    || activity.title.chars().count() > MAX_ACTIVITY_LABEL_CHARS))
+                .then_some(activity.title.as_str());
         if let Some(command) = activity
             .arguments
             .as_deref()
             .or(activity.display_target.as_deref())
+            .or(multiline_or_long_title)
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
@@ -1557,14 +1598,14 @@ pub(super) fn activity_preview(activity: &ActivityItem) -> String {
         && let Some(output) = activity.output.as_deref()
         && let Some(first_line) = output.lines().find(|line| !line.trim().is_empty())
     {
-        return first_line.trim().to_owned();
+        return compact_activity_label(first_line);
     }
     if (detail.is_empty() || detail.eq_ignore_ascii_case("failed"))
         && !activity.image_urls.is_empty()
     {
         return tr!("activity.image_output");
     }
-    detail.to_owned()
+    compact_activity_label(detail)
 }
 
 #[cfg(test)]
@@ -2056,5 +2097,93 @@ mod message_time_tests {
             false,
         );
         assert_eq!(activity_display_title(&plan), "Updating plan");
+    }
+
+    #[test]
+    fn multiline_command_titles_collapse_to_single_line_labels_while_preserving_full_disclosure() {
+        let script = concat!(
+            "const fs = require(\"fs\");\n",
+            "const crypto = require(\"crypto\");\n\n",
+            "const ws = new WebSocket(\"ws://127.0.0.1:34123/v1\");\n",
+            "ws.addEventListener(\"open\", () => {\n",
+            "  ws.send(JSON.stringify({ type: \"hello\" }));\n",
+            "});",
+        );
+        let command = ActivityItem::new(
+            Some("command-multiline".into()),
+            crate::model::ActivityKind::Command,
+            script,
+            None,
+            false,
+        );
+
+        let header = activity_header_title(&[command.clone()], true, None);
+        let row = activity_row_detail(&command, false);
+        assert!(!header.contains('\n') && !header.contains('\r'));
+        assert!(!row.contains('\n') && !row.contains('\r'));
+        assert!(
+            header.starts_with("const fs = require(\"fs\"); const crypto = require(\"crypto\");")
+        );
+        assert_eq!(header, row);
+        assert!(header.chars().count() <= MAX_ACTIVITY_LABEL_CHARS);
+
+        assert_eq!(
+            activity_disclosure_sections(&command),
+            vec![ActivityDisclosureSection {
+                kind: ActivityDisclosureSectionKind::Command,
+                content: script.to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn activity_labels_handle_crlf_heredoc_multiline_detail_and_overlong_lines() {
+        let crlf_heredoc = "\r\n\r\npython3 - <<'PY'\r\nimport sqlite3\r\nprint(1)\r\nPY\r\n";
+        let command = ActivityItem::new(
+            Some("command-crlf".into()),
+            crate::model::ActivityKind::Command,
+            crlf_heredoc,
+            None,
+            true,
+        );
+        assert_eq!(
+            activity_display_title(&command),
+            "python3 - <<'PY' import sqlite3 print(1) PY"
+        );
+        assert_eq!(
+            activity_row_detail(&command, false),
+            "python3 - <<'PY' import sqlite3 print(1) PY"
+        );
+
+        let multiline_detail = ActivityItem::new(
+            Some("tool-multiline-detail".into()),
+            crate::model::ActivityKind::Tool,
+            "Tool",
+            Some("line one\r\n  line two\nline three".into()),
+            true,
+        );
+        assert_eq!(
+            activity_preview(&multiline_detail),
+            "line one line two line three"
+        );
+
+        let overlong = "x".repeat(MAX_ACTIVITY_LABEL_CHARS + 50);
+        let overlong_command = ActivityItem::new(
+            Some("command-long".into()),
+            crate::model::ActivityKind::Command,
+            overlong.clone(),
+            None,
+            true,
+        );
+        let compact = activity_row_detail(&overlong_command, false);
+        assert_eq!(compact.chars().count(), MAX_ACTIVITY_LABEL_CHARS);
+        assert!(compact.ends_with('…'));
+        assert_eq!(
+            activity_disclosure_sections(&overlong_command),
+            vec![ActivityDisclosureSection {
+                kind: ActivityDisclosureSectionKind::Command,
+                content: overlong,
+            }]
+        );
     }
 }

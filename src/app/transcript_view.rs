@@ -1927,6 +1927,7 @@ impl Waku {
                     .w_full()
                     .min_w_0()
                     .h(px(26.0))
+                    .overflow_hidden()
                     .flex()
                     .items_center()
                     .gap(px(6.0))
@@ -2083,7 +2084,10 @@ impl Waku {
                         .id(SharedString::from(format!("activity-item-{id}")))
                         // The parent owns a 1px border on each edge, so a
                         // 28px row makes the visible activity header 30px.
+                        .w_full()
+                        .min_w_0()
                         .h(px(28.0))
+                        .overflow_hidden()
                         .px(px(8.0))
                         .flex()
                         .items_center()
@@ -3088,5 +3092,25 @@ mod live_reasoning_window_tests {
     fn window_below_the_threshold_keeps_the_cached_start() {
         let content = "a".repeat(LIVE_REASONING_WINDOW_MAX);
         assert_eq!(live_reasoning_window_anchor(7, &content), 7);
+    }
+
+    #[test]
+    fn activity_header_and_item_rows_clip_vertical_overflow() {
+        let source = include_str!("transcript_view.rs");
+        let toggle = source
+            .split(".id(SharedString::from(format!(\"activity-toggle-{block_index}\")))")
+            .nth(1)
+            .and_then(|rest| rest.split(".on_click(").next())
+            .expect("activity group toggle header should exist");
+        assert!(toggle.contains(".overflow_hidden()"));
+        assert!(toggle.contains(".truncate()"));
+
+        let item = source
+            .split(".id(SharedString::from(format!(\"activity-item-{id}\")))")
+            .nth(1)
+            .and_then(|rest| rest.split(".on_click(").next())
+            .expect("activity item header should exist");
+        assert!(item.contains(".overflow_hidden()"));
+        assert!(item.contains(".truncate()"));
     }
 }
