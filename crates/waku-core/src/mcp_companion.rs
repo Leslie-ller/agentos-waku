@@ -1894,22 +1894,59 @@ fn run_isolated_oneshot_agent(
     timeout: Duration,
     on_pid: Option<Box<dyn FnOnce(u32) + Send>>,
 ) -> anyhow::Result<String> {
+    run_isolated_oneshot_agent_with_effort(provider, cwd, prompt, model, None, read_only, timeout, on_pid)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_isolated_oneshot_agent_with_effort(
+    provider: ProviderKind,
+    cwd: &Path,
+    prompt: &str,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+    read_only: bool,
+    timeout: Duration,
+    on_pid: Option<Box<dyn FnOnce(u32) + Send>>,
+) -> anyhow::Result<String> {
     match provider {
-        ProviderKind::Codex => run_isolated_codex_oneshot(cwd, prompt, model, read_only, timeout, on_pid),
-        ProviderKind::Antigravity => {
-            run_isolated_antigravity_oneshot(cwd, prompt, model, read_only, timeout, on_pid)
+        ProviderKind::Codex => {
+            run_isolated_codex_oneshot(cwd, prompt, model, reasoning_effort, read_only, timeout, on_pid)
         }
+        ProviderKind::Antigravity => run_isolated_antigravity_oneshot(
+            cwd,
+            prompt,
+            model,
+            reasoning_effort,
+            read_only,
+            timeout,
+            on_pid,
+        ),
         other => anyhow::bail!("isolated one-shot runner does not support {}", other.display_name()),
     }
 }
 
 fn build_codex_oneshot_args(cwd: &Path, model: Option<&str>, read_only: bool) -> Vec<String> {
+    build_codex_oneshot_args_with_effort(cwd, model, None, read_only)
+}
+
+fn build_codex_oneshot_args_with_effort(
+    cwd: &Path,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+    read_only: bool,
+) -> Vec<String> {
     let mut args = vec![
         "-c".to_owned(),
         "approval_policy=\"never\"".to_owned(),
         "-c".to_owned(),
         "cli_auth_credentials_store=\"file\"".to_owned(),
     ];
+    if let Some(effort) = reasoning_effort.map(str::trim).filter(|s| !s.is_empty()) {
+        args.extend([
+            "-c".to_owned(),
+            format!("model_reasoning_effort=\"{effort}\""),
+        ]);
+    }
     if read_only {
         args.extend([
             "-c".to_owned(),
@@ -1949,10 +1986,12 @@ fn build_codex_oneshot_args(cwd: &Path, model: Option<&str>, read_only: bool) ->
     args
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_isolated_codex_oneshot(
     cwd: &Path,
     prompt: &str,
     model: Option<&str>,
+    reasoning_effort: Option<&str>,
     read_only: bool,
     timeout: Duration,
     on_pid: Option<Box<dyn FnOnce(u32) + Send>>,
@@ -1961,7 +2000,12 @@ fn run_isolated_codex_oneshot(
         .ok_or_else(|| anyhow!("codex CLI not found in PATH or ChatGPT.app"))?;
     let mut cmd = ProcessCommand::new(&binary);
     crate::agent_profiles::apply_to_command(ProviderKind::Codex, &mut cmd)?;
-    cmd.args(build_codex_oneshot_args(cwd, model, read_only));
+    cmd.args(build_codex_oneshot_args_with_effort(
+        cwd,
+        model,
+        reasoning_effort,
+        read_only,
+    ));
     cmd.arg(prompt)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2082,10 +2126,12 @@ fn validate_acp_model_selection(resp: &Value, requested_model: &str) -> anyhow::
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_isolated_antigravity_oneshot(
     cwd: &Path,
     prompt: &str,
     model: Option<&str>,
+    reasoning_effort: Option<&str>,
     read_only: bool,
     timeout: Duration,
     on_pid: Option<Box<dyn FnOnce(u32) + Send>>,
@@ -2265,6 +2311,30 @@ fn run_isolated_antigravity_oneshot(
             validate_acp_model_selection(&set_resp, model_id)?;
         }
 
+        if let Some(effort) = reasoning_effort.map(str::trim).filter(|s| !s.is_empty()) {
+            // Best-effort thought_level cap (e.g. "medium" for background auto-reviews);
+            // ignore unsupported errors on legacy ACP runtimes.
+            if send_msg(
+                &mut stdin,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "session/set_config_option",
+                    "params": { "sessionId": sid, "configId": "thought_level", "value": effort }
+                }),
+            )
+            .is_ok()
+            {
+                let _ = wait_for_id(
+                    &mut stdin,
+                    6,
+                    &mut output,
+                    &mut denied_any,
+                    &mut output_after_last_denial,
+                );
+            }
+        }
+
         send_msg(
             &mut stdin,
             json!({
@@ -2379,6 +2449,7 @@ fn execute_advisor_consultation(
     }
 
     let caller_name = caller_provider.map(|p| p.id().to_owned());
+    let reasoning_effort = (origin == "auto").then_some("medium");
     let wall_started = Instant::now();
 
     if targets.len() == 1 {
@@ -2402,11 +2473,12 @@ fn execute_advisor_consultation(
             ],
         )?;
 
-        match run_isolated_oneshot_agent(
+        match run_isolated_oneshot_agent_with_effort(
             advisor_provider,
             cwd,
             &prompt,
             model.as_deref(),
+            reasoning_effort,
             true,
             Duration::from_secs(120),
             None,
@@ -2488,11 +2560,12 @@ fn execute_advisor_consultation(
                     let model_for_panic = model.clone();
                     let handle = scope.spawn(move || {
                         let started = Instant::now();
-                        let result = run_isolated_oneshot_agent(
+                        let result = run_isolated_oneshot_agent_with_effort(
                             provider,
                             cwd,
                             prompt,
                             model.as_deref(),
+                            reasoning_effort,
                             true,
                             Duration::from_secs(120),
                             None,
@@ -2912,7 +2985,11 @@ fn auto_advisor_budget_allows(
 
 fn build_auto_advisor_prompt_inputs(snapshot: &AutoAdvisorSnapshot) -> (String, String, Vec<String>) {
     let question = format!(
-        "Automatic scale-triggered peer review ({}). Audit the recent work for hidden bugs, edge cases, architectural/design trade-offs, weak assumptions, or visual/clarity improvements. State the highest-impact findings first and keep advice concise.",
+        "Automatic scale-triggered peer review ({}).\n\
+         STRICT EXPLORATION & TOKEN BUDGET (background auto-review):\n\
+         - Make at most ONE parallel read batch of up to 2-3 listed files (0 reads if the provided excerpt & requests are already sufficient).\n\
+         - NEVER crawl additional files, follow imports across the repo, list directories, or run multi-round searches.\n\
+         - Keep your final answer sharp and concise (<= 300 words): state the 1-3 highest-impact bugs, edge cases, or design/clarity flaws first.",
         snapshot.trigger_reason
     );
     let mut ctx = String::new();
@@ -2934,17 +3011,27 @@ fn build_auto_advisor_prompt_inputs(snapshot: &AutoAdvisorSnapshot) -> (String, 
             ctx.push_str(&format!("- {f}\n"));
         }
     }
+    // Keep auto-review file lists tight so background advisors do not burn
+    // multi-round token budgets crawling large repos: prefer up to 3 edited
+    // files, or at most 2 read files when no files were edited.
     let mut files = Vec::new();
-    for f in snapshot
-        .edited_files
-        .iter()
-        .chain(snapshot.read_files.iter())
-    {
-        if files.len() >= 12 {
-            break;
+    if !snapshot.edited_files.is_empty() {
+        for f in &snapshot.edited_files {
+            if files.len() >= 3 {
+                break;
+            }
+            if !files.contains(f) {
+                files.push(f.clone());
+            }
         }
-        if !files.contains(f) {
-            files.push(f.clone());
+    } else {
+        for f in &snapshot.read_files {
+            if files.len() >= 2 {
+                break;
+            }
+            if !files.contains(f) {
+                files.push(f.clone());
+            }
         }
     }
     (question, ctx, files)
@@ -6430,5 +6517,48 @@ mod tests {
         assert!(!auto_advisor_budget_allows(&conn, &sid_str, 7_000, 1800, 1).unwrap());
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn auto_advisor_caps_file_list_and_applies_medium_effort() {
+        let with_edits = AutoAdvisorSnapshot {
+            trigger_reason: "code scale: 5 edited files".into(),
+            recent_user_prompts: vec!["fix stream stall".into()],
+            latest_assistant_excerpt: "patched acp.rs".into(),
+            edited_files: vec![
+                "a.rs".into(),
+                "b.rs".into(),
+                "c.rs".into(),
+                "d.rs".into(),
+                "e.rs".into(),
+            ],
+            read_files: vec!["r1.rs".into(), "r2.rs".into(), "r3.rs".into()],
+            failed_commands: vec![],
+        };
+        let (q, _ctx, files) = build_auto_advisor_prompt_inputs(&with_edits);
+        assert!(q.contains("STRICT EXPLORATION & TOKEN BUDGET"));
+        assert!(q.contains("NEVER crawl additional files"));
+        assert_eq!(files, vec!["a.rs", "b.rs", "c.rs"]);
+
+        let read_only_snap = AutoAdvisorSnapshot {
+            trigger_reason: "research milestone".into(),
+            recent_user_prompts: vec!["compare options".into()],
+            latest_assistant_excerpt: "summary".into(),
+            edited_files: vec![],
+            read_files: vec!["r1.md".into(), "r2.md".into(), "r3.md".into(), "r4.md".into()],
+            failed_commands: vec![],
+        };
+        let (_q2, _ctx2, files2) = build_auto_advisor_prompt_inputs(&read_only_snap);
+        assert_eq!(files2, vec!["r1.md", "r2.md"]);
+
+        let med_args = build_codex_oneshot_args_with_effort(
+            Path::new("/tmp/ws"),
+            Some("gpt-6.2-sol"),
+            Some("medium"),
+            true,
+        );
+        assert!(med_args.iter().any(|a| a == "model_reasoning_effort=\"medium\""));
+        let default_args = build_codex_oneshot_args(Path::new("/tmp/ws"), Some("gpt-6.2-sol"), true);
+        assert!(!default_args.iter().any(|a| a.starts_with("model_reasoning_effort=")));
     }
 }
