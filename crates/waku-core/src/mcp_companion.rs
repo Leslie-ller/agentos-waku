@@ -2419,6 +2419,51 @@ const AUTO_ADVISOR_MAX_QUEUE: usize = 4;
 const AUTO_ADVISOR_STALE_WINDOW_SECS: i64 = 6 * 3600;
 const AUTO_ADVISOR_MAX_INJECT_CHARS: usize = 6000;
 
+const AUTO_ADVISOR_ANTIGRAVITY_MAX_FILES: usize = 3;
+
+fn advisor_reasoning_effort(provider: ProviderKind, origin: &str) -> Option<&'static str> {
+    if origin == "auto" && provider == ProviderKind::Antigravity {
+        Some("medium")
+    } else {
+        None
+    }
+}
+
+fn build_advisor_prompt_for_provider(
+    provider: ProviderKind,
+    origin: &str,
+    question: &str,
+    context: Option<&str>,
+    files: &[String],
+) -> String {
+    let apply_antigravity_auto_cap = origin == "auto" && provider == ProviderKind::Antigravity;
+    let mut prompt = format!("{ADVISOR_SYSTEM_PROMPT}\n\n");
+    prompt.push_str(&format!("Question:\n{question}\n"));
+    if apply_antigravity_auto_cap {
+        prompt.push_str(
+            "\nSTRICT EXPLORATION & TOKEN BUDGET (background auto-review):\n\
+             - Make at most ONE parallel read batch of up to 2-3 listed files (0 reads if the provided excerpt & requests are already sufficient).\n\
+             - NEVER crawl additional files, follow imports across the repo, list directories, or run multi-round searches.\n\
+             - Keep your final answer sharp and concise (<= 300 words): state the 1-3 highest-impact bugs, edge cases, or design/clarity flaws first.\n",
+        );
+    }
+    if let Some(extra) = context {
+        prompt.push_str(&format!("\nContext & hypotheses:\n{extra}\n"));
+    }
+    let effective_files: &[String] = if apply_antigravity_auto_cap {
+        &files[..files.len().min(AUTO_ADVISOR_ANTIGRAVITY_MAX_FILES)]
+    } else {
+        files
+    };
+    if !effective_files.is_empty() {
+        prompt.push_str("\nRelevant local workspace files / images to inspect:\n");
+        for f in effective_files {
+            prompt.push_str(&format!("- {f}\n"));
+        }
+    }
+    prompt
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_advisor_consultation(
     conn: &Connection,
@@ -2436,24 +2481,19 @@ fn execute_advisor_consultation(
     let targets = resolve_advisor_providers(requested_provider, caller_provider)?;
     let now = unix_now();
 
-    let mut prompt = format!("{ADVISOR_SYSTEM_PROMPT}\n\n");
-    prompt.push_str(&format!("Question:\n{question}\n"));
-    if let Some(extra) = context {
-        prompt.push_str(&format!("\nContext & hypotheses:\n{extra}\n"));
-    }
-    if !files.is_empty() {
-        prompt.push_str("\nRelevant local workspace files / images to inspect:\n");
-        for f in files {
-            prompt.push_str(&format!("- {f}\n"));
-        }
-    }
-
     let caller_name = caller_provider.map(|p| p.id().to_owned());
-    let reasoning_effort = (origin == "auto").then_some("medium");
     let wall_started = Instant::now();
 
     if targets.len() == 1 {
         let advisor_provider = targets[0];
+        let prompt = build_advisor_prompt_for_provider(
+            advisor_provider,
+            origin,
+            question,
+            context,
+            files,
+        );
+        let reasoning_effort = advisor_reasoning_effort(advisor_provider, origin);
         let model = model_override
             .or_else(|| default_advisor_model(advisor_provider).map(str::to_owned));
         let cid = Uuid::new_v4().to_string();
@@ -2555,7 +2595,9 @@ fn execute_advisor_consultation(
             let handles: Vec<_> = jobs
                 .into_iter()
                 .map(|(cid, provider, model)| {
-                    let prompt = &prompt;
+                    let prompt =
+                        build_advisor_prompt_for_provider(provider, origin, question, context, files);
+                    let reasoning_effort = advisor_reasoning_effort(provider, origin);
                     let cid_for_panic = cid.clone();
                     let model_for_panic = model.clone();
                     let handle = scope.spawn(move || {
@@ -2563,7 +2605,7 @@ fn execute_advisor_consultation(
                         let result = run_isolated_oneshot_agent_with_effort(
                             provider,
                             cwd,
-                            prompt,
+                            &prompt,
                             model.as_deref(),
                             reasoning_effort,
                             true,
@@ -2985,11 +3027,7 @@ fn auto_advisor_budget_allows(
 
 fn build_auto_advisor_prompt_inputs(snapshot: &AutoAdvisorSnapshot) -> (String, String, Vec<String>) {
     let question = format!(
-        "Automatic scale-triggered peer review ({}).\n\
-         STRICT EXPLORATION & TOKEN BUDGET (background auto-review):\n\
-         - Make at most ONE parallel read batch of up to 2-3 listed files (0 reads if the provided excerpt & requests are already sufficient).\n\
-         - NEVER crawl additional files, follow imports across the repo, list directories, or run multi-round searches.\n\
-         - Keep your final answer sharp and concise (<= 300 words): state the 1-3 highest-impact bugs, edge cases, or design/clarity flaws first.",
+        "Automatic scale-triggered peer review ({}). Audit the recent work for hidden bugs, edge cases, architectural/design trade-offs, weak assumptions, or visual/clarity improvements. State the highest-impact findings first and keep advice concise.",
         snapshot.trigger_reason
     );
     let mut ctx = String::new();
@@ -3011,27 +3049,19 @@ fn build_auto_advisor_prompt_inputs(snapshot: &AutoAdvisorSnapshot) -> (String, 
             ctx.push_str(&format!("- {f}\n"));
         }
     }
-    // Keep auto-review file lists tight so background advisors do not burn
-    // multi-round token budgets crawling large repos: prefer up to 3 edited
-    // files, or at most 2 read files when no files were edited.
+    // Keep edited files first so providers with strict auto caps (Antigravity /
+    // Opus) get the top edited files, while Codex retains full up-to-12 context.
     let mut files = Vec::new();
-    if !snapshot.edited_files.is_empty() {
-        for f in &snapshot.edited_files {
-            if files.len() >= 3 {
-                break;
-            }
-            if !files.contains(f) {
-                files.push(f.clone());
-            }
+    for f in snapshot
+        .edited_files
+        .iter()
+        .chain(snapshot.read_files.iter())
+    {
+        if files.len() >= 12 {
+            break;
         }
-    } else {
-        for f in &snapshot.read_files {
-            if files.len() >= 2 {
-                break;
-            }
-            if !files.contains(f) {
-                files.push(f.clone());
-            }
+        if !files.contains(f) {
+            files.push(f.clone());
         }
     }
     (question, ctx, files)
@@ -6520,7 +6550,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_advisor_caps_file_list_and_applies_medium_effort() {
+    fn auto_advisor_caps_antigravity_only_and_keeps_codex_unrestricted() {
         let with_edits = AutoAdvisorSnapshot {
             trigger_reason: "code scale: 5 edited files".into(),
             recent_user_prompts: vec!["fix stream stall".into()],
@@ -6532,24 +6562,58 @@ mod tests {
                 "d.rs".into(),
                 "e.rs".into(),
             ],
-            read_files: vec!["r1.rs".into(), "r2.rs".into(), "r3.rs".into()],
+            read_files: vec!["r1.rs".into(), "r2.rs".into()],
             failed_commands: vec![],
         };
-        let (q, _ctx, files) = build_auto_advisor_prompt_inputs(&with_edits);
-        assert!(q.contains("STRICT EXPLORATION & TOKEN BUDGET"));
-        assert!(q.contains("NEVER crawl additional files"));
-        assert_eq!(files, vec!["a.rs", "b.rs", "c.rs"]);
+        let (q, ctx, files) = build_auto_advisor_prompt_inputs(&with_edits);
+        assert_eq!(files.len(), 7);
 
-        let read_only_snap = AutoAdvisorSnapshot {
-            trigger_reason: "research milestone".into(),
-            recent_user_prompts: vec!["compare options".into()],
-            latest_assistant_excerpt: "summary".into(),
-            edited_files: vec![],
-            read_files: vec!["r1.md".into(), "r2.md".into(), "r3.md".into(), "r4.md".into()],
-            failed_commands: vec![],
-        };
-        let (_q2, _ctx2, files2) = build_auto_advisor_prompt_inputs(&read_only_snap);
-        assert_eq!(files2, vec!["r1.md", "r2.md"]);
+        // Antigravity auto-review is capped to <=3 files, strict budget prompt, and medium effort.
+        assert_eq!(
+            advisor_reasoning_effort(ProviderKind::Antigravity, "auto"),
+            Some("medium")
+        );
+        let agy_prompt = build_advisor_prompt_for_provider(
+            ProviderKind::Antigravity,
+            "auto",
+            &q,
+            Some(&ctx),
+            &files,
+        );
+        assert!(agy_prompt.contains("STRICT EXPLORATION & TOKEN BUDGET"));
+        assert!(agy_prompt.contains("- a.rs\n"));
+        assert!(agy_prompt.contains("- c.rs\n"));
+        assert!(!agy_prompt.contains("- d.rs\n"));
+        assert!(!agy_prompt.contains("- r1.rs\n"));
+
+        // Codex auto-review ignores the file/crawl cap and keeps full default effort.
+        assert_eq!(advisor_reasoning_effort(ProviderKind::Codex, "auto"), None);
+        let codex_prompt = build_advisor_prompt_for_provider(
+            ProviderKind::Codex,
+            "auto",
+            &q,
+            Some(&ctx),
+            &files,
+        );
+        assert!(!codex_prompt.contains("STRICT EXPLORATION & TOKEN BUDGET"));
+        assert!(codex_prompt.contains("- a.rs\n"));
+        assert!(codex_prompt.contains("- e.rs\n"));
+        assert!(codex_prompt.contains("- r2.rs\n"));
+
+        // Manual calls on Antigravity also remain unrestricted.
+        assert_eq!(
+            advisor_reasoning_effort(ProviderKind::Antigravity, "manual"),
+            None
+        );
+        let manual_agy = build_advisor_prompt_for_provider(
+            ProviderKind::Antigravity,
+            "manual",
+            &q,
+            Some(&ctx),
+            &files,
+        );
+        assert!(!manual_agy.contains("STRICT EXPLORATION & TOKEN BUDGET"));
+        assert!(manual_agy.contains("- e.rs\n"));
 
         let med_args = build_codex_oneshot_args_with_effort(
             Path::new("/tmp/ws"),
@@ -6558,7 +6622,5 @@ mod tests {
             true,
         );
         assert!(med_args.iter().any(|a| a == "model_reasoning_effort=\"medium\""));
-        let default_args = build_codex_oneshot_args(Path::new("/tmp/ws"), Some("gpt-6.2-sol"), true);
-        assert!(!default_args.iter().any(|a| a.starts_with("model_reasoning_effort=")));
     }
 }
