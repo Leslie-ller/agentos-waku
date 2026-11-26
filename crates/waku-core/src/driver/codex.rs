@@ -50,6 +50,10 @@ enum CommandMessage {
         request_id: String,
         option_id: String,
     },
+    RawRpcResponse {
+        id: Value,
+        result: Value,
+    },
     RespondUserInput {
         request_id: String,
         answers: Vec<UserInputAnswer>,
@@ -71,6 +75,11 @@ enum CommandMessage {
     },
     GeneratedTitle(String),
     Shutdown,
+}
+
+struct PendingElicitation {
+    rpc_id: Value,
+    is_url_mode: bool,
 }
 
 struct CodexTitleRequest {
@@ -322,6 +331,8 @@ impl CodexDriver {
             (usize, Sender<Result<(), String>>),
         >::new()));
         let pending_steers = Arc::new(Mutex::new(HashMap::<u64, String>::new()));
+        let pending_elicitations =
+            Arc::new(Mutex::new(HashMap::<String, PendingElicitation>::new()));
         let background_rpcs = Arc::new(Mutex::new(BackgroundRpcState::default()));
         let goal_rpcs = Arc::new(Mutex::new(GoalRpcState::default()));
         let title_generation = Arc::new(Mutex::new(CodexTitleGeneration {
@@ -335,6 +346,7 @@ impl CodexDriver {
         let writer_turn_ids = turn_ids.clone();
         let writer_pending_rollbacks = pending_rollbacks.clone();
         let writer_pending_steers = pending_steers.clone();
+        let writer_pending_elicitations = pending_elicitations.clone();
         let writer_background_rpcs = background_rpcs.clone();
         let writer_goal_rpcs = goal_rpcs.clone();
         let writer_title_generation = title_generation.clone();
@@ -550,10 +562,25 @@ impl CodexDriver {
                             request_id,
                             option_id,
                         } => {
-                            let id = parse_rpc_id(&request_id);
+                            if let Some(pending) =
+                                writer_pending_elicitations.lock().remove(&request_id)
+                            {
+                                json!({
+                                    "id": pending.rpc_id,
+                                    "result": codex_elicitation_response(&option_id, pending.is_url_mode)
+                                })
+                            } else {
+                                let id = parse_rpc_id(&request_id);
+                                json!({
+                                    "id": id,
+                                    "result": {"decision": option_id}
+                                })
+                            }
+                        }
+                        CommandMessage::RawRpcResponse { id, result } => {
                             json!({
                                 "id": id,
-                                "result": {"decision": option_id}
+                                "result": result
                             })
                         }
                         CommandMessage::RespondUserInput {
@@ -769,6 +796,8 @@ impl CodexDriver {
         let reader_turn_ids = turn_ids.clone();
         let reader_pending_rollbacks = pending_rollbacks.clone();
         let reader_pending_steers = pending_steers.clone();
+        let reader_pending_elicitations = pending_elicitations.clone();
+        let reader_auto_allow_elicitations = mode == RuntimeMode::FullAccess;
         let reader_background_rpcs = background_rpcs.clone();
         let reader_goal_rpcs = goal_rpcs.clone();
         let reader_title_generation = title_generation;
@@ -777,7 +806,11 @@ impl CodexDriver {
         let reader_thread = thread::Builder::new()
             .name("waku-codex-reader".into())
             .spawn(move || {
-                let mut stream_state = CodexStreamState::default();
+                let mut stream_state = CodexStreamState {
+                    auto_allow_elicitations: reader_auto_allow_elicitations,
+                    pending_elicitations: reader_pending_elicitations,
+                    ..CodexStreamState::default()
+                };
                 for line in BufReader::new(stdout).lines() {
                     match line {
                         Ok(line) if !line.trim().is_empty() => {
@@ -1390,6 +1423,8 @@ struct CodexStreamState {
     next_citation_number: usize,
     /// Item id and part index of the reasoning chunk currently streaming.
     reasoning_part: Option<(String, u64)>,
+    auto_allow_elicitations: bool,
+    pending_elicitations: Arc<Mutex<HashMap<String, PendingElicitation>>>,
 }
 
 impl CodexStreamState {
@@ -2003,6 +2038,37 @@ fn handle_codex_message(
                 });
             }
         }
+        "mcpServer/elicitation/request" if value.get("id").is_some() => {
+            let rpc_id = value.get("id").cloned().unwrap();
+            let is_url_mode = params.get("mode").and_then(Value::as_str) == Some("url");
+            if !is_url_mode && !codex_elicitation_accepts_empty_form(&params) {
+                let _ = commands.send(CommandMessage::RawRpcResponse {
+                    id: rpc_id,
+                    result: json!({"action": "cancel"}),
+                });
+            } else if stream_state.auto_allow_elicitations && !is_url_mode {
+                let _ = commands.send(CommandMessage::RawRpcResponse {
+                    id: rpc_id,
+                    result: codex_elicitation_auto_accept(&params),
+                });
+            } else {
+                let request_id = rpc_id_string(&rpc_id);
+                let (title, detail, options) = codex_elicitation_permission(&params);
+                stream_state.pending_elicitations.lock().insert(
+                    request_id.clone(),
+                    PendingElicitation {
+                        rpc_id,
+                        is_url_mode,
+                    },
+                );
+                let _ = events.send(DriverEvent::Permission {
+                    request_id,
+                    title,
+                    detail,
+                    options,
+                });
+            }
+        }
         method if value.get("id").is_some() && method.contains("requestApproval") => {
             let request_id = rpc_id_string(value.get("id").unwrap());
             let (title, detail) = approval_copy(method, &params);
@@ -2455,6 +2521,140 @@ fn approval_copy(method: &str, params: &Value) -> (String, String) {
             .and_then(Value::as_str)
             .unwrap_or("Apply the proposed file changes");
         ("File change approval".into(), reason.into())
+    }
+}
+
+fn codex_elicitation_accepts_empty_form(params: &Value) -> bool {
+    let Some(schema) = params.get("requestedSchema") else {
+        return true;
+    };
+    if schema.is_null() {
+        return true;
+    }
+    let has_required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty());
+    let has_properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| !properties.is_empty());
+    !has_required && !has_properties
+}
+
+fn codex_elicitation_auto_accept(params: &Value) -> Value {
+    let allows_session = params
+        .pointer("/_meta/persist")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("session")));
+    if allows_session {
+        json!({
+            "action": "accept",
+            "content": {},
+            "_meta": {"persist": "session"}
+        })
+    } else {
+        json!({
+            "action": "accept",
+            "content": {}
+        })
+    }
+}
+
+fn codex_elicitation_permission(params: &Value) -> (String, String, Vec<PermissionOption>) {
+    let meta = params.get("_meta");
+    let title = non_empty_string(meta.and_then(|value| value.get("connector_name")))
+        .or_else(|| non_empty_string(params.get("serverName")))
+        .map(str::to_owned)
+        .unwrap_or_else(|| "MCP approval".to_owned());
+
+    let mut detail_parts = Vec::new();
+    if let Some(message) = non_empty_string(params.get("message")) {
+        detail_parts.push(message.to_owned());
+    }
+    if let Some(subtitle) = non_empty_string(meta.and_then(|value| value.get("subtitle"))) {
+        detail_parts.push(subtitle.to_owned());
+    }
+    if let Some(url) = non_empty_string(params.get("url")) {
+        detail_parts.push(url.to_owned());
+    }
+    let detail = if detail_parts.is_empty() {
+        "Approve this MCP server request?".to_owned()
+    } else {
+        detail_parts.join("\n")
+    };
+
+    let is_url_mode = params.get("mode").and_then(Value::as_str) == Some("url");
+    let persist = meta
+        .and_then(|value| value.get("persist"))
+        .and_then(Value::as_array);
+    let allows_session =
+        persist.is_some_and(|items| items.iter().any(|item| item.as_str() == Some("session")));
+    let allows_always =
+        persist.is_some_and(|items| items.iter().any(|item| item.as_str() == Some("always")));
+
+    let mut options = Vec::new();
+    if is_url_mode {
+        options.push(PermissionOption {
+            id: "accept".into(),
+            label: tr!("permission.allow_once"),
+            allow: true,
+        });
+    } else if allows_session {
+        options.push(PermissionOption {
+            id: "acceptForSession".into(),
+            label: tr!("permission.allow_for_session"),
+            allow: true,
+        });
+        if allows_always {
+            options.push(PermissionOption {
+                id: "acceptAlways".into(),
+                label: tr!("computer_use.always_allow_app"),
+                allow: true,
+            });
+        }
+    } else {
+        options.push(PermissionOption {
+            id: "accept".into(),
+            label: tr!("permission.allow_once"),
+            allow: true,
+        });
+        if allows_always {
+            options.push(PermissionOption {
+                id: "acceptAlways".into(),
+                label: tr!("computer_use.always_allow_app"),
+                allow: true,
+            });
+        }
+    }
+    options.push(PermissionOption {
+        id: "decline".into(),
+        label: tr!("common.deny"),
+        allow: false,
+    });
+
+    (title, detail, options)
+}
+
+fn codex_elicitation_response(option_id: &str, is_url_mode: bool) -> Value {
+    match option_id {
+        "accept" if is_url_mode => json!({"action": "accept"}),
+        "accept" => json!({
+            "action": "accept",
+            "content": {}
+        }),
+        "acceptForSession" => json!({
+            "action": "accept",
+            "content": {},
+            "_meta": {"persist": "session"}
+        }),
+        "acceptAlways" => json!({
+            "action": "accept",
+            "content": {},
+            "_meta": {"persist": "always"}
+        }),
+        "cancel" => json!({"action": "cancel"}),
+        _ => json!({"action": "decline"}),
     }
 }
 
@@ -3850,5 +4050,169 @@ mod tests {
 
         assert!(codex_plan_usage(Some(&json!({"planType": "plus"}))).is_none());
         assert!(codex_plan_usage(None).is_none());
+    }
+
+    #[test]
+    fn mcp_elicitation_request_handles_prompt_auto_allow_and_non_empty_schema() {
+        let (commands, cmd_rx) = unbounded();
+        let (events, received) = crate::driver::test_event_channel();
+        let mut state = CodexStreamState::default();
+
+        // 1. Non-FullAccess mode: emits Permission and tracks exact original string RPC ID.
+        handle_codex_message(
+            json!({
+                "id": "42",
+                "method": "mcpServer/elicitation/request",
+                "params": {
+                    "serverName": "node_repl",
+                    "threadId": "thread-1",
+                    "mode": "form",
+                    "message": "Allow Computer Use to use \"Microsoft Edge\"?",
+                    "requestedSchema": {"type": "object", "properties": {}},
+                    "_meta": {
+                        "connector_name": "Computer Use",
+                        "persist": ["session", "always"]
+                    }
+                }
+            }),
+            &Mutex::new(None),
+            &Mutex::new(None),
+            &Mutex::new(Vec::new()),
+            &Mutex::new(HashMap::new()),
+            &Mutex::new(HashMap::new()),
+            &Mutex::new(BackgroundRpcState::default()),
+            &Mutex::new(GoalRpcState::default()),
+            &commands,
+            &events,
+            &mut state,
+        );
+
+        match received.recv_timeout(Duration::from_secs(1)).unwrap() {
+            DriverEvent::Permission {
+                request_id,
+                title,
+                detail,
+                options,
+            } => {
+                assert_eq!(request_id, "42");
+                assert_eq!(title, "Computer Use");
+                assert_eq!(detail, "Allow Computer Use to use \"Microsoft Edge\"?");
+                let ids: Vec<&str> = options.iter().map(|opt| opt.id.as_str()).collect();
+                assert_eq!(ids, vec!["acceptForSession", "acceptAlways", "decline"]);
+            }
+            other => panic!("expected Permission event, got {other:?}"),
+        }
+        let pending = state
+            .pending_elicitations
+            .lock()
+            .remove("42")
+            .expect("pending elicitation should preserve original JSON-RPC id");
+        assert_eq!(pending.rpc_id, json!("42"));
+        assert!(!pending.is_url_mode);
+
+        // 2. FullAccess mode: auto-accepts empty-schema approval elicitation immediately.
+        state.auto_allow_elicitations = true;
+        handle_codex_message(
+            json!({
+                "id": 99,
+                "method": "mcpServer/elicitation/request",
+                "params": {
+                    "serverName": "node_repl",
+                    "threadId": "thread-1",
+                    "mode": "form",
+                    "message": "Allow Browser use to access https://career.ylab.ac.cn?",
+                    "requestedSchema": {"type": "object", "properties": {}},
+                    "_meta": {
+                        "connector_name": "Browser use",
+                        "persist": ["session"]
+                    }
+                }
+            }),
+            &Mutex::new(None),
+            &Mutex::new(None),
+            &Mutex::new(Vec::new()),
+            &Mutex::new(HashMap::new()),
+            &Mutex::new(HashMap::new()),
+            &Mutex::new(BackgroundRpcState::default()),
+            &Mutex::new(GoalRpcState::default()),
+            &commands,
+            &events,
+            &mut state,
+        );
+        match cmd_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            CommandMessage::RawRpcResponse { id, result } => {
+                assert_eq!(id, json!(99));
+                assert_eq!(
+                    result,
+                    json!({
+                        "action": "accept",
+                        "content": {},
+                        "_meta": {"persist": "session"}
+                    })
+                );
+            }
+            other => panic!("expected auto-allow RawRpcResponse, got {other:?}"),
+        }
+
+        // 3. Non-empty form schema: cancels explicitly instead of sending invalid empty content.
+        handle_codex_message(
+            json!({
+                "id": "form-1",
+                "method": "mcpServer/elicitation/request",
+                "params": {
+                    "serverName": "custom_mcp",
+                    "threadId": "thread-1",
+                    "mode": "form",
+                    "message": "Enter API key",
+                    "requestedSchema": {
+                        "type": "object",
+                        "properties": {"apiKey": {"type": "string"}},
+                        "required": ["apiKey"]
+                    }
+                }
+            }),
+            &Mutex::new(None),
+            &Mutex::new(None),
+            &Mutex::new(Vec::new()),
+            &Mutex::new(HashMap::new()),
+            &Mutex::new(HashMap::new()),
+            &Mutex::new(BackgroundRpcState::default()),
+            &Mutex::new(GoalRpcState::default()),
+            &commands,
+            &events,
+            &mut state,
+        );
+        match cmd_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            CommandMessage::RawRpcResponse { id, result } => {
+                assert_eq!(id, json!("form-1"));
+                assert_eq!(result, json!({"action": "cancel"}));
+            }
+            other => panic!("expected cancel RawRpcResponse, got {other:?}"),
+        }
+
+        assert_eq!(
+            codex_elicitation_response("acceptForSession", false),
+            json!({
+                "action": "accept",
+                "content": {},
+                "_meta": {"persist": "session"}
+            })
+        );
+        assert_eq!(
+            codex_elicitation_response("acceptAlways", false),
+            json!({
+                "action": "accept",
+                "content": {},
+                "_meta": {"persist": "always"}
+            })
+        );
+        assert_eq!(
+            codex_elicitation_response("accept", true),
+            json!({"action": "accept"})
+        );
+        assert_eq!(
+            codex_elicitation_response("decline", false),
+            json!({"action": "decline"})
+        );
     }
 }
