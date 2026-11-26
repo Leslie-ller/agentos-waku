@@ -31,7 +31,8 @@ pub const MCP_SERVER_NAME: &str = "agentos-mcp";
 pub const MCP_BIN_ENV: &str = "AGENTOS_WAKU_MCP_BIN";
 pub const DISABLE_MCP_ENV: &str = "AGENTOS_WAKU_DISABLE_MCP";
 pub const AGENTOS_QUESTION_PREFIX: &str = "agentos-q:";
-pub const CODEX_ADVISOR_MODEL: &str = "gpt-6.2-sol";
+pub const CODEX_ADVISOR_MODEL: &str = "gpt-6.2-astra";
+pub const CODEX_AUTO_ADVISOR_MODEL: &str = "gpt-6.2-sol";
 pub const ANTIGRAVITY_ADVISOR_MODEL: &str = "claude-opus-5-5";
 pub const ADVISOR_SYSTEM_PROMPT: &str = "\
 You are a read-only senior advisor consulted by another agent inside AgentOS for an independent \
@@ -57,7 +58,7 @@ STRICT RULES:\n\
   concise (aim for 400–800 tokens): state the verdict/diagnosis first, then concrete steps, \
   trade-offs, or creative improvements.";
 pub const MEMORY_MCP_INSTRUCTIONS: &str = "Persistent cross-session memory is available via memory_search (default scope=\"project\") and memory_read. Whenever the user references past state or behavior (e.g. 'before', 'last time', 'previously', 'still connected', 'again', '以前', '上次', '之前', '还在吗', '又...了', '连过', '配过'), or when troubleshooting devices, local network/SSH/proxy topology, credentials, deployment setup, or unexpected environment discrepancies, call memory_search(scope=\"project\") with 1-3 focused keywords BEFORE guessing or running broad diagnostics. Whenever the user's message mentions a past session link such as [Session title](agentos://session/<id>) or [Session title](codeg://session/<id>), call get_session_info(session_id=\"<id>\") to inspect its title, workspace, and recent transcript.";
-pub const ADVISOR_MCP_INSTRUCTIONS: &str = "Read-only cross-model peer review is available via consult_advisor (Codex gpt-6.2-sol + Antigravity claude-opus-5-5, supporting parallel dual-advisor mode via advisor_provider=\"both\" or the user's configured default). Before finalizing non-trivial architectural plans, risky multi-file changes, stubborn bugs, or creative/aesthetic/visual decisions (including reviewing local screenshots, contact sheets, or storyboards), proactively call consult_advisor with a concise question and relevant file paths for an independent second opinion.";
+pub const ADVISOR_MCP_INSTRUCTIONS: &str = "Read-only cross-model peer review is available via consult_advisor (Codex gpt-6.2-astra + Antigravity claude-opus-5-5, supporting parallel dual-advisor mode via advisor_provider=\"both\" or the user's configured default). Before finalizing non-trivial architectural plans, risky multi-file changes, stubborn bugs, or creative/aesthetic/visual decisions (including reviewing local screenshots, contact sheets, or storyboards), proactively call consult_advisor with a concise question and relevant file paths for an independent second opinion.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpCompanionLaunch {
@@ -1667,6 +1668,14 @@ pub(crate) fn default_advisor_model(provider: ProviderKind) -> Option<&'static s
     }
 }
 
+pub(crate) fn advisor_model_for_origin(provider: ProviderKind, origin: &str) -> Option<&'static str> {
+    if origin == "auto" && provider == ProviderKind::Codex {
+        Some(CODEX_AUTO_ADVISOR_MODEL)
+    } else {
+        default_advisor_model(provider)
+    }
+}
+
 struct ParallelAdvisorOutcome {
     consultation_id: String,
     provider: ProviderKind,
@@ -2422,10 +2431,10 @@ const AUTO_ADVISOR_MAX_INJECT_CHARS: usize = 6000;
 const AUTO_ADVISOR_ANTIGRAVITY_MAX_FILES: usize = 3;
 
 fn advisor_reasoning_effort(provider: ProviderKind, origin: &str) -> Option<&'static str> {
-    if origin == "auto" && provider == ProviderKind::Antigravity {
-        Some("medium")
-    } else {
-        None
+    match (provider, origin) {
+        (ProviderKind::Antigravity, "auto") => Some("medium"),
+        (ProviderKind::Codex, origin) if origin != "auto" => Some("medium"),
+        _ => None,
     }
 }
 
@@ -2495,7 +2504,7 @@ fn execute_advisor_consultation(
         );
         let reasoning_effort = advisor_reasoning_effort(advisor_provider, origin);
         let model = model_override
-            .or_else(|| default_advisor_model(advisor_provider).map(str::to_owned));
+            .or_else(|| advisor_model_for_origin(advisor_provider, origin).map(str::to_owned));
         let cid = Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO agentos_advisor_consultations
@@ -2570,7 +2579,7 @@ fn execute_advisor_consultation(
             let tx = conn.unchecked_transaction()?;
             for advisor_provider in targets {
                 let cid = Uuid::new_v4().to_string();
-                let model = default_advisor_model(advisor_provider).map(str::to_owned);
+                let model = advisor_model_for_origin(advisor_provider, origin).map(str::to_owned);
                 tx.execute(
                     "INSERT INTO agentos_advisor_consultations
                      (consultation_id, session_id, caller_provider, advisor_provider, model, question, status, created_at, origin)
@@ -4847,7 +4856,7 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
     if settings.advisor_enabled {
         tools.push(json!({
             "name": "consult_advisor",
-            "description": "Consult read-only senior advisor agent(s) — Codex (gpt-6.2-sol) and/or Antigravity (claude-opus-5-5) — for an independent second opinion. Supports parallel dual-advisor mode ('both', running Codex and Antigravity concurrently in one call and returning both perspectives side by side) as well as single-advisor mode ('auto' heterogeneous opposite, 'codex', 'antigravity'). Use proactively for complex architecture/planning trade-offs, pre-finalization reviews, subtle multi-file bugs, repeated failures, or risky changes, AS WELL AS creative direction, visual/aesthetic critique (inspecting local contact sheets, screenshots, UI previews, or storyboards), and non-code planning. SYNCHRONOUS & STRICTLY READ-ONLY: advisors can read/search local files and view local images directly, and cannot browse the web, edit files, run mutating commands, or talk to the user. Omit advisor_provider to follow AgentOS settings (default: 'both').",
+            "description": "Consult read-only senior advisor agent(s) — Codex (gpt-6.2-astra) and/or Antigravity (claude-opus-5-5) — for an independent second opinion. Supports parallel dual-advisor mode ('both', running Codex and Antigravity concurrently in one call and returning both perspectives side by side) as well as single-advisor mode ('auto' heterogeneous opposite, 'codex', 'antigravity'). Use proactively for complex architecture/planning trade-offs, pre-finalization reviews, subtle multi-file bugs, repeated failures, or risky changes, AS WELL AS creative direction, visual/aesthetic critique (inspecting local contact sheets, screenshots, UI previews, or storyboards), and non-code planning. SYNCHRONOUS & STRICTLY READ-ONLY: advisors can read/search local files and view local images directly, and cannot browse the web, edit files, run mutating commands, or talk to the user. Omit advisor_provider to follow AgentOS settings (default: 'both').",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4863,7 +4872,7 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
                     "advisor_provider": {
                         "type": "string",
                         "enum": ["both", "auto", "codex", "antigravity"],
-                        "description": "Optional override: 'both' queries Codex (gpt-6.2-sol) and Antigravity (claude-opus-5-5) concurrently in parallel; 'auto' picks a single heterogeneous opposite advisor; 'codex' or 'antigravity' targets one advisor. Defaults to AgentOS settings."
+                        "description": "Optional override: 'both' queries Codex (gpt-6.2-astra) and Antigravity (claude-opus-5-5) concurrently in parallel; 'auto' picks a single heterogeneous opposite advisor; 'codex' or 'antigravity' targets one advisor. Defaults to AgentOS settings."
                     },
                     "model": {
                         "type": "string",
@@ -6136,7 +6145,15 @@ mod tests {
 
     #[test]
     fn advisor_defaults_match_age180_creative_and_readonly_isolation() {
-        assert_eq!(default_advisor_model(ProviderKind::Codex), Some("gpt-6.2-sol"));
+        assert_eq!(default_advisor_model(ProviderKind::Codex), Some("gpt-6.2-astra"));
+        assert_eq!(
+            advisor_model_for_origin(ProviderKind::Codex, "manual"),
+            Some("gpt-6.2-astra")
+        );
+        assert_eq!(
+            advisor_model_for_origin(ProviderKind::Codex, "auto"),
+            Some("gpt-6.2-sol")
+        );
         assert_eq!(
             default_advisor_model(ProviderKind::Antigravity),
             Some("claude-opus-5-5")
@@ -6586,8 +6603,21 @@ mod tests {
         assert!(!agy_prompt.contains("- d.rs\n"));
         assert!(!agy_prompt.contains("- r1.rs\n"));
 
-        // Codex auto-review ignores the file/crawl cap and keeps full default effort.
+        // Codex auto-review uses gpt-6.2-sol, ignores the file/crawl cap, and keeps default effort;
+        // manual/proactive Codex consult_advisor uses gpt-6.2-astra at medium reasoning effort.
+        assert_eq!(
+            advisor_model_for_origin(ProviderKind::Codex, "auto"),
+            Some("gpt-6.2-sol")
+        );
+        assert_eq!(
+            advisor_model_for_origin(ProviderKind::Codex, "manual"),
+            Some("gpt-6.2-astra")
+        );
         assert_eq!(advisor_reasoning_effort(ProviderKind::Codex, "auto"), None);
+        assert_eq!(
+            advisor_reasoning_effort(ProviderKind::Codex, "manual"),
+            Some("medium")
+        );
         let codex_prompt = build_advisor_prompt_for_provider(
             ProviderKind::Codex,
             "auto",
@@ -6617,10 +6647,11 @@ mod tests {
 
         let med_args = build_codex_oneshot_args_with_effort(
             Path::new("/tmp/ws"),
-            Some("gpt-6.2-sol"),
+            Some("gpt-6.2-astra"),
             Some("medium"),
             true,
         );
+        assert!(med_args.windows(2).any(|w| w == ["-m", "gpt-6.2-astra"]));
         assert!(med_args.iter().any(|a| a == "model_reasoning_effort=\"medium\""));
     }
 }
