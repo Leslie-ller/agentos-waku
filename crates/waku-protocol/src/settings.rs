@@ -16,6 +16,34 @@ fn default_advisor_provider() -> String {
     "both".to_owned()
 }
 
+fn default_advisor_codex_model() -> String {
+    "gpt-6.2-astra".to_owned()
+}
+
+fn default_advisor_codex_effort() -> String {
+    "medium".to_owned()
+}
+
+fn default_advisor_antigravity_model() -> String {
+    "claude-opus-5-5".to_owned()
+}
+
+fn default_advisor_timeout_seconds() -> u32 {
+    120
+}
+
+fn default_advisor_auto_codex_model() -> String {
+    "gpt-6.2-sol".to_owned()
+}
+
+fn default_advisor_auto_antigravity_effort() -> String {
+    "medium".to_owned()
+}
+
+fn default_advisor_auto_antigravity_max_files() -> u32 {
+    3
+}
+
 fn default_advisor_auto_review_cooldown_minutes() -> u32 {
     30
 }
@@ -40,10 +68,39 @@ pub struct AgentOsMcpSettings {
     /// `"auto"` (heterogeneous opposite family), `"codex"`, or `"antigravity"`.
     #[serde(default = "default_advisor_provider")]
     pub advisor_provider: String,
+    // Hot-reloadable advisor model/effort/timeout overrides (read live on every
+    // consult_advisor call and background auto-review without recompiling).
+    #[serde(default = "default_advisor_codex_model")]
+    pub advisor_codex_model: String,
+    #[serde(default = "default_advisor_codex_effort")]
+    pub advisor_codex_effort: String,
+    #[serde(default = "default_advisor_antigravity_model")]
+    pub advisor_antigravity_model: String,
+    #[serde(default)]
+    pub advisor_antigravity_effort: String,
+    #[serde(default = "default_advisor_timeout_seconds")]
+    pub advisor_timeout_seconds: u32,
     // Automatically run background dual-advisor review once a human-rooted task
     // crosses scale thresholds, injecting the result into the next prompt.
     #[serde(default = "default_true")]
     pub advisor_auto_review_enabled: bool,
+    // Optional provider override for background auto-reviews (empty = inherit advisorProvider).
+    #[serde(default)]
+    pub advisor_auto_provider: String,
+    #[serde(default = "default_advisor_auto_codex_model")]
+    pub advisor_auto_codex_model: String,
+    #[serde(default)]
+    pub advisor_auto_codex_effort: String,
+    // Optional Antigravity model override for background auto-reviews (empty = inherit advisorAntigravityModel).
+    #[serde(default)]
+    pub advisor_auto_antigravity_model: String,
+    #[serde(default = "default_advisor_auto_antigravity_effort")]
+    pub advisor_auto_antigravity_effort: String,
+    // Max workspace files passed to background auto-review (0 = unrestricted).
+    #[serde(default)]
+    pub advisor_auto_codex_max_files: u32,
+    #[serde(default = "default_advisor_auto_antigravity_max_files")]
+    pub advisor_auto_antigravity_max_files: u32,
     #[serde(default = "default_advisor_auto_review_cooldown_minutes")]
     pub advisor_auto_review_cooldown_minutes: u32,
     #[serde(default = "default_advisor_auto_review_daily_cap")]
@@ -63,7 +120,19 @@ impl Default for AgentOsMcpSettings {
             goal_enabled: true,
             advisor_enabled: true,
             advisor_provider: default_advisor_provider(),
+            advisor_codex_model: default_advisor_codex_model(),
+            advisor_codex_effort: default_advisor_codex_effort(),
+            advisor_antigravity_model: default_advisor_antigravity_model(),
+            advisor_antigravity_effort: String::new(),
+            advisor_timeout_seconds: default_advisor_timeout_seconds(),
             advisor_auto_review_enabled: true,
+            advisor_auto_provider: String::new(),
+            advisor_auto_codex_model: default_advisor_auto_codex_model(),
+            advisor_auto_codex_effort: String::new(),
+            advisor_auto_antigravity_model: String::new(),
+            advisor_auto_antigravity_effort: default_advisor_auto_antigravity_effort(),
+            advisor_auto_codex_max_files: 0,
+            advisor_auto_antigravity_max_files: default_advisor_auto_antigravity_max_files(),
             advisor_auto_review_cooldown_minutes: default_advisor_auto_review_cooldown_minutes(),
             advisor_auto_review_daily_cap: default_advisor_auto_review_daily_cap(),
             ask_user_enabled: true,

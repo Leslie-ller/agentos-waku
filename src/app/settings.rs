@@ -758,6 +758,38 @@ impl Waku {
         )
         .into_any_element();
 
+        let make_pill = |id: String, label: &'static str, active: bool| {
+            div()
+                .id(SharedString::from(id))
+                .px(px(10.0))
+                .py(px(5.0))
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .text_size(sp(12.0))
+                .font_weight(if active {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::NORMAL
+                })
+                .bg(if active {
+                    theme.overlay_strong
+                } else {
+                    theme.surface
+                })
+                .text_color(if active {
+                    theme.text
+                } else {
+                    theme.text_secondary
+                })
+                .border_1()
+                .border_color(if active {
+                    theme.border_strong
+                } else {
+                    theme.border
+                })
+                .child(label)
+        };
+
         let current_advisor = mcp.advisor_provider.clone();
         let mut advisor_pills = div().mt(px(8.0)).flex().flex_wrap().items_center().gap(px(8.0));
         for (value, label) in [
@@ -769,40 +801,124 @@ impl Waku {
             let active = current_advisor.eq_ignore_ascii_case(value);
             let value_owned = value.to_owned();
             advisor_pills = advisor_pills.child(
-                div()
-                    .id(SharedString::from(format!("agentos-advisor-pill-{value}")))
-                    .px(px(10.0))
-                    .py(px(5.0))
-                    .rounded(px(8.0))
-                    .cursor_pointer()
-                    .text_size(sp(12.0))
-                    .font_weight(if active {
-                        FontWeight::MEDIUM
-                    } else {
-                        FontWeight::NORMAL
-                    })
-                    .bg(if active {
-                        theme.overlay_strong
-                    } else {
-                        theme.surface
-                    })
-                    .text_color(if active {
-                        theme.text
-                    } else {
-                        theme.text_secondary
-                    })
-                    .border_1()
-                    .border_color(if active {
-                        theme.border_strong
-                    } else {
-                        theme.border
-                    })
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                make_pill(format!("agentos-advisor-pill-{value}"), label, active).on_click(
+                    cx.listener(move |this, _, _, cx| {
                         this.state.agentos_mcp.advisor_provider = value_owned.clone();
                         this.save();
                         cx.notify();
-                    })),
+                    }),
+                ),
+            );
+        }
+
+        let current_codex_model = mcp.advisor_codex_model.clone();
+        let current_codex_effort = mcp.advisor_codex_effort.clone();
+        let mut proactive_codex_pills =
+            div().mt(px(6.0)).flex().flex_wrap().items_center().gap(px(8.0));
+        for model in ["gpt-6.2-astra", "gpt-6.2-sol"] {
+            let active = current_codex_model.eq_ignore_ascii_case(model);
+            let model_owned = model.to_owned();
+            proactive_codex_pills = proactive_codex_pills.child(
+                make_pill(format!("agentos-advisor-codex-model-{model}"), model, active).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.state.agentos_mcp.advisor_codex_model = model_owned.clone();
+                        this.save();
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+        proactive_codex_pills = proactive_codex_pills.child(
+            div()
+                .ml(px(4.0))
+                .text_size(sp(11.5))
+                .text_color(theme.text_tertiary)
+                .child("Effort:"),
+        );
+        for effort in ["low", "medium", "high", "xhigh"] {
+            let active = current_codex_effort.eq_ignore_ascii_case(effort);
+            let effort_owned = effort.to_owned();
+            proactive_codex_pills = proactive_codex_pills.child(
+                make_pill(
+                    format!("agentos-advisor-codex-effort-{effort}"),
+                    effort,
+                    active,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.state.agentos_mcp.advisor_codex_effort = effort_owned.clone();
+                    this.save();
+                    cx.notify();
+                })),
+            );
+        }
+
+        let current_auto_provider = mcp.advisor_auto_provider.clone();
+        let mut auto_provider_pills =
+            div().mt(px(6.0)).flex().flex_wrap().items_center().gap(px(8.0));
+        for (value, label) in [
+            ("", "Same as Default"),
+            ("both", "Both"),
+            ("codex", "Codex Only"),
+            ("antigravity", "AGY Only"),
+        ] {
+            let active = current_auto_provider.trim().eq_ignore_ascii_case(value);
+            let value_owned = value.to_owned();
+            let id_suffix = if value.is_empty() { "inherit" } else { value };
+            auto_provider_pills = auto_provider_pills.child(
+                make_pill(
+                    format!("agentos-advisor-auto-provider-{id_suffix}"),
+                    label,
+                    active,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.state.agentos_mcp.advisor_auto_provider = value_owned.clone();
+                    this.save();
+                    cx.notify();
+                })),
+            );
+        }
+
+        let current_auto_codex_model = mcp.advisor_auto_codex_model.clone();
+        let current_auto_agy_effort = mcp.advisor_auto_antigravity_effort.clone();
+        let mut auto_tuning_pills =
+            div().mt(px(6.0)).flex().flex_wrap().items_center().gap(px(8.0));
+        for model in ["gpt-6.2-sol", "gpt-6.2-astra"] {
+            let active = current_auto_codex_model.eq_ignore_ascii_case(model);
+            let model_owned = model.to_owned();
+            auto_tuning_pills = auto_tuning_pills.child(
+                make_pill(
+                    format!("agentos-advisor-auto-codex-model-{model}"),
+                    model,
+                    active,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.state.agentos_mcp.advisor_auto_codex_model = model_owned.clone();
+                    this.save();
+                    cx.notify();
+                })),
+            );
+        }
+        auto_tuning_pills = auto_tuning_pills.child(
+            div()
+                .ml(px(4.0))
+                .text_size(sp(11.5))
+                .text_color(theme.text_tertiary)
+                .child("AGY Effort:"),
+        );
+        for effort in ["low", "medium", "high"] {
+            let active = current_auto_agy_effort.eq_ignore_ascii_case(effort);
+            let effort_owned = effort.to_owned();
+            auto_tuning_pills = auto_tuning_pills.child(
+                make_pill(
+                    format!("agentos-advisor-auto-agy-effort-{effort}"),
+                    effort,
+                    active,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.state.agentos_mcp.advisor_auto_antigravity_effort = effort_owned.clone();
+                    this.save();
+                    cx.notify();
+                })),
             );
         }
 
@@ -857,7 +973,15 @@ impl Waku {
                                 .text_color(theme.text_tertiary)
                                 .child("Default Advisor Target"),
                         )
-                        .child(advisor_pills),
+                        .child(advisor_pills)
+                        .child(
+                            div()
+                                .mt(px(10.0))
+                                .text_size(sp(11.5))
+                                .text_color(theme.text_tertiary)
+                                .child("Proactive Codex Model & Effort"),
+                        )
+                        .child(proactive_codex_pills),
                 )
                 .child(make_row(
                     "row-mcp-advisor-auto-review",
@@ -865,6 +989,34 @@ impl Waku {
                     "Automatically run background dual-advisor review once a human-driven task reaches substantial scale (skips cron/game-farming wakeups) and inject advice into the next turn.",
                     advisor_auto_review_toggle,
                 ))
+                .when(mcp.advisor_auto_review_enabled, |card| {
+                    card.child(
+                        div()
+                            .pb(px(10.0))
+                            .child(
+                                div()
+                                    .text_size(sp(11.5))
+                                    .text_color(theme.text_tertiary)
+                                    .child("Auto-Review Target"),
+                            )
+                            .child(auto_provider_pills)
+                            .child(
+                                div()
+                                    .mt(px(10.0))
+                                    .text_size(sp(11.5))
+                                    .text_color(theme.text_tertiary)
+                                    .child("Auto Codex Model & Auto AGY Effort"),
+                            )
+                            .child(auto_tuning_pills)
+                            .child(
+                                div()
+                                    .mt(px(8.0))
+                                    .text_size(sp(11.0))
+                                    .text_color(theme.text_tertiary)
+                                    .child("All advisor models, efforts, timeout, file caps, and cooldowns hot-reload live from ~/.agentos-waku/settings.json."),
+                            ),
+                    )
+                })
             })
             .child(make_row(
                 "row-mcp-ask",

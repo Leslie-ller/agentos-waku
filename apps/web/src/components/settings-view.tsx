@@ -211,7 +211,19 @@ const DEFAULT_AGENTOS_MCP: AgentOsMcpSettings = {
   goalEnabled: true,
   advisorEnabled: true,
   advisorProvider: 'both',
+  advisorCodexModel: 'gpt-6.2-astra',
+  advisorCodexEffort: 'medium',
+  advisorAntigravityModel: 'claude-opus-5-5',
+  advisorAntigravityEffort: '',
+  advisorTimeoutSeconds: 120,
   advisorAutoReviewEnabled: true,
+  advisorAutoProvider: '',
+  advisorAutoCodexModel: 'gpt-6.2-sol',
+  advisorAutoCodexEffort: '',
+  advisorAutoAntigravityModel: '',
+  advisorAutoAntigravityEffort: 'medium',
+  advisorAutoCodexMaxFiles: 0,
+  advisorAutoAntigravityMaxFiles: 3,
   advisorAutoReviewCooldownMinutes: 30,
   advisorAutoReviewDailyCap: 20,
   askUserEnabled: true,
@@ -283,34 +295,160 @@ function GeneralSettings() {
               />
             </div>
           ))}
-          <div className="pt-3">
-            <div className="text-[13px] font-medium">Advisor Engine</div>
-            <div className="mt-2 flex flex-wrap gap-1.5">
-              {([
-                ['both', 'Both (Codex + AGY)'],
-                ['auto', 'Auto (Heterogeneous)'],
-                ['codex', 'Codex'],
-                ['antigravity', 'Antigravity'],
-              ] as const).map(([value, label]) => {
-                const active = mcp.advisorProvider.toLowerCase() === value
-                return (
-                  <button
-                    className={cn(
-                      'rounded-lg border px-2.5 py-1 text-[12px] transition-colors',
-                      active
-                        ? 'border-foreground/30 bg-accent font-medium text-foreground'
-                        : 'border-border bg-background/60 text-[var(--text-secondary)] hover:bg-accent/60',
-                    )}
-                    disabled={savingMcp}
-                    key={value}
-                    type="button"
-                    onClick={() => void patchMcp({ advisorProvider: value })}
-                  >
-                    {label}
-                  </button>
-                )
-              })}
+          <div className="space-y-3 pt-3">
+            <div>
+              <div className="text-[13px] font-medium">Advisor Engine</div>
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {([
+                  ['both', 'Both (Codex + AGY)'],
+                  ['auto', 'Auto (Heterogeneous)'],
+                  ['codex', 'Codex'],
+                  ['antigravity', 'Antigravity'],
+                ] as const).map(([value, label]) => {
+                  const active = mcp.advisorProvider.toLowerCase() === value
+                  return (
+                    <button
+                      className={cn(
+                        'rounded-lg border px-2.5 py-1 text-[12px] transition-colors',
+                        active
+                          ? 'border-foreground/30 bg-accent font-medium text-foreground'
+                          : 'border-border bg-background/60 text-[var(--text-secondary)] hover:bg-accent/60',
+                      )}
+                      disabled={savingMcp}
+                      key={value}
+                      type="button"
+                      onClick={() => void patchMcp({ advisorProvider: value })}
+                    >
+                      {label}
+                    </button>
+                  )
+                })}
+              </div>
             </div>
+            <div>
+              <div className="text-[12px] font-medium text-[var(--text-secondary)]">Proactive Codex Model & Effort</div>
+              <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                {(['gpt-6.2-astra', 'gpt-6.2-sol'] as const).map((model) => {
+                  const active = mcp.advisorCodexModel === model
+                  return (
+                    <button
+                      className={cn(
+                        'rounded-lg border px-2.5 py-1 text-[12px] transition-colors',
+                        active
+                          ? 'border-foreground/30 bg-accent font-medium text-foreground'
+                          : 'border-border bg-background/60 text-[var(--text-secondary)] hover:bg-accent/60',
+                      )}
+                      disabled={savingMcp}
+                      key={model}
+                      type="button"
+                      onClick={() => void patchMcp({ advisorCodexModel: model })}
+                    >
+                      {model}
+                    </button>
+                  )
+                })}
+                <span className="mx-1 text-[11px] text-[var(--text-secondary)]">Effort:</span>
+                {(['low', 'medium', 'high', 'xhigh'] as const).map((effort) => {
+                  const active = (mcp.advisorCodexEffort || 'low').toLowerCase() === effort
+                  return (
+                    <button
+                      className={cn(
+                        'rounded-lg border px-2 py-1 text-[11.5px] transition-colors',
+                        active
+                          ? 'border-foreground/30 bg-accent font-medium text-foreground'
+                          : 'border-border bg-background/60 text-[var(--text-secondary)] hover:bg-accent/60',
+                      )}
+                      disabled={savingMcp}
+                      key={effort}
+                      type="button"
+                      onClick={() => void patchMcp({ advisorCodexEffort: effort })}
+                    >
+                      {effort}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+            {mcp.advisorAutoReviewEnabled && (
+              <div className="space-y-2.5">
+                <div>
+                  <div className="text-[12px] font-medium text-[var(--text-secondary)]">Auto-Review Target</div>
+                  <div className="mt-1.5 flex flex-wrap gap-1.5">
+                    {([
+                      ['', 'Same as Default'],
+                      ['both', 'Both'],
+                      ['codex', 'Codex Only'],
+                      ['antigravity', 'AGY Only'],
+                    ] as const).map(([value, label]) => {
+                      const active = (mcp.advisorAutoProvider || '').toLowerCase() === value
+                      return (
+                        <button
+                          className={cn(
+                            'rounded-lg border px-2.5 py-1 text-[12px] transition-colors',
+                            active
+                              ? 'border-foreground/30 bg-accent font-medium text-foreground'
+                              : 'border-border bg-background/60 text-[var(--text-secondary)] hover:bg-accent/60',
+                          )}
+                          disabled={savingMcp}
+                          key={value || 'inherit'}
+                          type="button"
+                          onClick={() => void patchMcp({ advisorAutoProvider: value })}
+                        >
+                          {label}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[12px] font-medium text-[var(--text-secondary)]">Auto Codex Model / Auto AGY Effort</div>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                    {(['gpt-6.2-sol', 'gpt-6.2-astra'] as const).map((model) => {
+                      const active = mcp.advisorAutoCodexModel === model
+                      return (
+                        <button
+                          className={cn(
+                            'rounded-lg border px-2.5 py-1 text-[12px] transition-colors',
+                            active
+                              ? 'border-foreground/30 bg-accent font-medium text-foreground'
+                              : 'border-border bg-background/60 text-[var(--text-secondary)] hover:bg-accent/60',
+                          )}
+                          disabled={savingMcp}
+                          key={model}
+                          type="button"
+                          onClick={() => void patchMcp({ advisorAutoCodexModel: model })}
+                        >
+                          {model}
+                        </button>
+                      )
+                    })}
+                    <span className="mx-1 text-[11px] text-[var(--text-secondary)]">AGY Effort:</span>
+                    {(['low', 'medium', 'high'] as const).map((effort) => {
+                      const active = (mcp.advisorAutoAntigravityEffort || 'medium').toLowerCase() === effort
+                      return (
+                        <button
+                          className={cn(
+                            'rounded-lg border px-2 py-1 text-[11.5px] transition-colors',
+                            active
+                              ? 'border-foreground/30 bg-accent font-medium text-foreground'
+                              : 'border-border bg-background/60 text-[var(--text-secondary)] hover:bg-accent/60',
+                          )}
+                          disabled={savingMcp}
+                          key={effort}
+                          type="button"
+                          onClick={() => void patchMcp({ advisorAutoAntigravityEffort: effort })}
+                        >
+                          {effort}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              </div>
+            )}
+            <p className="text-[11px] leading-4 text-[var(--text-secondary)]">
+              All advisor models, efforts, timeout, file caps, and cooldowns hot-reload live from ~/.agentos-waku/settings.json without restarting.
+            </p>
           </div>
         </div>
       </SettingsCard>

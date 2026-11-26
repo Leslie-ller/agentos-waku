@@ -373,12 +373,12 @@ pub fn dispatch_mcp_request(conn: &Connection, ctx: &McpContext, req: &Value) ->
                 }
             });
             let mcp_settings = ctx.mcp_settings();
-            let mut instruction_parts: Vec<&str> = Vec::new();
+            let mut instruction_parts: Vec<String> = Vec::new();
             if mcp_settings.memory_enabled {
-                instruction_parts.push(MEMORY_MCP_INSTRUCTIONS);
+                instruction_parts.push(MEMORY_MCP_INSTRUCTIONS.to_owned());
             }
             if mcp_settings.advisor_enabled {
-                instruction_parts.push(ADVISOR_MCP_INSTRUCTIONS);
+                instruction_parts.push(advisor_mcp_instructions_for(&mcp_settings));
             }
             if !instruction_parts.is_empty() {
                 init["instructions"] = json!(instruction_parts.join("\n\n"));
@@ -1436,6 +1436,7 @@ fn call_mcp_tool(
                 context,
                 &files,
                 "manual",
+                &settings,
             )
         }
 
@@ -1660,6 +1661,11 @@ fn call_mcp_tool(
     }
 }
 
+fn non_empty_trimmed(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
 pub(crate) fn default_advisor_model(provider: ProviderKind) -> Option<&'static str> {
     match provider {
         ProviderKind::Codex => Some(CODEX_ADVISOR_MODEL),
@@ -1674,6 +1680,56 @@ pub(crate) fn advisor_model_for_origin(provider: ProviderKind, origin: &str) -> 
     } else {
         default_advisor_model(provider)
     }
+}
+
+pub(crate) fn advisor_model_from_settings(
+    settings: &AgentOsMcpSettings,
+    provider: ProviderKind,
+    origin: &str,
+) -> Option<String> {
+    match (provider, origin) {
+        (ProviderKind::Codex, "auto") => non_empty_trimmed(&settings.advisor_auto_codex_model)
+            .or_else(|| non_empty_trimmed(&settings.advisor_codex_model))
+            .or_else(|| advisor_model_for_origin(provider, origin).map(str::to_owned)),
+        (ProviderKind::Codex, _) => non_empty_trimmed(&settings.advisor_codex_model)
+            .or_else(|| advisor_model_for_origin(provider, origin).map(str::to_owned)),
+        (ProviderKind::Antigravity, "auto") => {
+            non_empty_trimmed(&settings.advisor_auto_antigravity_model)
+                .or_else(|| non_empty_trimmed(&settings.advisor_antigravity_model))
+                .or_else(|| advisor_model_for_origin(provider, origin).map(str::to_owned))
+        }
+        (ProviderKind::Antigravity, _) => non_empty_trimmed(&settings.advisor_antigravity_model)
+            .or_else(|| advisor_model_for_origin(provider, origin).map(str::to_owned)),
+        _ => None,
+    }
+}
+
+fn advisor_auto_provider_from_settings(settings: &AgentOsMcpSettings) -> &str {
+    let trimmed = settings.advisor_auto_provider.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("inherit") {
+        settings.advisor_provider.as_str()
+    } else {
+        trimmed
+    }
+}
+
+fn advisor_timeout_from_settings(settings: &AgentOsMcpSettings) -> Duration {
+    let secs = if settings.advisor_timeout_seconds == 0 {
+        120
+    } else {
+        settings.advisor_timeout_seconds.clamp(30, 600)
+    };
+    Duration::from_secs(u64::from(secs))
+}
+
+fn advisor_mcp_instructions_for(settings: &AgentOsMcpSettings) -> String {
+    let codex_model = advisor_model_from_settings(settings, ProviderKind::Codex, "manual")
+        .unwrap_or_else(|| CODEX_ADVISOR_MODEL.to_owned());
+    let agy_model = advisor_model_from_settings(settings, ProviderKind::Antigravity, "manual")
+        .unwrap_or_else(|| ANTIGRAVITY_ADVISOR_MODEL.to_owned());
+    format!(
+        "Read-only cross-model peer review is available via consult_advisor (Codex {codex_model} + Antigravity {agy_model}, supporting parallel dual-advisor mode via advisor_provider=\"both\" or the user's configured default). Before finalizing non-trivial architectural plans, risky multi-file changes, stubborn bugs, or creative/aesthetic/visual decisions (including reviewing local screenshots, contact sheets, or storyboards), proactively call consult_advisor with a concise question and relevant file paths for an independent second opinion."
+    )
 }
 
 struct ParallelAdvisorOutcome {
@@ -2428,16 +2484,51 @@ const AUTO_ADVISOR_MAX_QUEUE: usize = 4;
 const AUTO_ADVISOR_STALE_WINDOW_SECS: i64 = 6 * 3600;
 const AUTO_ADVISOR_MAX_INJECT_CHARS: usize = 6000;
 
-const AUTO_ADVISOR_ANTIGRAVITY_MAX_FILES: usize = 3;
-
-fn advisor_reasoning_effort(provider: ProviderKind, origin: &str) -> Option<&'static str> {
-    match (provider, origin) {
-        (ProviderKind::Antigravity, "auto") => Some("medium"),
-        (ProviderKind::Codex, origin) if origin != "auto" => Some("medium"),
-        _ => None,
+fn advisor_reasoning_effort_from_settings(
+    settings: &AgentOsMcpSettings,
+    provider: ProviderKind,
+    origin: &str,
+) -> Option<String> {
+    let raw = match (provider, origin) {
+        (ProviderKind::Codex, "auto") => settings.advisor_auto_codex_effort.as_str(),
+        (ProviderKind::Codex, _) => settings.advisor_codex_effort.as_str(),
+        (ProviderKind::Antigravity, "auto") => settings.advisor_auto_antigravity_effort.as_str(),
+        (ProviderKind::Antigravity, _) => settings.advisor_antigravity_effort.as_str(),
+        _ => "",
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("default")
+        || trimmed.eq_ignore_ascii_case("none")
+    {
+        None
+    } else {
+        Some(trimmed.to_owned())
     }
 }
 
+fn advisor_auto_max_files_from_settings(
+    settings: &AgentOsMcpSettings,
+    provider: ProviderKind,
+    origin: &str,
+) -> Option<usize> {
+    if origin != "auto" {
+        return None;
+    }
+    let limit = match provider {
+        ProviderKind::Codex => settings.advisor_auto_codex_max_files,
+        ProviderKind::Antigravity => settings.advisor_auto_antigravity_max_files,
+        _ => 0,
+    };
+    (limit > 0).then_some(limit as usize)
+}
+
+#[cfg(test)]
+fn advisor_reasoning_effort(provider: ProviderKind, origin: &str) -> Option<String> {
+    advisor_reasoning_effort_from_settings(&AgentOsMcpSettings::default(), provider, origin)
+}
+
+#[cfg(test)]
 fn build_advisor_prompt_for_provider(
     provider: ProviderKind,
     origin: &str,
@@ -2445,24 +2536,41 @@ fn build_advisor_prompt_for_provider(
     context: Option<&str>,
     files: &[String],
 ) -> String {
-    let apply_antigravity_auto_cap = origin == "auto" && provider == ProviderKind::Antigravity;
+    build_advisor_prompt_for_provider_with_settings(
+        &AgentOsMcpSettings::default(),
+        provider,
+        origin,
+        question,
+        context,
+        files,
+    )
+}
+
+fn build_advisor_prompt_for_provider_with_settings(
+    settings: &AgentOsMcpSettings,
+    provider: ProviderKind,
+    origin: &str,
+    question: &str,
+    context: Option<&str>,
+    files: &[String],
+) -> String {
+    let auto_max_files = advisor_auto_max_files_from_settings(settings, provider, origin);
     let mut prompt = format!("{ADVISOR_SYSTEM_PROMPT}\n\n");
     prompt.push_str(&format!("Question:\n{question}\n"));
-    if apply_antigravity_auto_cap {
-        prompt.push_str(
+    if let Some(max_files) = auto_max_files {
+        prompt.push_str(&format!(
             "\nSTRICT EXPLORATION & TOKEN BUDGET (background auto-review):\n\
-             - Make at most ONE parallel read batch of up to 2-3 listed files (0 reads if the provided excerpt & requests are already sufficient).\n\
+             - Make at most ONE parallel read batch of up to {max_files} listed files (0 reads if the provided excerpt & requests are already sufficient).\n\
              - NEVER crawl additional files, follow imports across the repo, list directories, or run multi-round searches.\n\
-             - Keep your final answer sharp and concise (<= 300 words): state the 1-3 highest-impact bugs, edge cases, or design/clarity flaws first.\n",
-        );
+             - Keep your final answer sharp and concise (<= 300 words): state the 1-3 highest-impact bugs, edge cases, or design/clarity flaws first.\n"
+        ));
     }
     if let Some(extra) = context {
         prompt.push_str(&format!("\nContext & hypotheses:\n{extra}\n"));
     }
-    let effective_files: &[String] = if apply_antigravity_auto_cap {
-        &files[..files.len().min(AUTO_ADVISOR_ANTIGRAVITY_MAX_FILES)]
-    } else {
-        files
+    let effective_files: &[String] = match auto_max_files {
+        Some(max_files) => &files[..files.len().min(max_files)],
+        None => files,
     };
     if !effective_files.is_empty() {
         prompt.push_str("\nRelevant local workspace files / images to inspect:\n");
@@ -2485,9 +2593,12 @@ fn execute_advisor_consultation(
     context: Option<&str>,
     files: &[String],
     origin: &str,
+    settings: &AgentOsMcpSettings,
 ) -> anyhow::Result<Value> {
     let requested_both = is_parallel_advisor_request(requested_provider);
+    let effective_model_override = if requested_both { None } else { model_override };
     let targets = resolve_advisor_providers(requested_provider, caller_provider)?;
+    let timeout = advisor_timeout_from_settings(settings);
     let now = unix_now();
 
     let caller_name = caller_provider.map(|p| p.id().to_owned());
@@ -2495,16 +2606,18 @@ fn execute_advisor_consultation(
 
     if targets.len() == 1 {
         let advisor_provider = targets[0];
-        let prompt = build_advisor_prompt_for_provider(
+        let prompt = build_advisor_prompt_for_provider_with_settings(
+            settings,
             advisor_provider,
             origin,
             question,
             context,
             files,
         );
-        let reasoning_effort = advisor_reasoning_effort(advisor_provider, origin);
-        let model = model_override
-            .or_else(|| advisor_model_for_origin(advisor_provider, origin).map(str::to_owned));
+        let reasoning_effort =
+            advisor_reasoning_effort_from_settings(settings, advisor_provider, origin);
+        let model = effective_model_override
+            .or_else(|| advisor_model_from_settings(settings, advisor_provider, origin));
         let cid = Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO agentos_advisor_consultations
@@ -2527,9 +2640,9 @@ fn execute_advisor_consultation(
             cwd,
             &prompt,
             model.as_deref(),
-            reasoning_effort,
+            reasoning_effort.as_deref(),
             true,
-            Duration::from_secs(120),
+            timeout,
             None,
         ) {
             Ok(advice) => {
@@ -2579,7 +2692,7 @@ fn execute_advisor_consultation(
             let tx = conn.unchecked_transaction()?;
             for advisor_provider in targets {
                 let cid = Uuid::new_v4().to_string();
-                let model = advisor_model_for_origin(advisor_provider, origin).map(str::to_owned);
+                let model = advisor_model_from_settings(settings, advisor_provider, origin);
                 tx.execute(
                     "INSERT INTO agentos_advisor_consultations
                      (consultation_id, session_id, caller_provider, advisor_provider, model, question, status, created_at, origin)
@@ -2604,9 +2717,11 @@ fn execute_advisor_consultation(
             let handles: Vec<_> = jobs
                 .into_iter()
                 .map(|(cid, provider, model)| {
-                    let prompt =
-                        build_advisor_prompt_for_provider(provider, origin, question, context, files);
-                    let reasoning_effort = advisor_reasoning_effort(provider, origin);
+                    let prompt = build_advisor_prompt_for_provider_with_settings(
+                        settings, provider, origin, question, context, files,
+                    );
+                    let reasoning_effort =
+                        advisor_reasoning_effort_from_settings(settings, provider, origin);
                     let cid_for_panic = cid.clone();
                     let model_for_panic = model.clone();
                     let handle = scope.spawn(move || {
@@ -2616,9 +2731,9 @@ fn execute_advisor_consultation(
                             cwd,
                             &prompt,
                             model.as_deref(),
-                            reasoning_effort,
+                            reasoning_effort.as_deref(),
                             true,
-                            Duration::from_secs(120),
+                            timeout,
                             None,
                         );
                         ParallelAdvisorOutcome {
@@ -3265,17 +3380,19 @@ impl AutoAdvisorPool {
         }
 
         let (question, context, files) = build_auto_advisor_prompt_inputs(&job.snapshot);
+        let auto_provider = advisor_auto_provider_from_settings(&settings);
         let result = execute_advisor_consultation(
             &conn,
             &sid,
             &job.cwd,
             Some(job.caller_provider),
-            &settings.advisor_provider,
+            auto_provider,
             None,
             &question,
             (!context.trim().is_empty()).then_some(context.as_str()),
             &files,
             "auto",
+            &settings,
         )?;
 
         // If the session was closed or daemon shut down while advisors were running,
@@ -4854,9 +4971,15 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
         }));
     }
     if settings.advisor_enabled {
+        let codex_model = advisor_model_from_settings(settings, ProviderKind::Codex, "manual")
+            .unwrap_or_else(|| CODEX_ADVISOR_MODEL.to_owned());
+        let agy_model = advisor_model_from_settings(settings, ProviderKind::Antigravity, "manual")
+            .unwrap_or_else(|| ANTIGRAVITY_ADVISOR_MODEL.to_owned());
         tools.push(json!({
             "name": "consult_advisor",
-            "description": "Consult read-only senior advisor agent(s) — Codex (gpt-6.2-astra) and/or Antigravity (claude-opus-5-5) — for an independent second opinion. Supports parallel dual-advisor mode ('both', running Codex and Antigravity concurrently in one call and returning both perspectives side by side) as well as single-advisor mode ('auto' heterogeneous opposite, 'codex', 'antigravity'). Use proactively for complex architecture/planning trade-offs, pre-finalization reviews, subtle multi-file bugs, repeated failures, or risky changes, AS WELL AS creative direction, visual/aesthetic critique (inspecting local contact sheets, screenshots, UI previews, or storyboards), and non-code planning. SYNCHRONOUS & STRICTLY READ-ONLY: advisors can read/search local files and view local images directly, and cannot browse the web, edit files, run mutating commands, or talk to the user. Omit advisor_provider to follow AgentOS settings (default: 'both').",
+            "description": format!(
+                "Consult read-only senior advisor agent(s) — Codex ({codex_model}) and/or Antigravity ({agy_model}) — for an independent second opinion. Supports parallel dual-advisor mode ('both', running Codex and Antigravity concurrently in one call and returning both perspectives side by side) as well as single-advisor mode ('auto' heterogeneous opposite, 'codex', 'antigravity'). Use proactively for complex architecture/planning trade-offs, pre-finalization reviews, subtle multi-file bugs, repeated failures, or risky changes, AS WELL AS creative direction, visual/aesthetic critique (inspecting local contact sheets, screenshots, UI previews, or storyboards), and non-code planning. SYNCHRONOUS & STRICTLY READ-ONLY: advisors can read/search local files and view local images directly, and cannot browse the web, edit files, run mutating commands, or talk to the user. Omit advisor_provider to follow AgentOS settings (default: 'both')."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4872,11 +4995,13 @@ fn mcp_tool_definitions_for(settings: &AgentOsMcpSettings) -> Vec<Value> {
                     "advisor_provider": {
                         "type": "string",
                         "enum": ["both", "auto", "codex", "antigravity"],
-                        "description": "Optional override: 'both' queries Codex (gpt-6.2-astra) and Antigravity (claude-opus-5-5) concurrently in parallel; 'auto' picks a single heterogeneous opposite advisor; 'codex' or 'antigravity' targets one advisor. Defaults to AgentOS settings."
+                        "description": format!(
+                            "Optional override: 'both' queries Codex ({codex_model}) and Antigravity ({agy_model}) concurrently in parallel; 'auto' picks a single heterogeneous opposite advisor; 'codex' or 'antigravity' targets one advisor. Defaults to AgentOS settings."
+                        )
                     },
                     "model": {
                         "type": "string",
-                        "description": "Optional model override when targeting a single advisor (ignored in 'both' mode so each advisor uses its native frontier model)."
+                        "description": "Optional model override when targeting a single advisor (ignored in 'both' mode so each advisor uses its configured model)."
                     }
                 },
                 "required": ["question"]
@@ -5479,6 +5604,7 @@ mod tests {
             ask_user_enabled: true,
             delegation_enabled: true,
             session_info_enabled: true,
+            ..AgentOsMcpSettings::default()
         };
         let tools = mcp_tool_definitions_for(&all_on);
         assert_eq!(tools.len(), 15);
@@ -6587,7 +6713,7 @@ mod tests {
 
         // Antigravity auto-review is capped to <=3 files, strict budget prompt, and medium effort.
         assert_eq!(
-            advisor_reasoning_effort(ProviderKind::Antigravity, "auto"),
+            advisor_reasoning_effort(ProviderKind::Antigravity, "auto").as_deref(),
             Some("medium")
         );
         let agy_prompt = build_advisor_prompt_for_provider(
@@ -6615,7 +6741,7 @@ mod tests {
         );
         assert_eq!(advisor_reasoning_effort(ProviderKind::Codex, "auto"), None);
         assert_eq!(
-            advisor_reasoning_effort(ProviderKind::Codex, "manual"),
+            advisor_reasoning_effort(ProviderKind::Codex, "manual").as_deref(),
             Some("medium")
         );
         let codex_prompt = build_advisor_prompt_for_provider(
@@ -6653,5 +6779,95 @@ mod tests {
         );
         assert!(med_args.windows(2).any(|w| w == ["-m", "gpt-6.2-astra"]));
         assert!(med_args.iter().any(|a| a == "model_reasoning_effort=\"medium\""));
+    }
+
+    #[test]
+    fn advisor_settings_hot_reload_models_efforts_timeout_provider_and_file_caps() {
+        let custom = AgentOsMcpSettings {
+            advisor_provider: "both".into(),
+            advisor_codex_model: "gpt-6.3-astra".into(),
+            advisor_codex_effort: "high".into(),
+            advisor_antigravity_model: "claude-opus-6-0".into(),
+            advisor_antigravity_effort: "high".into(),
+            advisor_timeout_seconds: 180,
+            advisor_auto_provider: "codex".into(),
+            advisor_auto_codex_model: "gpt-6.2-astra".into(),
+            advisor_auto_codex_effort: "low".into(),
+            advisor_auto_antigravity_model: "claude-sonnet-5".into(),
+            advisor_auto_antigravity_effort: "default".into(),
+            advisor_auto_codex_max_files: 2,
+            advisor_auto_antigravity_max_files: 0,
+            ..AgentOsMcpSettings::default()
+        };
+
+        assert_eq!(
+            advisor_model_from_settings(&custom, ProviderKind::Codex, "manual").as_deref(),
+            Some("gpt-6.3-astra")
+        );
+        assert_eq!(
+            advisor_model_from_settings(&custom, ProviderKind::Codex, "auto").as_deref(),
+            Some("gpt-6.2-astra")
+        );
+        assert_eq!(
+            advisor_model_from_settings(&custom, ProviderKind::Antigravity, "manual").as_deref(),
+            Some("claude-opus-6-0")
+        );
+        assert_eq!(
+            advisor_model_from_settings(&custom, ProviderKind::Antigravity, "auto").as_deref(),
+            Some("claude-sonnet-5")
+        );
+        assert_eq!(
+            advisor_reasoning_effort_from_settings(&custom, ProviderKind::Codex, "manual").as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            advisor_reasoning_effort_from_settings(&custom, ProviderKind::Codex, "auto").as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            advisor_reasoning_effort_from_settings(&custom, ProviderKind::Antigravity, "manual").as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            advisor_reasoning_effort_from_settings(&custom, ProviderKind::Antigravity, "auto"),
+            None
+        );
+        assert_eq!(advisor_auto_provider_from_settings(&custom), "codex");
+        assert_eq!(advisor_timeout_from_settings(&custom), Duration::from_secs(180));
+        assert_eq!(
+            advisor_auto_max_files_from_settings(&custom, ProviderKind::Codex, "auto"),
+            Some(2)
+        );
+        assert_eq!(
+            advisor_auto_max_files_from_settings(&custom, ProviderKind::Antigravity, "auto"),
+            None
+        );
+
+        let instr = advisor_mcp_instructions_for(&custom);
+        assert!(instr.contains("gpt-6.3-astra"));
+        assert!(instr.contains("claude-opus-6-0"));
+
+        let tools = mcp_tool_definitions_for(&custom);
+        let consult = tools
+            .iter()
+            .find(|t| t["name"] == "consult_advisor")
+            .unwrap();
+        let desc = consult["description"].as_str().unwrap();
+        assert!(desc.contains("gpt-6.3-astra"));
+        assert!(desc.contains("claude-opus-6-0"));
+
+        // Empty auto_provider inherits advisor_provider; empty auto_antigravity_model inherits manual model.
+        let inherit = AgentOsMcpSettings {
+            advisor_provider: "antigravity".into(),
+            advisor_auto_provider: String::new(),
+            advisor_antigravity_model: "claude-opus-5-5".into(),
+            advisor_auto_antigravity_model: String::new(),
+            ..AgentOsMcpSettings::default()
+        };
+        assert_eq!(advisor_auto_provider_from_settings(&inherit), "antigravity");
+        assert_eq!(
+            advisor_model_from_settings(&inherit, ProviderKind::Antigravity, "auto").as_deref(),
+            Some("claude-opus-5-5")
+        );
     }
 }
