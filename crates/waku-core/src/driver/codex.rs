@@ -4151,7 +4151,7 @@ mod tests {
                     })
                 );
             }
-            other => panic!("expected auto-allow RawRpcResponse, got {other:?}"),
+            _ => panic!("expected auto-allow RawRpcResponse"),
         }
 
         // 3. Non-empty form schema: cancels explicitly instead of sending invalid empty content.
@@ -4187,7 +4187,7 @@ mod tests {
                 assert_eq!(id, json!("form-1"));
                 assert_eq!(result, json!({"action": "cancel"}));
             }
-            other => panic!("expected cancel RawRpcResponse, got {other:?}"),
+            _ => panic!("expected cancel RawRpcResponse"),
         }
 
         assert_eq!(
