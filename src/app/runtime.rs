@@ -3214,15 +3214,6 @@ impl Waku {
         if self.response_fork_preparations.contains_key(&session_id) {
             return;
         }
-        let selected = self.state.selected_session == Some(session_id);
-        let Some(session) = self
-            .state
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
-        else {
-            return;
-        };
         if self.ending_checkpoint_pending(session_id) {
             self.enqueue_follow_up_submission(session_id, submission, cx);
             self.defer_queue_drain(session_id);
@@ -3236,6 +3227,23 @@ impl Waku {
             self.defer_queue_drain(session_id);
             return;
         }
+        if self
+            .runtimes
+            .get(&session_id)
+            .is_some_and(|runtime| runtime.restart_when_idle)
+            && self.runtime_can_close(session_id)
+        {
+            self.reset_session_runtime(session_id);
+        }
+        let selected = self.state.selected_session == Some(session_id);
+        let Some(session) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        else {
+            return;
+        };
         if session.status.is_busy() {
             self.enqueue_follow_up_submission(session_id, submission, cx);
             return;
