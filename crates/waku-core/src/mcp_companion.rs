@@ -2479,7 +2479,6 @@ fn run_isolated_antigravity_oneshot(
 
 // ── Shared advisor execution & scale-triggered background auto-review ────────
 
-const AUTO_ADVISOR_PER_SESSION_DAILY_CAP: i64 = 6;
 const AUTO_ADVISOR_MAX_QUEUE: usize = 4;
 const AUTO_ADVISOR_STALE_WINDOW_SECS: i64 = 6 * 3600;
 const AUTO_ADVISOR_MAX_INJECT_CHARS: usize = 6000;
@@ -2970,12 +2969,28 @@ impl SessionScaleTracker {
         }
     }
 
+    #[cfg(test)]
     pub fn evaluate_on_turn_finished(
         &mut self,
         now: i64,
         cooldown_secs: i64,
         turn_succeeded: bool,
     ) -> Option<AutoAdvisorSnapshot> {
+        let settings = AgentOsMcpSettings {
+            advisor_auto_review_cooldown_minutes: (cooldown_secs.max(0) / 60) as u32,
+            ..AgentOsMcpSettings::default()
+        };
+        self.evaluate_on_turn_finished_with_settings(now, &settings, turn_succeeded)
+    }
+
+    pub fn evaluate_on_turn_finished_with_settings(
+        &mut self,
+        now: i64,
+        settings: &AgentOsMcpSettings,
+        turn_succeeded: bool,
+    ) -> Option<AutoAdvisorSnapshot> {
+        let cooldown_secs =
+            i64::from(settings.advisor_auto_review_cooldown_minutes).saturating_mul(60);
         let was_human = self.turn_origin_human;
         self.turn_origin_human = false;
         if !was_human {
@@ -3009,7 +3024,10 @@ impl SessionScaleTracker {
             return None;
         }
 
-        if self.last_review_at > 0 && now.saturating_sub(self.last_review_at) < cooldown_secs {
+        if cooldown_secs > 0
+            && self.last_review_at > 0
+            && now.saturating_sub(self.last_review_at) < cooldown_secs
+        {
             return None;
         }
 
@@ -3019,7 +3037,26 @@ impl SessionScaleTracker {
             .saturating_add(self.plan_ops)
             .saturating_add(self.other_tool_ops);
 
-        let trigger_reason = if self.edited_files.len() >= 3 || self.diff_lines >= 150 {
+        let min_edited_files = settings.advisor_auto_min_edited_files as usize;
+        let min_diff_lines = u64::from(settings.advisor_auto_min_diff_lines);
+        let min_research_ops = settings.advisor_auto_min_research_ops;
+        let min_human_turns = settings.advisor_auto_min_human_turns;
+        let min_tool_ops = settings.advisor_auto_min_tool_ops;
+
+        let code_scale_hit = (min_edited_files > 0 && self.edited_files.len() >= min_edited_files)
+            || (min_diff_lines > 0 && self.diff_lines >= min_diff_lines);
+        let research_hit = min_research_ops > 0 && self.research_ops >= min_research_ops;
+        let edit_ops_threshold = if min_tool_ops > 0 {
+            (min_tool_ops / 2).max(1)
+        } else {
+            0
+        };
+        let sustained_hit = min_human_turns > 0
+            && min_tool_ops > 0
+            && self.human_turns >= min_human_turns
+            && total_ops >= min_tool_ops;
+
+        let trigger_reason = if code_scale_hit {
             Some(format!(
                 "code scale: {} edited files (~{} diff lines)",
                 self.edited_files.len(),
@@ -3033,7 +3070,10 @@ impl SessionScaleTracker {
             ))
         } else if turn_succeeded
             && self.human_turns >= 2
-            && (self.research_ops >= 10 || (!self.edited_files.is_empty() && total_ops >= 6))
+            && (research_hit
+                || (!self.edited_files.is_empty()
+                    && edit_ops_threshold > 0
+                    && total_ops >= edit_ops_threshold))
         {
             Some(format!(
                 "research/build milestone: {} human turns, {} reads/searches, {} edited files",
@@ -3041,7 +3081,7 @@ impl SessionScaleTracker {
                 self.research_ops,
                 self.edited_files.len()
             ))
-        } else if turn_succeeded && self.human_turns >= 4 && total_ops >= 12 {
+        } else if turn_succeeded && sustained_hit {
             Some(format!(
                 "sustained multi-turn session: {} human turns, {} tool actions",
                 self.human_turns, total_ops
@@ -3111,42 +3151,50 @@ fn auto_advisor_budget_allows(
     now: i64,
     cooldown_secs: i64,
     global_daily_cap: u32,
+    per_session_daily_cap: u32,
 ) -> anyhow::Result<bool> {
-    if global_daily_cap == 0 {
-        return Ok(false);
-    }
-    let last_any: Option<i64> = conn
-        .query_row(
-            "SELECT MAX(created_at) FROM agentos_advisor_consultations WHERE session_id = ?1",
-            params![session_id],
-            |r| r.get(0),
-        )
-        .optional()?
-        .flatten();
-    if let Some(ts) = last_any
-        && now.saturating_sub(ts) < cooldown_secs
-    {
-        return Ok(false);
+    if cooldown_secs > 0 {
+        let last_any: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(created_at) FROM agentos_advisor_consultations WHERE session_id = ?1",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(ts) = last_any
+            && now.saturating_sub(ts) < cooldown_secs
+        {
+            return Ok(false);
+        }
     }
 
     let day_cutoff = now.saturating_sub(86_400);
-    let session_auto_24h: i64 = conn.query_row(
-        "SELECT COUNT(DISTINCT created_at) FROM agentos_advisor_consultations
-         WHERE session_id = ?1 AND origin = 'auto' AND created_at >= ?2",
-        params![session_id, day_cutoff],
-        |r| r.get(0),
-    )?;
-    if session_auto_24h >= AUTO_ADVISOR_PER_SESSION_DAILY_CAP {
-        return Ok(false);
+    if per_session_daily_cap > 0 {
+        let session_auto_24h: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT created_at) FROM agentos_advisor_consultations
+             WHERE session_id = ?1 AND origin = 'auto' AND created_at >= ?2",
+            params![session_id, day_cutoff],
+            |r| r.get(0),
+        )?;
+        if session_auto_24h >= i64::from(per_session_daily_cap) {
+            return Ok(false);
+        }
     }
 
-    let global_auto_24h: i64 = conn.query_row(
-        "SELECT COUNT(DISTINCT session_id || ':' || created_at) FROM agentos_advisor_consultations
-         WHERE origin = 'auto' AND created_at >= ?1",
-        params![day_cutoff],
-        |r| r.get(0),
-    )?;
-    Ok(global_auto_24h < i64::from(global_daily_cap))
+    if global_daily_cap > 0 {
+        let global_auto_24h: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT session_id || ':' || created_at) FROM agentos_advisor_consultations
+             WHERE origin = 'auto' AND created_at >= ?1",
+            params![day_cutoff],
+            |r| r.get(0),
+        )?;
+        if global_auto_24h >= i64::from(global_daily_cap) {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 fn build_auto_advisor_prompt_inputs(snapshot: &AutoAdvisorSnapshot) -> (String, String, Vec<String>) {
@@ -3375,6 +3423,7 @@ impl AutoAdvisorPool {
             unix_now(),
             cooldown_secs,
             settings.advisor_auto_review_daily_cap,
+            settings.advisor_auto_review_per_session_daily_cap,
         )? {
             return Ok(());
         }
@@ -6663,7 +6712,7 @@ mod tests {
         let sid = Uuid::new_v4();
         let sid_str = sid.to_string();
 
-        assert!(auto_advisor_budget_allows(&conn, &sid_str, 5_000, 1800, 20).unwrap());
+        assert!(auto_advisor_budget_allows(&conn, &sid_str, 5_000, 1800, 20, 6).unwrap());
         store_pending_advisor_review(&conn, &sid_str, "code scale: 3 files", "## Advisor 1\nLooks good.")
             .unwrap();
         let injected = take_pending_advisor_review(&db, sid)
@@ -6677,7 +6726,7 @@ mod tests {
             "second consume must return None"
         );
 
-        // Insert a recent consultation and verify cooldown blocks immediate auto-review.
+        // Insert a recent consultation and verify cooldown, per-session cap, global cap, and 0=unlimited.
         conn.execute(
             "INSERT INTO agentos_advisor_consultations
              (consultation_id, session_id, caller_provider, advisor_provider, model, question, status, created_at, origin)
@@ -6685,9 +6734,43 @@ mod tests {
             params![sid_str, 5_000_i64],
         )
         .unwrap();
-        assert!(!auto_advisor_budget_allows(&conn, &sid_str, 5_600, 1800, 20).unwrap());
-        assert!(auto_advisor_budget_allows(&conn, &sid_str, 7_000, 1800, 20).unwrap());
-        assert!(!auto_advisor_budget_allows(&conn, &sid_str, 7_000, 1800, 1).unwrap());
+        assert!(!auto_advisor_budget_allows(&conn, &sid_str, 5_600, 1800, 20, 6).unwrap());
+        assert!(auto_advisor_budget_allows(&conn, &sid_str, 7_000, 1800, 20, 6).unwrap());
+        assert!(!auto_advisor_budget_allows(&conn, &sid_str, 7_000, 1800, 1, 6).unwrap());
+        assert!(!auto_advisor_budget_allows(&conn, &sid_str, 7_000, 1800, 20, 1).unwrap());
+        // 0 means unlimited for both global and per-session caps (disable is via advisorAutoReviewEnabled).
+        assert!(auto_advisor_budget_allows(&conn, &sid_str, 7_000, 1800, 0, 0).unwrap());
+        assert!(auto_advisor_budget_allows(&conn, &sid_str, 5_100, 0, 0, 0).unwrap());
+
+        // Custom scale thresholds hot-reloaded via AgentOsMcpSettings.
+        let mut custom_tracker = SessionScaleTracker::new();
+        custom_tracker.mark_human_prompt("edit one big file");
+        custom_tracker.observe_activity(
+            ActivityKind::Edit,
+            Some("edit_file"),
+            None,
+            "edit main.rs",
+            None,
+            false,
+            &["main.rs".into()],
+            1_000,
+        );
+        let strict = AgentOsMcpSettings {
+            advisor_auto_min_edited_files: 5,
+            advisor_auto_min_diff_lines: 500,
+            ..AgentOsMcpSettings::default()
+        };
+        assert!(custom_tracker
+            .evaluate_on_turn_finished_with_settings(1_010, &strict, true)
+            .is_none());
+        custom_tracker.mark_human_prompt("trigger at 1 file");
+        let sensitive = AgentOsMcpSettings {
+            advisor_auto_min_edited_files: 1,
+            ..AgentOsMcpSettings::default()
+        };
+        assert!(custom_tracker
+            .evaluate_on_turn_finished_with_settings(1_020, &sensitive, true)
+            .is_some());
 
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -49,7 +49,27 @@ fn default_advisor_auto_review_cooldown_minutes() -> u32 {
 }
 
 fn default_advisor_auto_review_daily_cap() -> u32 {
-    20
+    0
+}
+
+fn default_advisor_auto_min_edited_files() -> u32 {
+    3
+}
+
+fn default_advisor_auto_min_diff_lines() -> u32 {
+    150
+}
+
+fn default_advisor_auto_min_research_ops() -> u32 {
+    10
+}
+
+fn default_advisor_auto_min_human_turns() -> u32 {
+    4
+}
+
+fn default_advisor_auto_min_tool_ops() -> u32 {
+    12
 }
 
 /// Feature toggles and routing preferences for the built-in `agentos-mcp`
@@ -103,8 +123,23 @@ pub struct AgentOsMcpSettings {
     pub advisor_auto_antigravity_max_files: u32,
     #[serde(default = "default_advisor_auto_review_cooldown_minutes")]
     pub advisor_auto_review_cooldown_minutes: u32,
+    // Global 24h rolling cap for auto-reviews (0 = unlimited; disable via advisorAutoReviewEnabled).
     #[serde(default = "default_advisor_auto_review_daily_cap")]
     pub advisor_auto_review_daily_cap: u32,
+    // Per-session 24h rolling cap for auto-reviews (0 = unlimited).
+    #[serde(default)]
+    pub advisor_auto_review_per_session_daily_cap: u32,
+    // Scale-trigger thresholds for background auto-review (0 disables that individual rule).
+    #[serde(default = "default_advisor_auto_min_edited_files")]
+    pub advisor_auto_min_edited_files: u32,
+    #[serde(default = "default_advisor_auto_min_diff_lines")]
+    pub advisor_auto_min_diff_lines: u32,
+    #[serde(default = "default_advisor_auto_min_research_ops")]
+    pub advisor_auto_min_research_ops: u32,
+    #[serde(default = "default_advisor_auto_min_human_turns")]
+    pub advisor_auto_min_human_turns: u32,
+    #[serde(default = "default_advisor_auto_min_tool_ops")]
+    pub advisor_auto_min_tool_ops: u32,
     #[serde(default = "default_true")]
     pub ask_user_enabled: bool,
     #[serde(default)]
@@ -135,6 +170,12 @@ impl Default for AgentOsMcpSettings {
             advisor_auto_antigravity_max_files: default_advisor_auto_antigravity_max_files(),
             advisor_auto_review_cooldown_minutes: default_advisor_auto_review_cooldown_minutes(),
             advisor_auto_review_daily_cap: default_advisor_auto_review_daily_cap(),
+            advisor_auto_review_per_session_daily_cap: 0,
+            advisor_auto_min_edited_files: default_advisor_auto_min_edited_files(),
+            advisor_auto_min_diff_lines: default_advisor_auto_min_diff_lines(),
+            advisor_auto_min_research_ops: default_advisor_auto_min_research_ops(),
+            advisor_auto_min_human_turns: default_advisor_auto_min_human_turns(),
+            advisor_auto_min_tool_ops: default_advisor_auto_min_tool_ops(),
             ask_user_enabled: true,
             delegation_enabled: false,
             session_info_enabled: true,

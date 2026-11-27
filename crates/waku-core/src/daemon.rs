@@ -1885,15 +1885,11 @@ impl WakuBackend {
                                     })
                                     .map(|s| s.agentos_mcp)
                                     .unwrap_or_default();
-                                let cooldown_secs = i64::from(
-                                    mcp_settings.advisor_auto_review_cooldown_minutes,
-                                )
-                                .saturating_mul(60);
                                 if let Some(snapshot) = scale_tracker_for_loop
                                     .lock()
-                                    .evaluate_on_turn_finished(
+                                    .evaluate_on_turn_finished_with_settings(
                                         unix_now_secs(),
-                                        cooldown_secs,
+                                        &mcp_settings,
                                         turn_succeeded,
                                     )
                                     && mcp_settings.advisor_enabled
