@@ -4436,7 +4436,7 @@ fn sync_messages_fts(conn: &Connection) -> bool {
              FROM messages m
              LEFT JOIN agentos_messages_fts_sync s ON s.msg_rowid = m.rowid
              WHERE m.streaming = 0
-               AND (s.msg_rowid IS NULL OR s.content_len != length(m.content))",
+               AND (s.msg_rowid IS NULL OR s.content_len != length(CAST(m.content AS BLOB)))",
         ) else {
             return false;
         };
@@ -4447,28 +4447,56 @@ fn sync_messages_fts(conn: &Connection) -> bool {
         rows.flatten().collect()
     };
 
-    if !pending.is_empty() {
+    let orphaned: Vec<i64> = {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT s.msg_rowid
+             FROM agentos_messages_fts_sync s
+             LEFT JOIN messages m ON m.rowid = s.msg_rowid
+             WHERE m.rowid IS NULL",
+        ) else {
+            return false;
+        };
+        let Ok(rows) = stmt.query_map([], |r| r.get::<_, i64>(0)) else {
+            return false;
+        };
+        rows.flatten().collect()
+    };
+
+    if !pending.is_empty() || !orphaned.is_empty() {
         if conn.execute_batch("BEGIN IMMEDIATE").is_err() {
             return false;
         }
         let mut ok = true;
         {
             let del = conn.prepare("DELETE FROM agentos_messages_fts WHERE rowid = ?1");
+            let del_sync = conn.prepare("DELETE FROM agentos_messages_fts_sync WHERE msg_rowid = ?1");
             let ins = conn
                 .prepare("INSERT INTO agentos_messages_fts(rowid, content) VALUES (?1, ?2)");
             let mark = conn.prepare(
                 "INSERT OR REPLACE INTO agentos_messages_fts_sync(msg_rowid, content_len) VALUES (?1, ?2)",
             );
-            if let (Ok(mut del), Ok(mut ins), Ok(mut mark)) = (del, ins, mark) {
-                for (rowid, content) in pending {
-                    let norm = fts_normalize_cjk(&content);
-                    let len = content.len() as i64;
+            if let (Ok(mut del), Ok(mut del_sync), Ok(mut ins), Ok(mut mark)) =
+                (del, del_sync, ins, mark)
+            {
+                for rowid in orphaned {
                     if del.execute(params![rowid]).is_err()
-                        || ins.execute(params![rowid, norm]).is_err()
-                        || mark.execute(params![rowid, len]).is_err()
+                        || del_sync.execute(params![rowid]).is_err()
                     {
                         ok = false;
                         break;
+                    }
+                }
+                if ok {
+                    for (rowid, content) in pending {
+                        let norm = fts_normalize_cjk(&content);
+                        let len = content.len() as i64;
+                        if del.execute(params![rowid]).is_err()
+                            || ins.execute(params![rowid, norm]).is_err()
+                            || mark.execute(params![rowid, len]).is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
                     }
                 }
             } else {
@@ -6078,6 +6106,65 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sync_messages_fts_matches_utf8_byte_length_and_prunes_orphans() {
+        let dir = std::env::temp_dir().join(format!("agentos-fts-sync-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("app.db");
+        let conn = open_mcp_connection(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                 id TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL,
+                 role TEXT NOT NULL,
+                 content TEXT NOT NULL,
+                 streaming INTEGER NOT NULL DEFAULT 0,
+                 created_at INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO messages (id, session_id, role, content, streaming, created_at)
+             VALUES ('m-cjk', 's1', 'assistant', '中文测试消息 🚀', 0, 100),
+                    ('m-del', 's1', 'assistant', '即将删除的旧消息', 0, 101);",
+        )
+        .unwrap();
+
+        assert!(sync_messages_fts(&conn));
+        let pending_after_first: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM messages m
+                 LEFT JOIN agentos_messages_fts_sync s ON s.msg_rowid = m.rowid
+                 WHERE m.streaming = 0
+                   AND (s.msg_rowid IS NULL OR s.content_len != length(CAST(m.content AS BLOB)))",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_after_first, 0);
+
+        let before_changes = conn.total_changes();
+        assert!(sync_messages_fts(&conn));
+        assert_eq!(
+            conn.total_changes(),
+            before_changes,
+            "second FTS sync must not rewrite unchanged CJK messages"
+        );
+
+        conn.execute("DELETE FROM messages WHERE id = 'm-del'", [])
+            .unwrap();
+        assert!(sync_messages_fts(&conn));
+        let sync_count: i64 = conn
+            .query_row("SELECT count(*) FROM agentos_messages_fts_sync", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let fts_count: i64 = conn
+            .query_row("SELECT count(*) FROM agentos_messages_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync_count, 1);
+        assert_eq!(fts_count, 1);
 
         let _ = std::fs::remove_dir_all(dir);
     }
