@@ -2682,6 +2682,16 @@ impl Waku {
         }
     }
 
+    fn runtime_can_close(&self, session_id: Uuid) -> bool {
+        session_runtime_can_close(
+            self.state
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id),
+            self.session_has_live_background_work(session_id),
+        )
+    }
+
     /// Applies a changed model, effort, tier, or mode to a session. Transports
     /// that carry these per turn absorb the change and keep running; the rest
     /// are torn down so the next prompt starts with the new options.
@@ -2698,7 +2708,8 @@ impl Waku {
         let Some(runtime) = self.runtimes.get_mut(&session_id) else {
             return;
         };
-        runtime.options_generation = runtime.options_generation.wrapping_add(1);
+        runtime.options_generation = Uuid::new_v4();
+        runtime.restart_when_idle = false;
         let generation = runtime.options_generation;
         let driver = runtime.driver.clone();
         cx.spawn(async move |waku, cx| {
@@ -2712,7 +2723,14 @@ impl Waku {
                     .get(&session_id)
                     .is_some_and(|runtime| runtime.options_generation == generation);
                 if is_current && !applied {
-                    waku.reset_session_runtime(session_id);
+                    if !waku.runtime_can_close(session_id) {
+                        if let Some(runtime) = waku.runtimes.get_mut(&session_id) {
+                            runtime.restart_when_idle = true;
+                        }
+                        waku.show_toast(tr!("session.options_when_idle"));
+                    } else {
+                        waku.reset_session_runtime(session_id);
+                    }
                     cx.notify();
                 }
             });
@@ -2937,7 +2955,8 @@ impl Waku {
             session_id,
             SessionRuntime {
                 driver: prepared.handle,
-                options_generation: 0,
+                options_generation: Uuid::nil(),
+                restart_when_idle: false,
                 events: prepared.events,
                 pending_events: VecDeque::new(),
                 pending_steers: VecDeque::new(),
@@ -3685,7 +3704,10 @@ impl Waku {
                 }
             }
             runtime.stream_remeasure_pending = markdown_changed;
-            if keep_runtime {
+            if keep_runtime && runtime.restart_when_idle && self.runtime_can_close(session_id) {
+                runtime.driver.close();
+                changed = true;
+            } else if keep_runtime {
                 self.runtimes.insert(session_id, runtime);
             }
             changed |= runtime_changed || background_changed;

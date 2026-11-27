@@ -2302,3 +2302,6 @@ daemon.qr_hint:
   en: "Token is embedded in the URL fragment (#token=…) and cleared from the address bar immediately after pairing."
 web.pairing_tip:
   en: "Tip: Enable Daemon Exposure in desktop Settings → Daemon and scan the QR code to connect in one tap, then use \"Add to Home Screen\" for a full-screen app experience."
+
+session.options_when_idle:
+  en: The new settings will take effect after current tasks finish.

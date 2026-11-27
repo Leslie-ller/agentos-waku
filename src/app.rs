@@ -387,8 +387,14 @@ fn session_is_reapable(
     idle_for: Duration,
     has_live_background_work: bool,
 ) -> bool {
+    idle_for >= IDLE_SESSION_TIMEOUT && session_runtime_can_close(session, has_live_background_work)
+}
+
+fn session_runtime_can_close(
+    session: Option<&AgentSession>,
+    has_live_background_work: bool,
+) -> bool {
     !has_live_background_work
-        && idle_for >= IDLE_SESSION_TIMEOUT
         && session.is_none_or(|session| {
             session.active_turn_id().is_none()
                 && matches!(session.status, SessionStatus::Idle | SessionStatus::Failed)
@@ -899,7 +905,8 @@ struct SessionRuntime {
     driver: DriverHandle,
     /// Invalidates stale ApplyOptions responses when settings change again or
     /// this runtime is replaced while the RPC is in flight.
-    options_generation: u64,
+    options_generation: Uuid,
+    restart_when_idle: bool,
     events: Receiver<DriverEvent>,
     pending_events: VecDeque<DriverEvent>,
     /// Presentation metadata for steering messages awaiting the provider's
@@ -1689,9 +1696,9 @@ mod drafts;
 mod file_search;
 mod goal_dialog;
 mod image_preview;
+mod memory_page;
 mod project_picker;
 mod render;
-mod memory_page;
 mod right_panel;
 mod runtime;
 mod sessions;

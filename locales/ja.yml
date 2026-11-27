@@ -1176,3 +1176,5 @@ daemon.copy_pairing_link: リンクをコピー
 daemon.refresh_endpoints: IP を更新
 daemon.qr_hint: "トークンは URL フラグメント（#token=…）でのみ渡され、ペアリング直後にアドレスバーから自動消去されます。"
 web.pairing_tip: "ヒント：デスクトップの「設定 → デーモン」で外部接続を有効にし、QR コードをスキャンするとワンタップで接続できます。「ホーム画面に追加」で全画面アプリとして利用可能です。"
+
+session.options_when_idle: 現在のタスクが完了した後に新しい設定が適用されます。
