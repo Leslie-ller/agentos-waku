@@ -3272,6 +3272,30 @@ pub fn take_pending_advisor_review(
     db_path: &Path,
     session_id: Uuid,
 ) -> anyhow::Result<Option<String>> {
+    take_pending_advisor_review_with_stale_secs(db_path, session_id, AUTO_ADVISOR_STALE_WINDOW_SECS)
+}
+
+/// Same as [`take_pending_advisor_review`], reading `advisorAutoReviewStaleHours` live from
+/// `settings_path` (`0` = never expire).
+pub fn take_pending_advisor_review_for_settings(
+    db_path: &Path,
+    settings_path: &Path,
+    session_id: Uuid,
+) -> anyhow::Result<Option<String>> {
+    let stale_hours = std::fs::read(settings_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<DaemonSettings>(&bytes).ok())
+        .map(|s| s.agentos_mcp.advisor_auto_review_stale_hours)
+        .unwrap_or(6);
+    let stale_secs = i64::from(stale_hours).saturating_mul(3600);
+    take_pending_advisor_review_with_stale_secs(db_path, session_id, stale_secs)
+}
+
+pub fn take_pending_advisor_review_with_stale_secs(
+    db_path: &Path,
+    session_id: Uuid,
+    stale_window_secs: i64,
+) -> anyhow::Result<Option<String>> {
     let conn = open_mcp_connection(db_path)?;
     let sid = session_id.to_string();
     let now = unix_now();
@@ -3288,7 +3312,7 @@ pub fn take_pending_advisor_review(
     let Some((review_id, trigger_reason, advice_text, created_at)) = row else {
         return Ok(None);
     };
-    if now.saturating_sub(created_at) > AUTO_ADVISOR_STALE_WINDOW_SECS {
+    if stale_window_secs > 0 && now.saturating_sub(created_at) > stale_window_secs {
         let _ = conn.execute(
             "UPDATE agentos_pending_advisor_reviews SET status = 'expired', applied_at = ?1 WHERE review_id = ?2",
             params![now, review_id],
@@ -6724,6 +6748,59 @@ mod tests {
         assert!(
             take_pending_advisor_review(&db, sid).unwrap().is_none(),
             "second consume must return None"
+        );
+
+        // Verify hot-reloaded stale window: 0 = never expire, positive window expires old rows.
+        let old_ts = unix_now() - 10 * 3600;
+        conn.execute(
+            "INSERT INTO agentos_pending_advisor_reviews
+             (review_id, session_id, trigger_reason, advice_text, status, created_at)
+             VALUES ('r-old-never', ?1, 'old review', 'still useful advice', 'pending', ?2)",
+            params![sid_str, old_ts],
+        )
+        .unwrap();
+        let settings_file = dir.join("settings.json");
+        let never_expire = DaemonSettings {
+            agentos_mcp: AgentOsMcpSettings {
+                advisor_auto_review_stale_hours: 0,
+                ..AgentOsMcpSettings::default()
+            },
+            ..DaemonSettings::default()
+        };
+        std::fs::write(
+            &settings_file,
+            serde_json::to_vec(&never_expire).unwrap(),
+        )
+        .unwrap();
+        let kept = take_pending_advisor_review_for_settings(&db, &settings_file, sid)
+            .unwrap()
+            .expect("stale_hours=0 must never expire pending reviews");
+        assert!(kept.contains("still useful advice"));
+
+        conn.execute(
+            "INSERT INTO agentos_pending_advisor_reviews
+             (review_id, session_id, trigger_reason, advice_text, status, created_at)
+             VALUES ('r-old-expire', ?1, 'old review', 'stale advice', 'pending', ?2)",
+            params![sid_str, old_ts],
+        )
+        .unwrap();
+        let short_expire = DaemonSettings {
+            agentos_mcp: AgentOsMcpSettings {
+                advisor_auto_review_stale_hours: 2,
+                ..AgentOsMcpSettings::default()
+            },
+            ..DaemonSettings::default()
+        };
+        std::fs::write(
+            &settings_file,
+            serde_json::to_vec(&short_expire).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            take_pending_advisor_review_for_settings(&db, &settings_file, sid)
+                .unwrap()
+                .is_none(),
+            "10h-old review must expire when stale_hours=2"
         );
 
         // Insert a recent consultation and verify cooldown, per-session cap, global cap, and 0=unlimited.

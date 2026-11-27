@@ -227,6 +227,7 @@ const DEFAULT_AGENTOS_MCP: AgentOsMcpSettings = {
   advisorAutoReviewCooldownMinutes: 30,
   advisorAutoReviewDailyCap: 0,
   advisorAutoReviewPerSessionDailyCap: 0,
+  advisorAutoReviewStaleHours: 6,
   advisorAutoMinEditedFiles: 3,
   advisorAutoMinDiffLines: 150,
   advisorAutoMinResearchOps: 10,

@@ -52,6 +52,10 @@ fn default_advisor_auto_review_daily_cap() -> u32 {
     0
 }
 
+fn default_advisor_auto_review_stale_hours() -> u32 {
+    6
+}
+
 fn default_advisor_auto_min_edited_files() -> u32 {
     3
 }
@@ -129,6 +133,9 @@ pub struct AgentOsMcpSettings {
     // Per-session 24h rolling cap for auto-reviews (0 = unlimited).
     #[serde(default)]
     pub advisor_auto_review_per_session_daily_cap: u32,
+    // Expiry window in hours for pending auto-advisor reviews waiting to be injected (0 = never expire).
+    #[serde(default = "default_advisor_auto_review_stale_hours")]
+    pub advisor_auto_review_stale_hours: u32,
     // Scale-trigger thresholds for background auto-review (0 disables that individual rule).
     #[serde(default = "default_advisor_auto_min_edited_files")]
     pub advisor_auto_min_edited_files: u32,
@@ -171,6 +178,7 @@ impl Default for AgentOsMcpSettings {
             advisor_auto_review_cooldown_minutes: default_advisor_auto_review_cooldown_minutes(),
             advisor_auto_review_daily_cap: default_advisor_auto_review_daily_cap(),
             advisor_auto_review_per_session_daily_cap: 0,
+            advisor_auto_review_stale_hours: default_advisor_auto_review_stale_hours(),
             advisor_auto_min_edited_files: default_advisor_auto_min_edited_files(),
             advisor_auto_min_diff_lines: default_advisor_auto_min_diff_lines(),
             advisor_auto_min_research_ops: default_advisor_auto_min_research_ops(),

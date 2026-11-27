@@ -851,11 +851,11 @@ impl Backend for WakuBackend {
                     self.task_store.path(),
                     session_id,
                 );
-                self.auto_advisor.cancel_session(session_id);
-                let _ = crate::mcp_companion::dismiss_pending_advisor_reviews(
-                    self.task_store.path(),
-                    session_id,
-                );
+                // Do NOT cancel queued auto-advisor jobs or dismiss pending advisor reviews on
+                // CloseSession: desktop idle eviction (30m) calls CloseSession to release idle
+                // subprocess memory without deleting the session. Pending reviews remain intact
+                // until consumed or expired by `advisorAutoReviewStaleHours`, and are only
+                // dismissed on `Command::DeleteSession`.
                 let removed = {
                     let mut sessions = self.sessions.lock();
                     sessions
@@ -1930,8 +1930,9 @@ impl WakuBackend {
                                     continuation_prefixes.push(rot_pkg);
                                 }
                                 if let Ok(Some(review_pkg)) =
-                                    crate::mcp_companion::take_pending_advisor_review(
+                                    crate::mcp_companion::take_pending_advisor_review_for_settings(
                                         &db_path_for_loop,
+                                        &settings_path_for_loop,
                                         session_id,
                                     )
                                 {
@@ -2026,10 +2027,13 @@ impl WakuBackend {
         ) {
             prefix_blocks.push(rot_pkg);
         }
-        if let Ok(Some(review_pkg)) = crate::mcp_companion::take_pending_advisor_review(
-            self.task_store.path(),
-            session_id,
-        ) {
+        if let Ok(Some(review_pkg)) =
+            crate::mcp_companion::take_pending_advisor_review_for_settings(
+                self.task_store.path(),
+                self.settings.path(),
+                session_id,
+            )
+        {
             prefix_blocks.push(review_pkg);
         }
 
