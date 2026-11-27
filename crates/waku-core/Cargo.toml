@@ -14,10 +14,11 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-channel = "0.5"
 dirs = "6.0"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 nucleo-matcher = "0.3"
 parking_lot = "0.12"
 rust-i18n = "4"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 serde = { version = "1.0", features = ["derive"] }
 serde-saphyr = { version = "0.0.29", default-features = false, features = ["deserialize"] }
 serde_json = "1.0"

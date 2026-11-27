@@ -13,14 +13,14 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ClientCapabilities, ContentBlock, Implementation, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, McpServer, McpServerStdio, NewSessionRequest,
-    PermissionOptionKind, PromptRequest, PromptResponse, RequestId, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
-    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionConfigSelectOptions, SessionId, SessionModeId,
-    SessionModeState, SessionNotification, SetSessionConfigOptionRequest, SetSessionModeRequest,
-    StopReason, TextContent,
+    CancelNotification, ClientCapabilities, CloseSessionRequest, ContentBlock, Implementation,
+    InitializeRequest, InitializeResponse, LoadSessionRequest, McpServer, McpServerStdio,
+    NewSessionRequest, PermissionOptionKind, PromptRequest, PromptResponse, RequestId,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOptions, SessionId,
+    SessionModeId, SessionModeState, SessionNotification, SetSessionConfigOptionRequest,
+    SetSessionModeRequest, StopReason, TextContent,
 };
 use agent_client_protocol::{
     AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo, Handled, LineDirection, Responder,
@@ -57,6 +57,9 @@ enum CommandMessage {
     },
     Options(SessionOptions),
     RefreshBackgroundWork,
+    RecoverCorruptMedia {
+        after_idx: Option<i64>,
+    },
     Shutdown,
 }
 
@@ -189,6 +192,7 @@ impl AcpDriver {
             stderr_lines.clone(),
         )?;
         let (commands, command_rx) = smol::channel::unbounded();
+        let command_tx = commands.clone();
         let (shutdown, shutdown_rx) = smol::channel::bounded(1);
         let provider_name = provider.display_name();
         let thread_events = events.clone();
@@ -218,6 +222,7 @@ impl AcpDriver {
                         mcp_companion,
                         grok_title_home,
                         agy_native_acp_streams_wakeups,
+                        command_tx,
                         command_rx,
                         thread_events.clone(),
                     ),
@@ -407,6 +412,7 @@ async fn run_sdk_connection(
     mcp_companion: Option<crate::mcp_companion::McpCompanionLaunch>,
     grok_title_home: Option<std::path::PathBuf>,
     agy_native_acp_streams_wakeups: bool,
+    command_tx: smol::channel::Sender<CommandMessage>,
     commands: smol::channel::Receiver<CommandMessage>,
     events: DriverEventSender,
 ) -> agent_client_protocol::Result<()> {
@@ -589,7 +595,27 @@ async fn run_sdk_connection(
                     )
                 })
                 .collect();
-            let (session_id, modes, config_options) = establish_session(
+            let pre_open_repair = if provider == ProviderKind::Antigravity
+                && let Some(existing_sid) = resume_session_id.clone()
+                && let Some(dir) = crate::antigravity_watch::antigravity_conversations_dir()
+            {
+                match smol::unblock(move || {
+                    crate::antigravity_media::sanitize_antigravity_session_media(&dir, &existing_sid)
+                })
+                .await
+                {
+                    Ok(report) => crate::antigravity_media::format_media_repair_summary(&report),
+                    Err(err) => {
+                        eprintln!(
+                            "Antigravity pre-open trajectory media repair skipped: {err}"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let (mut session_id, modes, mut config_options) = establish_session(
                 &connection,
                 &initialize,
                 resume_session_id.as_deref(),
@@ -615,6 +641,15 @@ async fn run_sdk_connection(
                     native_session_id.clone(),
                 )),
             });
+            if let Some((title, detail)) = pre_open_repair {
+                let _ = events.send(DriverEvent::Activity {
+                    id: None,
+                    kind: ActivityKind::Tool,
+                    title,
+                    detail: Some(detail),
+                    complete: true,
+                });
+            }
 
             let mut current_model = model;
             let mut current_effort = reasoning_effort;
@@ -675,6 +710,7 @@ async fn run_sdk_connection(
                             title_refresh.clone(),
                             stream_state.clone(),
                             agy_watcher.clone(),
+                            command_tx.clone(),
                         ) {
                             let _ = events.send(DriverEvent::Error(error.to_string()));
                             let _ = events.send(DriverEvent::TurnFinished {
@@ -712,6 +748,7 @@ async fn run_sdk_connection(
                             title_refresh.clone(),
                             stream_state.clone(),
                             agy_watcher.clone(),
+                            command_tx.clone(),
                         ) {
                             Ok(()) => {
                                 let _ = events.send(DriverEvent::SteerAccepted { message: text });
@@ -727,6 +764,147 @@ async fn run_sdk_connection(
                     CommandMessage::RefreshBackgroundWork => {
                         if let Some(watcher) = agy_watcher.as_ref() {
                             watcher.refresh_now();
+                        }
+                    }
+                    CommandMessage::RecoverCorruptMedia { after_idx } => {
+                        if provider != ProviderKind::Antigravity
+                            || !prompt_requests.lock().is_empty()
+                        {
+                            continue;
+                        }
+                        let Some(dir) = agy_watcher
+                            .as_ref()
+                            .map(|w| w.conversations_dir().to_path_buf())
+                            .or_else(crate::antigravity_watch::antigravity_conversations_dir)
+                        else {
+                            continue;
+                        };
+                        let check_dir = dir.clone();
+                        let check_sid = native_session_id.clone();
+                        let still_corrupt = smol::unblock(move || {
+                            crate::antigravity_media::has_corrupt_antigravity_session_media(
+                                &check_dir, &check_sid, after_idx,
+                            )
+                        })
+                        .await;
+                        if !still_corrupt {
+                            continue;
+                        }
+
+                        let supports_close = initialize
+                            .agent_capabilities
+                            .session_capabilities
+                            .close
+                            .is_some();
+                        let supports_reload = initialize
+                            .agent_capabilities
+                            .session_capabilities
+                            .resume
+                            .is_some()
+                            || initialize.agent_capabilities.load_session;
+                        let close_failure = if supports_close && supports_reload {
+                            let close_req = CloseSessionRequest::new(session_id.clone());
+                            let close_fut = async {
+                                match connection.send_request(close_req).block_task().await {
+                                    Ok(_) => None,
+                                    Err(err) => Some(format!("session/close failed: {err}")),
+                                }
+                            };
+                            let timeout_fut = async {
+                                smol::Timer::after(Duration::from_secs(5)).await;
+                                Some("session/close timed out".to_string())
+                            };
+                            smol::future::race(close_fut, timeout_fut).await
+                        } else {
+                            Some("session close and reload capabilities are unavailable".into())
+                        };
+                        if let Some(reason) = close_failure {
+                            let _ = events.send(DriverEvent::Activity {
+                                id: None,
+                                kind: ActivityKind::Tool,
+                                title: "Could not safely repair unreadable images in session history"
+                                    .into(),
+                                detail: Some(format!("History was left unchanged: {reason}")),
+                                complete: true,
+                            });
+                            continue;
+                        }
+
+                        let repair_sid = native_session_id.clone();
+                        let repair_outcome = smol::unblock(move || {
+                            crate::antigravity_media::sanitize_antigravity_session_media_after(
+                                &dir,
+                                &repair_sid,
+                                after_idx,
+                            )
+                        })
+                        .await;
+                        match establish_session(
+                            &connection,
+                            &initialize,
+                            Some(&native_session_id),
+                            &cwd,
+                            &mcp_servers,
+                            &suppress_session_updates,
+                        )
+                        .await
+                        {
+                            Ok((reloaded_id, reloaded_modes, reloaded_opts)) => {
+                                session_id = reloaded_id;
+                                config_options = reloaded_opts;
+                                if let Some(mode_id) =
+                                    desired_access_mode(provider, reloaded_modes.as_ref(), mode)
+                                {
+                                    let _ = connection
+                                        .send_request(SetSessionModeRequest::new(
+                                            session_id.clone(),
+                                            mode_id,
+                                        ))
+                                        .block_task()
+                                        .await;
+                                }
+                                apply_model(
+                                    &connection,
+                                    provider,
+                                    &session_id,
+                                    config_options.as_deref(),
+                                    current_model.as_deref(),
+                                    current_effort.as_deref(),
+                                    current_tier.as_deref(),
+                                    current_window.as_deref(),
+                                    &events,
+                                )
+                                .await;
+                            }
+                            Err(err) => {
+                                let _ = events.send(DriverEvent::Error(format!(
+                                    "Antigravity session reload after media repair failed: {err}"
+                                )));
+                            }
+                        }
+                        match repair_outcome {
+                            Ok(report) => {
+                                if let Some((title, detail)) =
+                                    crate::antigravity_media::format_media_repair_summary(&report)
+                                {
+                                    let _ = events.send(DriverEvent::Activity {
+                                        id: None,
+                                        kind: ActivityKind::Tool,
+                                        title,
+                                        detail: Some(detail),
+                                        complete: true,
+                                    });
+                                }
+                            }
+                            Err(err) => {
+                                let _ = events.send(DriverEvent::Activity {
+                                    id: None,
+                                    kind: ActivityKind::Tool,
+                                    title: "Antigravity trajectory media repair failed".into(),
+                                    detail: Some(err),
+                                    complete: true,
+                                });
+                            }
                         }
                     }
                     CommandMessage::Cancel => {
@@ -1485,6 +1663,7 @@ fn send_prompt(
     title_refresh: super::title_refresh::NativeTitleRefresh,
     stream_state: Arc<Mutex<AcpStreamState>>,
     agy_watcher: Option<Arc<crate::antigravity_watch::AntigravityTrajectoryWatcher>>,
+    command_tx: smol::channel::Sender<CommandMessage>,
 ) -> agent_client_protocol::Result<()> {
     stream_state.lock().produced_content = false;
     // Read before the turn runs, so the failure lookup cannot mistake an
@@ -1517,9 +1696,14 @@ fn send_prompt(
     let registered = sent.on_receiving_result(async move |result| {
         if settle_prompt_request(&callback_requests, &callback_request_id) {
             let produced = stream_state.lock().produced_content;
+            let prompt_failed = result.is_err();
+            let err_is_invalid_media = result
+                .as_ref()
+                .err()
+                .is_some_and(|e| crate::antigravity_media::is_invalid_media_error_text(&e.to_string()));
             let agy_settlement = agy_watcher
                 .as_ref()
-                .map(|watcher| watcher.on_foreground_settled(produced));
+                .map(|watcher| watcher.on_foreground_settled(produced, prompt_failed));
             // Only an empty turn pays for this lookup, so a healthy turn never
             // waits on Kimi's records.
             let native_failure = wire_offset
@@ -1535,6 +1719,34 @@ fn send_prompt(
                 .is_some_and(|s| s.has_live_detached_work);
             let success =
                 finish_prompt_with_park(result, native_failure, park_on_background, &callback_events);
+            if provider == ProviderKind::Antigravity
+                && !park_on_background
+                && let Some(watcher) = agy_watcher.as_ref()
+            {
+                let is_invalid_media = err_is_invalid_media
+                    || agy_settlement.as_ref().is_some_and(|s| s.is_invalid_media);
+                let scan_after = if is_invalid_media {
+                    None
+                } else {
+                    agy_settlement
+                        .as_ref()
+                        .map(|s| s.turn_start_idx)
+                        .filter(|&idx| idx >= 0)
+                };
+                let dir = watcher.conversations_dir().to_path_buf();
+                let sid = native_session_id.clone();
+                let has_corrupt = smol::unblock(move || {
+                    crate::antigravity_media::has_corrupt_antigravity_session_media(
+                        &dir, &sid, scan_after,
+                    )
+                })
+                .await;
+                if has_corrupt {
+                    let _ = command_tx.try_send(CommandMessage::RecoverCorruptMedia {
+                        after_idx: scan_after,
+                    });
+                }
+            }
             if provider == ProviderKind::Grok && success {
                 start_grok_title_refresh(
                     grok_title_home.as_deref(),
@@ -1627,7 +1839,18 @@ fn finish_prompt_with_park(
     let response = match result {
         Ok(response) => response,
         Err(error) => {
-            let _ = events.send(DriverEvent::Error(error.to_string()));
+            let acp_error = error.to_string();
+            let message = match native_failure {
+                Some(failure)
+                    if !failure.trim().is_empty()
+                        && (crate::antigravity_media::is_invalid_media_error_text(&failure)
+                            || !acp_error.contains(failure.trim())) =>
+                {
+                    failure
+                }
+                _ => acp_error,
+            };
+            let _ = events.send(DriverEvent::Error(message));
             let _ = events.send(DriverEvent::TurnFinished {
                 success: false,
                 summary: None,
@@ -3541,5 +3764,27 @@ for raw in sys.stdin:
         }));
 
         let _ = std::fs::remove_dir_all(sandbox);
+    }
+
+    #[test]
+    fn finish_prompt_prefers_rich_native_invalid_media_failure_over_generic_acp_err() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let success = finish_prompt_with_park(
+            Err(agent_client_protocol::Error::internal_error()),
+            Some("INVALID_MEDIA (error 2011): INVALID_ARGUMENT (code 400)".into()),
+            false,
+            &tx,
+        );
+        drop(tx);
+        let recorded: Vec<DriverEvent> = rx.iter().collect();
+        assert!(!success);
+        assert!(recorded.iter().any(|ev| matches!(
+            ev,
+            DriverEvent::Error(msg) if msg.contains("INVALID_MEDIA (error 2011)")
+        )));
+        assert!(recorded.iter().any(|ev| matches!(
+            ev,
+            DriverEvent::TurnFinished { success: false, .. }
+        )));
     }
 }

@@ -208,6 +208,9 @@ struct DecodedError {
     user_error_message: String,
     short_error: String,
     full_error: String,
+    details: String,
+    rpc_error_details: Vec<String>,
+    user_error_number: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -498,6 +501,21 @@ fn decode_error_details(bytes: &[u8]) -> DecodedError {
             (3, 2) => {
                 if let Some(s) = r.read_string() {
                     out.full_error = s;
+                }
+            }
+            (5, 2) => {
+                if let Some(s) = r.read_string() {
+                    out.details = s;
+                }
+            }
+            (10, 2) => {
+                if let Some(s) = r.read_string() {
+                    out.rpc_error_details.push(s);
+                }
+            }
+            (12, 2) => {
+                if let Some(s) = r.read_string() {
+                    out.user_error_number = s;
                 }
             }
             _ => {
@@ -1031,7 +1049,7 @@ fn extract_background_items(
     out
 }
 
-fn extract_turn_failure(steps: &[DecodedStep], after_idx: i64) -> Option<String> {
+fn extract_turn_failure(steps: &[DecodedStep], after_idx: i64) -> Option<(String, bool)> {
     let last = steps.iter().rev().find(|s| s.idx > after_idx)?;
     let err = last.error.as_ref()?;
     let terminal_banner = err.user_error_message.trim().trim_end_matches('.')
@@ -1039,7 +1057,13 @@ fn extract_turn_failure(steps: &[DecodedStep], after_idx: i64) -> Option<String>
     if !terminal_banner && last.status != STEP_STATUS_ERROR {
         return None;
     }
-    [
+    let rpc_info = crate::antigravity_media::extract_rpc_error_info(
+        &err.rpc_error_details,
+        &err.details,
+        &err.full_error,
+        &err.user_error_number,
+    );
+    let base = [
         err.short_error.as_str(),
         err.full_error.as_str(),
         err.user_error_message.as_str(),
@@ -1047,7 +1071,19 @@ fn extract_turn_failure(steps: &[DecodedStep], after_idx: i64) -> Option<String>
     .into_iter()
     .map(str::trim)
     .find(|s| !s.is_empty())
-    .map(|s| s.chars().take(800).collect())
+    .unwrap_or_default();
+    let decorated =
+        crate::antigravity_media::decorate_with_rpc_info(base, rpc_info.as_ref());
+    if decorated.trim().is_empty() {
+        return None;
+    }
+    let is_invalid_media = rpc_info
+        .as_ref()
+        .is_some_and(crate::antigravity_media::RpcErrorInfo::is_invalid_media)
+        || crate::antigravity_media::is_invalid_media_error_text(&decorated)
+        || crate::antigravity_media::is_invalid_media_error_text(&err.short_error)
+        || crate::antigravity_media::is_invalid_media_error_text(&err.full_error);
+    Some((decorated.chars().take(800).collect(), is_invalid_media))
 }
 
 // ---------------------------------------------------------------------------
@@ -1064,6 +1100,8 @@ const ACP_STREAM_DRAIN_GRACE: Duration = Duration::from_millis(450);
 pub struct ForegroundSettlement {
     pub has_live_detached_work: bool,
     pub native_failure: Option<String>,
+    pub turn_start_idx: i64,
+    pub is_invalid_media: bool,
 }
 
 struct WatcherShared {
@@ -1202,19 +1240,34 @@ impl AntigravityTrajectoryWatcher {
         }
     }
 
-    pub fn on_foreground_settled(&self, produced_content: bool) -> ForegroundSettlement {
+    pub fn conversations_dir(&self) -> &Path {
+        &self.conversations_dir
+    }
+
+    pub fn on_foreground_settled(
+        &self,
+        produced_content: bool,
+        prompt_failed: bool,
+    ) -> ForegroundSettlement {
         let (lock, cvar) = &*self.shared;
         let Ok(mut state) = lock.lock() else {
             return ForegroundSettlement {
                 has_live_detached_work: false,
                 native_failure: None,
+                turn_start_idx: -1,
+                is_invalid_media: false,
             };
         };
         state.foreground_active = false;
+        let turn_start_idx = state.foreground_start_idx;
         let steps = read_steps_since(&self.db_path, state.birth_step_idx);
-        let native_failure = (!produced_content)
-            .then(|| extract_turn_failure(&steps, state.foreground_start_idx))
+        let failure_tuple = (!produced_content || prompt_failed)
+            .then(|| extract_turn_failure(&steps, turn_start_idx))
             .flatten();
+        let (native_failure, is_invalid_media) = match failure_tuple {
+            Some((msg, invalid_media)) => (Some(msg), invalid_media),
+            None => (None, false),
+        };
         if let Some(max_idx) = steps.last().map(|s| s.idx) {
             state.synced_step_idx = state.synced_step_idx.max(max_idx);
         }
@@ -1226,6 +1279,8 @@ impl AntigravityTrajectoryWatcher {
         ForegroundSettlement {
             has_live_detached_work: has_live,
             native_failure,
+            turn_start_idx,
+            is_invalid_media,
         }
     }
 
@@ -1590,7 +1645,7 @@ mod tests {
         // Pretend foreground turn started before step 0 so step 0 belongs to this session.
         watcher.shared.0.lock().unwrap().birth_step_idx = 0;
         watcher.shared.0.lock().unwrap().synced_step_idx = -1;
-        let settlement = watcher.on_foreground_settled(true);
+        let settlement = watcher.on_foreground_settled(true, false);
         assert!(settlement.has_live_detached_work);
         assert!(settlement.native_failure.is_none());
 
@@ -1705,7 +1760,7 @@ mod tests {
         let watcher = AntigravityTrajectoryWatcher::start(dir.clone(), "sess-gap", events);
         watcher.shared.0.lock().unwrap().birth_step_idx = 0;
         watcher.shared.0.lock().unwrap().synced_step_idx = -1;
-        let settlement = watcher.on_foreground_settled(true);
+        let settlement = watcher.on_foreground_settled(true, false);
         assert!(settlement.has_live_detached_work);
         while rx.try_recv().is_ok() {}
 
@@ -1844,7 +1899,7 @@ mod tests {
         )
         .unwrap();
 
-        let settlement = watcher.on_foreground_settled(true);
+        let settlement = watcher.on_foreground_settled(true, false);
         assert!(settlement.has_live_detached_work);
         while rx.try_recv().is_ok() {}
 
@@ -1904,5 +1959,44 @@ mod tests {
         drop(watcher);
         drop(conn);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn extract_turn_failure_surfaces_invalid_media_2011_and_claude_image_error() {
+        let mut err_details = Vec::new();
+        encode_field_str(1, "Agent execution terminated due to error.", &mut err_details);
+        encode_field_str(2, "INVALID_ARGUMENT (code 400): Request contains an invalid argument.", &mut err_details);
+        encode_field_str(
+            10,
+            r#"{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"INVALID_MEDIA","domain":"cloudcode-pa.googleapis.com","metadata":{"error_number":"2011"}}"#,
+            &mut err_details,
+        );
+        let decoded = decode_error_details(&err_details);
+        let step = DecodedStep {
+            idx: 2,
+            status: STEP_STATUS_ERROR,
+            error: Some(decoded),
+            ..Default::default()
+        };
+        let (msg, is_invalid_media) = extract_turn_failure(&[step], 1).expect("failure");
+        assert!(is_invalid_media);
+        assert!(msg.contains("INVALID_MEDIA (error 2011)"), "{msg}");
+
+        let mut claude_err = Vec::new();
+        encode_field_str(
+            2,
+            "INVALID_ARGUMENT (code 400): invalid_request_error: Could not process image",
+            &mut claude_err,
+        );
+        let step_claude = DecodedStep {
+            idx: 3,
+            status: STEP_STATUS_ERROR,
+            error: Some(decode_error_details(&claude_err)),
+            ..Default::default()
+        };
+        let (msg_claude, is_invalid_claude) =
+            extract_turn_failure(&[step_claude], 1).expect("claude failure");
+        assert!(is_invalid_claude);
+        assert!(msg_claude.contains("Could not process image"), "{msg_claude}");
     }
 }
