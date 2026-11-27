@@ -6746,13 +6746,13 @@ mod tests {
         let mut custom_tracker = SessionScaleTracker::new();
         custom_tracker.mark_human_prompt("edit one big file");
         custom_tracker.observe_activity(
-            ActivityKind::Edit,
+            ActivityKind::FileChange,
             Some("edit_file"),
             None,
             "edit main.rs",
             None,
             false,
-            &["main.rs".into()],
+            &[("main.rs".into(), 40)],
             1_000,
         );
         let strict = AgentOsMcpSettings {
