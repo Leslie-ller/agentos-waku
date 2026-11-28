@@ -48,9 +48,11 @@ second opinion. Adapt your lens to the question:\n\
 STRICT RULES:\n\
 - You are running in a STRICTLY READ-ONLY session. Never attempt to create, edit, delete, or \
   modify files, git state, or system state.\n\
-- NEVER invoke shell or terminal execution tools (such as run_command) when native file read or \
-  search tools (read_file, list_dir, grep_search, find_by_name, etc.) are available — shell \
-  commands are blocked in this read-only sandbox.\n\
+- Prefer native file read or search tools (read_file, list_dir, grep_search, find_by_name, etc.) \
+  whenever available, and NEVER invoke shell/terminal tools (such as run_command) in ACP sandboxes \
+  where shell execution is blocked. In Codex CLI read-only sandboxes without native file-read \
+  tools, read-only inspection shell commands (rg, sed, head, cat, ls, git status/diff/show/log) \
+  ARE allowed and should be used to inspect workspace files.\n\
 - Do NOT ask the user questions or request approvals — your output goes back to the calling \
   agent, not directly to the end user.\n\
 - Verify claims against actual files or local images in the workspace when paths are involved, \
@@ -2555,6 +2557,23 @@ fn build_advisor_prompt_for_provider_with_settings(
 ) -> String {
     let auto_max_files = advisor_auto_max_files_from_settings(settings, provider, origin);
     let mut prompt = format!("{ADVISOR_SYSTEM_PROMPT}\n\n");
+    match provider {
+        ProviderKind::Codex => {
+            prompt.push_str(
+                "TOOL ACCESS (Codex read-only sandbox):\n\
+                 - Read-only shell inspection commands (e.g. rg, sed, head, cat, ls, git status/diff/show/log) ARE permitted and encouraged to verify code and cite exact file:line references.\n\
+                 - Never run mutating commands or attempt to edit files.\n\n",
+            );
+        }
+        ProviderKind::Antigravity => {
+            prompt.push_str(
+                "TOOL ACCESS (Antigravity read-only sandbox):\n\
+                 - Use native file/search/image tools only (read_file, grep_search, list_dir, find_by_name).\n\
+                 - NEVER call shell/terminal execution tools (run_command is denied in this sandbox).\n\n",
+            );
+        }
+        _ => {}
+    }
     prompt.push_str(&format!("Question:\n{question}\n"));
     if let Some(max_files) = auto_max_files {
         prompt.push_str(&format!(
@@ -2993,7 +3012,7 @@ impl SessionScaleTracker {
             i64::from(settings.advisor_auto_review_cooldown_minutes).saturating_mul(60);
         let was_human = self.turn_origin_human;
         self.turn_origin_human = false;
-        if !was_human {
+        if !was_human || !settings.advisor_enabled || !settings.advisor_auto_review_enabled {
             return None;
         }
         let trimmed_out = self.current_assistant_text.trim();
@@ -3275,19 +3294,23 @@ pub fn take_pending_advisor_review(
     take_pending_advisor_review_with_stale_secs(db_path, session_id, AUTO_ADVISOR_STALE_WINDOW_SECS)
 }
 
-/// Same as [`take_pending_advisor_review`], reading `advisorAutoReviewStaleHours` live from
-/// `settings_path` (`0` = never expire).
+/// Same as [`take_pending_advisor_review`], reading advisor enable flags and
+/// `advisorAutoReviewStaleHours` live from `settings_path` (`0` = never expire).
+/// Returns `Ok(None)` without mutating pending rows when advisor or auto-review is disabled.
 pub fn take_pending_advisor_review_for_settings(
     db_path: &Path,
     settings_path: &Path,
     session_id: Uuid,
 ) -> anyhow::Result<Option<String>> {
-    let stale_hours = std::fs::read(settings_path)
+    let mcp = std::fs::read(settings_path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<DaemonSettings>(&bytes).ok())
-        .map(|s| s.agentos_mcp.advisor_auto_review_stale_hours)
-        .unwrap_or(6);
-    let stale_secs = i64::from(stale_hours).saturating_mul(3600);
+        .map(|s| s.agentos_mcp)
+        .unwrap_or_default();
+    if !mcp.advisor_enabled || !mcp.advisor_auto_review_enabled {
+        return Ok(None);
+    }
+    let stale_secs = i64::from(mcp.advisor_auto_review_stale_hours).saturating_mul(3600);
     take_pending_advisor_review_with_stale_secs(db_path, session_id, stale_secs)
 }
 
@@ -6890,6 +6913,47 @@ mod tests {
             "10h-old review must expire when stale_hours=2"
         );
 
+        // Disabled toggles must suppress injection without consuming/expiring pending rows.
+        store_pending_advisor_review(&conn, &sid_str, "code scale: 2 files", "pending toggle check")
+            .unwrap();
+        let auto_off = DaemonSettings {
+            agentos_mcp: AgentOsMcpSettings {
+                advisor_auto_review_enabled: false,
+                ..AgentOsMcpSettings::default()
+            },
+            ..DaemonSettings::default()
+        };
+        std::fs::write(&settings_file, serde_json::to_vec(&auto_off).unwrap()).unwrap();
+        assert!(
+            take_pending_advisor_review_for_settings(&db, &settings_file, sid)
+                .unwrap()
+                .is_none(),
+            "pending review must not inject while advisor_auto_review_enabled=false"
+        );
+        let advisor_off = DaemonSettings {
+            agentos_mcp: AgentOsMcpSettings {
+                advisor_enabled: false,
+                ..AgentOsMcpSettings::default()
+            },
+            ..DaemonSettings::default()
+        };
+        std::fs::write(&settings_file, serde_json::to_vec(&advisor_off).unwrap()).unwrap();
+        assert!(
+            take_pending_advisor_review_for_settings(&db, &settings_file, sid)
+                .unwrap()
+                .is_none(),
+            "pending review must not inject while advisor_enabled=false"
+        );
+        std::fs::write(
+            &settings_file,
+            serde_json::to_vec(&DaemonSettings::default()).unwrap(),
+        )
+        .unwrap();
+        let resumed = take_pending_advisor_review_for_settings(&db, &settings_file, sid)
+            .unwrap()
+            .expect("pending review remains intact and injects once toggles are re-enabled");
+        assert!(resumed.contains("pending toggle check"));
+
         // Insert a recent consultation and verify cooldown, per-session cap, global cap, and 0=unlimited.
         conn.execute(
             "INSERT INTO agentos_advisor_consultations
@@ -6932,6 +6996,25 @@ mod tests {
             advisor_auto_min_edited_files: 1,
             ..AgentOsMcpSettings::default()
         };
+        // Disabling auto-review must not reset accumulated counters or burn cooldown,
+        // while still clearing turn_origin_human for subsequent autonomous turns.
+        let disabled_sensitive = AgentOsMcpSettings {
+            advisor_auto_review_enabled: false,
+            ..sensitive.clone()
+        };
+        assert!(
+            custom_tracker
+                .evaluate_on_turn_finished_with_settings(1_015, &disabled_sensitive, true)
+                .is_none()
+        );
+        // Autonomous turn right after re-enabling still returns None because turn_origin_human was cleared.
+        assert!(
+            custom_tracker
+                .evaluate_on_turn_finished_with_settings(1_016, &sensitive, true)
+                .is_none()
+        );
+        // Next human turn triggers cleanly because counters & cooldown were preserved while disabled.
+        custom_tracker.mark_human_prompt("re-enabled human turn");
         assert!(custom_tracker
             .evaluate_on_turn_finished_with_settings(1_020, &sensitive, true)
             .is_some());
@@ -6970,6 +7053,8 @@ mod tests {
             Some(&ctx),
             &files,
         );
+        assert!(agy_prompt.contains("TOOL ACCESS (Antigravity read-only sandbox)"));
+        assert!(agy_prompt.contains("run_command is denied"));
         assert!(agy_prompt.contains("STRICT EXPLORATION & TOKEN BUDGET"));
         assert!(agy_prompt.contains("- a.rs\n"));
         assert!(agy_prompt.contains("- c.rs\n"));
@@ -6998,6 +7083,8 @@ mod tests {
             Some(&ctx),
             &files,
         );
+        assert!(codex_prompt.contains("TOOL ACCESS (Codex read-only sandbox)"));
+        assert!(codex_prompt.contains("ARE permitted and encouraged"));
         assert!(!codex_prompt.contains("STRICT EXPLORATION & TOKEN BUDGET"));
         assert!(codex_prompt.contains("- a.rs\n"));
         assert!(codex_prompt.contains("- e.rs\n"));
