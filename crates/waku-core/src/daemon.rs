@@ -1018,6 +1018,26 @@ fn merge_stale_session_metadata(existing: &mut AgentSession, incoming: AgentSess
         existing.project_id = incoming.project_id;
         existing.workspace = incoming.workspace;
         let provider_changed = existing.provider != incoming.provider;
+        if provider_changed {
+            // Park any existing active cursor under its true owning provider before switching
+            // so stale metadata merges never leave an old provider's cursor attached to the
+            // newly selected provider (AGE-198).
+            if let Some(old_cursor) = existing.provider_cursor.take() {
+                let owner = old_cursor.provider();
+                if owner != incoming.provider {
+                    existing.parked_cursors.retain(|entry| entry.provider != owner);
+                    existing.parked_cursors.push(waku_protocol::model::ParkedProviderCursor {
+                        provider: owner,
+                        cursor: old_cursor,
+                        parked_at_turn_count: existing.turns.len(),
+                        parked_at_message_count: existing.messages.len(),
+                        parked_at: incoming.updated_at,
+                    });
+                } else {
+                    existing.provider_cursor = Some(old_cursor);
+                }
+            }
+        }
         existing.provider = incoming.provider;
         existing.model = incoming.model;
         existing.runtime_mode = incoming.runtime_mode;
@@ -1026,11 +1046,39 @@ fn merge_stale_session_metadata(existing: &mut AgentSession, incoming: AgentSess
         existing.context_window = incoming.context_window;
         existing.agent_preset = incoming.agent_preset;
         if !incoming.parked_cursors.is_empty() {
-            existing.parked_cursors = incoming.parked_cursors;
+            for entry in incoming.parked_cursors {
+                if entry.cursor.provider() == entry.provider {
+                    existing
+                        .parked_cursors
+                        .retain(|current| current.provider != entry.provider);
+                    existing.parked_cursors.push(entry);
+                }
+            }
         }
-        if provider_changed && incoming.pending_handoff_seed.is_some() {
-            existing.pending_handoff_seed = incoming.pending_handoff_seed;
+        if provider_changed {
+            if let Some(cursor) = incoming
+                .provider_cursor
+                .filter(|cursor| cursor.provider() == existing.provider)
+            {
+                existing.provider_cursor = Some(cursor);
+            } else if existing
+                .provider_cursor
+                .as_ref()
+                .is_none_or(|cursor| cursor.provider() != existing.provider)
+            {
+                if let Some(idx) = existing.parked_cursors.iter().position(|entry| {
+                    entry.provider == existing.provider && entry.cursor.provider() == existing.provider
+                }) {
+                    existing.provider_cursor = Some(existing.parked_cursors.remove(idx).cursor);
+                } else {
+                    existing.provider_cursor = None;
+                }
+            }
+            if incoming.pending_handoff_seed.is_some() {
+                existing.pending_handoff_seed = incoming.pending_handoff_seed;
+            }
         }
+        existing.repair_mismatched_cursor();
         existing.updated_at = incoming.updated_at;
         existing.last_reply_at = incoming.last_reply_at.or(existing.last_reply_at);
     }
@@ -1692,9 +1740,13 @@ impl WakuBackend {
                 state.sessions.iter_mut().find(|s| s.id == session_id)
             {
                 let _ = self.task_store.hydrate(stored_session);
+                if stored_session.repair_mismatched_cursor() {
+                    switched = true;
+                }
                 if let Some(ref cur) = requested_cursor
                     && cur.provider() != provider
                     && stored_session.provider_cursor.is_none()
+                    && stored_session.provider == cur.provider()
                 {
                     stored_session.provider_cursor = Some(cur.clone());
                 }
@@ -1706,7 +1758,10 @@ impl WakuBackend {
                     .as_ref()
                     .is_some_and(|cur| cur.provider() != provider)
                 {
-                    requested_cursor = stored_session.provider_cursor.clone();
+                    requested_cursor = stored_session
+                        .provider_cursor
+                        .clone()
+                        .filter(|cur| cur.provider() == provider);
                 } else if requested_cursor.is_none()
                     && stored_session
                         .provider_cursor
@@ -1726,6 +1781,8 @@ impl WakuBackend {
                 let _ = self.task_store.save(&mut state);
             }
         }
+        // Final invariant: never forward a resume cursor belonging to a different provider.
+        let requested_cursor = requested_cursor.filter(|cur| cur.provider() == provider);
 
         let mcp_companion = crate::mcp_companion::companion_launch_for_session_with_provider(
             session_id,
@@ -3600,6 +3657,43 @@ mod tests {
         assert_eq!(
             switched.pending_handoff_seed.as_deref(),
             Some("<agent_handoff_context>fresh</agent_handoff_context>")
+        );
+    }
+
+    #[test]
+    fn stale_metadata_merge_parks_old_cursor_on_provider_switch_and_never_leaves_mismatch() {
+        let mut existing = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        existing.provider_cursor = Some(waku_protocol::model::ProviderResumeCursor::Codex {
+            thread_id: "01a218c8-e72b-7d53-9998-5f977288a240".into(),
+        });
+        existing.updated_at = 100;
+
+        let mut incoming = existing.clone();
+        incoming.provider = ProviderKind::Antigravity;
+        incoming.provider_cursor = None;
+        incoming.updated_at = 110;
+
+        merge_stale_session_metadata(&mut existing, incoming);
+        assert_eq!(existing.provider, ProviderKind::Antigravity);
+        assert!(
+            existing.provider_cursor.is_none(),
+            "old Codex cursor must never remain attached to Antigravity session"
+        );
+        assert_eq!(existing.parked_cursors.len(), 1);
+        assert_eq!(existing.parked_cursors[0].provider, ProviderKind::Codex);
+
+        // Switching back to Codex via stale metadata merge restores the parked Codex cursor.
+        let mut back_to_codex = existing.clone();
+        back_to_codex.provider = ProviderKind::Codex;
+        back_to_codex.provider_cursor = None;
+        back_to_codex.updated_at = 120;
+        merge_stale_session_metadata(&mut existing, back_to_codex);
+        assert_eq!(existing.provider, ProviderKind::Codex);
+        assert_eq!(
+            existing.provider_cursor,
+            Some(waku_protocol::model::ProviderResumeCursor::Codex {
+                thread_id: "01a218c8-e72b-7d53-9998-5f977288a240".into(),
+            })
         );
     }
 

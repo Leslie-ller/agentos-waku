@@ -2775,7 +2775,10 @@ impl Waku {
                 context_window,
                 agent_preset,
                 computer_use_enabled: self.state.computer_use_enabled,
-                provider_cursor: session.provider_cursor.clone(),
+                provider_cursor: session
+                    .provider_cursor
+                    .clone()
+                    .filter(|cursor| cursor.provider() == session.provider),
             },
             event_wake: self.event_wake_tx.clone(),
             daemon: self.daemon.clone(),

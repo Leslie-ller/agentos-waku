@@ -1372,14 +1372,54 @@ impl AgentSession {
     /// native resume cursor in [`Self::parked_cursors`] and either restoring a
     /// previously parked cursor for `target` (warm delta handoff) or seeding a
     /// fresh native session with a bounded transcript digest (cold handoff).
+    /// Ensures `self.provider_cursor` belongs to `self.provider`.
+    /// If a mismatched cursor is present (for example from a stale metadata merge),
+    /// parks it under its actual owning provider and restores any parked cursor for
+    /// `self.provider` (or clears it to `None`). Returns `true` if state changed.
+    pub fn repair_mismatched_cursor(&mut self) -> bool {
+        let mut changed = false;
+        let before_len = self.parked_cursors.len();
+        self.parked_cursors
+            .retain(|entry| entry.cursor.provider() == entry.provider);
+        if self.parked_cursors.len() != before_len {
+            changed = true;
+        }
+        if self
+            .provider_cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.provider() != self.provider)
+            && let Some(misplaced) = self.provider_cursor.take()
+        {
+            let owner = misplaced.provider();
+            self.parked_cursors.retain(|entry| entry.provider != owner);
+            self.parked_cursors.push(ParkedProviderCursor {
+                provider: owner,
+                cursor: misplaced,
+                parked_at_turn_count: self.turns.len(),
+                parked_at_message_count: self.messages.len(),
+                parked_at: unix_time(),
+            });
+            if let Some(idx) = self
+                .parked_cursors
+                .iter()
+                .position(|entry| entry.provider == self.provider)
+            {
+                let resumed = self.parked_cursors.remove(idx);
+                self.provider_cursor = Some(resumed.cursor);
+            }
+            changed = true;
+        }
+        changed
+    }
+
     pub fn switch_provider(&mut self, target: ProviderKind) -> bool {
         if self.provider == target {
-            return false;
+            return self.repair_mismatched_cursor();
         }
         let now = unix_time();
         let outgoing = self.provider;
 
-        if self.messages.is_empty() {
+        if self.messages.is_empty() && self.turns.is_empty() && self.provider_cursor.is_none() {
             self.provider = target;
             self.provider_cursor = None;
             self.pending_handoff_seed = None;
@@ -1389,23 +1429,29 @@ impl AgentSession {
             return true;
         }
 
+        let mut already_matching_cursor = None;
         if let Some(cursor) = self.provider_cursor.take() {
-            self.parked_cursors
-                .retain(|entry| entry.provider != outgoing);
-            self.parked_cursors.push(ParkedProviderCursor {
-                provider: outgoing,
-                cursor,
-                parked_at_turn_count: self.turns.len(),
-                parked_at_message_count: self.messages.len(),
-                parked_at: now,
-            });
+            let owner = cursor.provider();
+            if owner == target {
+                already_matching_cursor = Some(cursor);
+            } else {
+                self.parked_cursors.retain(|entry| entry.provider != owner);
+                self.parked_cursors.push(ParkedProviderCursor {
+                    provider: owner,
+                    cursor,
+                    parked_at_turn_count: self.turns.len(),
+                    parked_at_message_count: self.messages.len(),
+                    parked_at: now,
+                });
+            }
         }
 
-        if let Some(idx) = self
-            .parked_cursors
-            .iter()
-            .position(|entry| entry.provider == target)
-        {
+        if let Some(cursor) = already_matching_cursor {
+            self.provider_cursor = Some(cursor);
+            self.pending_handoff_seed = self.build_handoff_context(outgoing, target, 0, true);
+        } else if let Some(idx) = self.parked_cursors.iter().position(|entry| {
+            entry.provider == target && entry.cursor.provider() == target
+        }) {
             let resumed = self.parked_cursors.remove(idx);
             self.provider_cursor = Some(resumed.cursor);
             self.pending_handoff_seed = self.build_handoff_context(
@@ -5300,5 +5346,36 @@ mod tests {
         assert_eq!(edit_activity.file_changes[0].path, "/tmp/demo/app.rs");
         assert_eq!(edit_activity.file_changes[0].additions, Some(2));
         assert_eq!(edit_activity.file_changes[0].deletions, Some(1));
+    }
+
+    #[test]
+    fn switch_provider_parks_cursor_when_unhydrated_and_repairs_mismatched_cursor() {
+        // Unhydrated session (messages empty, but existing Codex cursor present) must park cursor.
+        let mut session = AgentSession::new(Uuid::new_v4(), ProviderKind::Codex);
+        session.provider_cursor = Some(ProviderResumeCursor::Codex {
+            thread_id: "thread-codex-1".into(),
+        });
+        assert!(session.switch_provider(ProviderKind::Antigravity));
+        assert_eq!(session.provider, ProviderKind::Antigravity);
+        assert!(session.provider_cursor.is_none());
+        assert_eq!(session.parked_cursors.len(), 1);
+        assert_eq!(session.parked_cursors[0].provider, ProviderKind::Codex);
+
+        // Switching back restores the parked Codex cursor.
+        assert!(session.switch_provider(ProviderKind::Codex));
+        assert_eq!(
+            session.provider_cursor,
+            Some(ProviderResumeCursor::Codex {
+                thread_id: "thread-codex-1".into(),
+            })
+        );
+
+        // Repairing an already-corrupted session (Antigravity with Codex cursor, AGE-198).
+        session.provider = ProviderKind::Antigravity;
+        assert!(session.repair_mismatched_cursor());
+        assert!(session.provider_cursor.is_none());
+        assert_eq!(session.parked_cursors.len(), 1);
+        assert_eq!(session.parked_cursors[0].provider, ProviderKind::Codex);
+        assert!(!session.repair_mismatched_cursor());
     }
 }
