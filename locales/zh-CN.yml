@@ -1124,3 +1124,5 @@ daemon.copy_pairing_link: 复制配对链接
 daemon.refresh_endpoints: 刷新网卡
 daemon.qr_hint: "令牌仅通过本地 URL 锚点（#token=…）传递，手机打开完成配对后会自动从地址栏抹除。"
 web.pairing_tip: "提示：在桌面端「设置 → 守护进程」开启局域网访问后，用手机扫二维码即可一键直连，并可通过浏览器「添加到主屏幕」获得全屏 App 体验。"
+
+session.options_when_idle: 新设置将在当前回合和后台任务结束后生效。

@@ -876,6 +876,21 @@ fn reasoning_and_tools_share_one_ordered_activity_block() {
 }
 
 #[test]
+fn settings_restart_waits_for_both_turn_and_background_work() {
+    let mut session = AgentSession::new(uuid::Uuid::new_v4(), ProviderKind::Codex);
+    session.begin_turn("work");
+    session.status = SessionStatus::Working;
+    assert!(!super::session_runtime_can_close(Some(&session), false));
+    session.status = SessionStatus::Background;
+    assert!(!super::session_runtime_can_close(Some(&session), true));
+    session.status = SessionStatus::Idle;
+    assert!(!super::session_runtime_can_close(Some(&session), false));
+    session.finish_active_turn(TurnStatus::Failed);
+    assert!(!super::session_runtime_can_close(Some(&session), true));
+    assert!(super::session_runtime_can_close(Some(&session), false));
+}
+
+#[test]
 fn idle_reaping_releases_finished_sessions_but_never_a_running_turn() {
     let project_id = uuid::Uuid::new_v4();
     let fresh = Duration::from_secs(60);

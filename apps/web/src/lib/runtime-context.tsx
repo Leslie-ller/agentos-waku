@@ -55,6 +55,7 @@ interface RuntimeSummary {
 
 interface RuntimeEntry extends RuntimeSummary {
   lastDriverError: string | null
+  restartWhenIdle: boolean
   unsubscribe: () => void
 }
 
@@ -184,6 +185,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     Record<string, PendingUserInput | undefined>
   >({})
   const [backgroundWork, setBackgroundWork] = useState<Record<string, BackgroundWorkItem[]>>({})
+  const backgroundWorkRef = useRef<Record<string, BackgroundWorkItem[]>>({})
   const [responseForks, setResponseForks] = useState<Record<string, number | undefined>>({})
   const [messageRewinds, setMessageRewinds] = useState<Record<string, number | undefined>>({})
 
@@ -265,10 +267,36 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       delete next[sessionId]
       return next
     })
-    setBackgroundWork((current) => current[sessionId]
-      ? { ...current, [sessionId]: markBackgroundWorkLost(current[sessionId]) }
-      : current)
+    setBackgroundWork((current) => {
+      if (!current[sessionId]) return current
+      const next = { ...current, [sessionId]: markBackgroundWorkLost(current[sessionId]) }
+      backgroundWorkRef.current = next
+      return next
+    })
   }, [])
+
+  const closeDeferredRuntimeIfIdle = useCallback(
+    (
+      sessionId: string,
+      sessionOverride?: AgentSession,
+      backgroundOverride?: BackgroundWorkItem[],
+    ) => {
+      const entry = entries.current.get(sessionId)
+      if (!entry?.restartWhenIdle) return false
+      const latestSession = sessionOverride ?? (config
+        ? queryClient.getQueryData<AgentSession>(daemonKeys.session(config.address, sessionId))
+        : undefined)
+      const items = backgroundOverride ?? backgroundWorkRef.current[sessionId] ?? []
+      if (!sessionRuntimeCanClose(latestSession, items)) return false
+      const runtimeId = entry.runtimeId
+      removeRuntime(sessionId)
+      if (client) {
+        void client.request({ type: 'closeSession' }, sessionId, runtimeId).catch(() => {})
+      }
+      return true
+    },
+    [client, config, queryClient, removeRuntime],
+  )
 
   const saveSession = useCallback(
     async (session: AgentSession, project?: Project) => {
@@ -297,6 +325,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           await client.request({ type: 'closeSession' }, session.id, runtime.runtimeId)
           removeRuntime(session.id)
         } else if (runtime) {
+          runtime.restartWhenIdle = false
           const response = await client.request(
             {
               type: 'applyOptions',
@@ -311,9 +340,21 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             session.id,
             runtime.runtimeId,
           )
-          if (response.type !== 'optionsApplied' || !response.applied) {
-            await client.request({ type: 'closeSession' }, session.id, runtime.runtimeId)
-            removeRuntime(session.id)
+          const isCurrent = saveGenerations.current.get(session.id) === generation
+            && entries.current.get(session.id) === runtime
+          if (isCurrent && (response.type !== 'optionsApplied' || !response.applied)) {
+            const latestSession = config
+              ? queryClient.getQueryData<AgentSession>(daemonKeys.session(config.address, session.id))
+                ?? session
+              : session
+            const items = backgroundWorkRef.current[session.id] ?? []
+            if (!sessionRuntimeCanClose(latestSession, items)) {
+              runtime.restartWhenIdle = true
+              toast(translate(localeRef.current, 'session.options_when_idle'))
+            } else {
+              await client.request({ type: 'closeSession' }, session.id, runtime.runtimeId)
+              removeRuntime(session.id)
+            }
           }
         }
         const saved = await persistOrdered(session, project)
@@ -443,6 +484,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         supportsSteer: false,
         starting: true,
         lastDriverError: null,
+        restartWhenIdle: false,
         unsubscribe: () => {},
       }
       entries.current.set(session.id, entry)
@@ -461,13 +503,19 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
             event.event.payload as PlanUsage,
           )
         }
+        let nextBackgroundItems: BackgroundWorkItem[] | undefined
         if (event.event.kind === 'backgroundWork') {
           const backgroundEvent = decodeBackgroundWorkEvent(event.event.payload)
           if (backgroundEvent) {
-            setBackgroundWork((current) => ({
-              ...current,
-              [session.id]: reduceBackgroundWork(current[session.id] ?? [], backgroundEvent),
-            }))
+            nextBackgroundItems = reduceBackgroundWork(
+              backgroundWorkRef.current[session.id] ?? [],
+              backgroundEvent,
+            )
+            backgroundWorkRef.current = {
+              ...backgroundWorkRef.current,
+              [session.id]: nextBackgroundItems,
+            }
+            setBackgroundWork(backgroundWorkRef.current)
           }
         }
         if (event.event.kind === 'steerAccepted') {
@@ -525,6 +573,11 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           }))
         }
         if (result.error) toast.error(result.error)
+        if (result.removeRuntime) {
+          removeRuntime(session.id)
+        } else {
+          closeDeferredRuntimeIfIdle(session.id, result.session, nextBackgroundItems)
+        }
         if (result.settled) {
           const projectionTimer = projectionPersistTimers.current.get(session.id)
           if (projectionTimer !== undefined) {
@@ -550,7 +603,6 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
           ])
           finishSettledTurn(result.session)
         }
-        if (result.removeRuntime) removeRuntime(session.id)
       })
       if (entries.current.get(session.id) === entry) {
         entry.unsubscribe = unsubscribe
@@ -565,6 +617,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       queryClient,
       cacheSession,
       removeRuntime,
+      closeDeferredRuntimeIfIdle,
       persistOrdered,
       scheduleProjectionPersist,
       finishSettledTurn,
@@ -644,6 +697,19 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
 
       if (!entries.current.has(currentSession.id)) {
         await attachSession(currentSession)
+      }
+
+      const existingRuntime = entries.current.get(currentSession.id)
+      if (
+        existingRuntime?.restartWhenIdle
+        && sessionRuntimeCanClose(
+          currentSession,
+          backgroundWorkRef.current[currentSession.id] ?? [],
+        )
+      ) {
+        removeRuntime(currentSession.id)
+        await client.request({ type: 'closeSession' }, currentSession.id, existingRuntime.runtimeId)
+          .catch(() => {})
       }
 
       let session = beginTurn(currentSession, prompt, attachments)
@@ -1083,7 +1149,11 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       pendingSteers.current.delete(sessionId)
       setPermissions((current) => removeRecordKey(current, sessionId))
       setUserInputs((current) => removeRecordKey(current, sessionId))
-      setBackgroundWork((current) => removeRecordKey(current, sessionId))
+      setBackgroundWork((current) => {
+        const next = removeRecordKey(current, sessionId)
+        backgroundWorkRef.current = next
+        return next
+      })
     },
     [client, phase, removeRuntime],
   )
@@ -1300,6 +1370,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     setRuntimes({})
     setPermissions({})
     setUserInputs({})
+    backgroundWorkRef.current = {}
     setBackgroundWork({})
     setResponseForks({})
     setMessageRewinds({})
@@ -1683,6 +1754,18 @@ function isBackgroundStatus(value: unknown): value is BackgroundWorkStatus {
     'stopped',
     'lost',
   ].includes(String(value))
+}
+
+export function sessionRuntimeCanClose(
+  session: AgentSession | undefined,
+  backgroundItems: BackgroundWorkItem[] = [],
+): boolean {
+  if (backgroundItems.some((item) => isLiveBackgroundStatus(item.status))) {
+    return false
+  }
+  if (!session) return true
+  const hasRunningTurn = session.turns.some((turn) => turn.status === 'running')
+  return !hasRunningTurn && (session.status === 'idle' || session.status === 'failed')
 }
 
 function isLiveBackgroundStatus(status: BackgroundWorkStatus) {

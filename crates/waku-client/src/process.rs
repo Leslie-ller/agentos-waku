@@ -129,6 +129,8 @@ pub fn parse_allowed_origins(text: &str) -> anyhow::Result<Vec<String>> {
 pub struct DaemonProcess {
     client: DaemonClient,
     child: Child,
+    address: String,
+    token: String,
 }
 
 impl DaemonProcess {
@@ -224,7 +226,7 @@ impl DaemonProcess {
                 return Err(error);
             }
         };
-        let client = match DaemonClient::connect(&client_address, token) {
+        let client = match DaemonClient::connect(&client_address, token.clone()) {
             Ok(client) => client,
             Err(error) => {
                 let _ = child.kill();
@@ -232,7 +234,12 @@ impl DaemonProcess {
                 return Err(error);
             }
         };
-        Ok(Self { client, child })
+        Ok(Self {
+            client,
+            child,
+            address: client_address,
+            token,
+        })
     }
 
     pub fn client(&self) -> DaemonClient {
@@ -516,9 +523,21 @@ fn monitor_daemon(
         if !inner.running.load(Ordering::Acquire) {
             return;
         }
-        let remote_reconnect = {
-            let target = inner.target.lock();
-            match &*target {
+        let reconnect = {
+            let mut target = inner.target.lock();
+            match &mut *target {
+                DaemonTarget::Local(process) if process.client.is_disconnected() => {
+                    if process.has_exited() {
+                        None
+                    } else {
+                        Some((
+                            process.client(),
+                            process.address.clone(),
+                            process.token.clone(),
+                            process.client.last_sequences(),
+                        ))
+                    }
+                }
                 DaemonTarget::Remote {
                     client,
                     address,
@@ -532,31 +551,24 @@ fn monitor_daemon(
                 _ => None,
             }
         };
-        if let Some((disconnected, address, token, resume_from)) = remote_reconnect {
+        if let Some((disconnected, address, token, resume_from)) = reconnect {
             let _restart = inner.restart.lock();
-            let still_current = matches!(
-                &*inner.target.lock(),
-                DaemonTarget::Remote { client, .. }
-                    if client.same_connection(&disconnected) && client.is_disconnected()
-            );
-            if !still_current {
+            if !inner.target.lock().client().same_connection(&disconnected) {
                 continue;
             }
-            let Ok(replacement) =
-                DaemonClient::connect_with_resume(&address, token.clone(), resume_from)
-            else {
+            if let Ok(replacement) = DaemonClient::connect_with_resume(&address, token, resume_from)
+            {
+                match &mut *inner.target.lock() {
+                    DaemonTarget::Local(process) => process.client = replacement.clone(),
+                    DaemonTarget::Remote { client, .. } => *client = replacement.clone(),
+                    DaemonTarget::Restarting(_) => continue,
+                }
+                inner
+                    .client_updates
+                    .lock()
+                    .retain(|subscriber| subscriber.send(replacement.clone()).is_ok());
                 continue;
-            };
-            *inner.target.lock() = DaemonTarget::Remote {
-                client: replacement.clone(),
-                address,
-                token,
-            };
-            inner
-                .client_updates
-                .lock()
-                .retain(|subscriber| subscriber.send(replacement.clone()).is_ok());
-            continue;
+            }
         }
         let process_exited = match &mut *inner.target.lock() {
             DaemonTarget::Local(process) => process.has_exited(),
@@ -689,6 +701,67 @@ fn persist_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn local_socket_loss_reconnects_without_replacing_child() {
+        use std::net::TcpListener;
+        use waku_protocol::{ClientMessage, ServerMessage};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (release, finished) = mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut socket = tungstenite::accept(stream).unwrap();
+                let hello = socket.read().unwrap();
+                let message: ClientMessage = serde_json::from_slice(&hello.into_data()).unwrap();
+                assert!(matches!(message, ClientMessage::Hello { token, .. } if token == "test"));
+                let reply = ServerMessage::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    daemon_version: "test".into(),
+                };
+                socket
+                    .send(tungstenite::Message::text(
+                        serde_json::to_string(&reply).unwrap(),
+                    ))
+                    .unwrap();
+                if attempt == 1 {
+                    finished.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+            }
+        });
+        let client = DaemonClient::connect(&address, "test".into()).unwrap();
+        let child = ProcessCommand::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let process = DaemonProcess {
+            client,
+            child,
+            address,
+            token: "test".into(),
+        };
+        let supervisor = DaemonSupervisor::from_target(
+            DaemonTarget::Local(process),
+            Some(std::env::current_exe().unwrap()),
+            None,
+            DaemonSettings::default(),
+        )
+        .unwrap();
+        let updates = supervisor.subscribe_clients();
+        let first = updates.recv().unwrap();
+        let weak = Arc::downgrade(&supervisor.inner);
+        let monitor = std::thread::spawn(move || monitor_daemon(weak, None, false));
+        let next = updates.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(!first.same_connection(&next));
+        assert!(
+            matches!(&*supervisor.inner.target.lock(), DaemonTarget::Local(p) if p.child.id() == pid)
+        );
+        supervisor.inner.running.store(false, Ordering::Release);
+        release.send(()).unwrap();
+        server.join().unwrap();
+        monitor.join().unwrap();
+    }
 
     #[test]
     fn browser_origins_are_exact_and_deduplicated() {
