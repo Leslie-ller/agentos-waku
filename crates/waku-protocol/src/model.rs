@@ -1419,7 +1419,11 @@ impl AgentSession {
         let now = unix_time();
         let outgoing = self.provider;
 
-        if self.messages.is_empty() && self.turns.is_empty() && self.provider_cursor.is_none() {
+        if self.messages.is_empty()
+            && self.turns.is_empty()
+            && self.provider_cursor.is_none()
+            && self.parked_cursors.is_empty()
+        {
             self.provider = target;
             self.provider_cursor = None;
             self.pending_handoff_seed = None;
